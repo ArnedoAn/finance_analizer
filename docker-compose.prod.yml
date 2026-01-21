@@ -1,0 +1,115 @@
+# =============================================================================
+# Finance Analyzer - Production Docker Compose
+# =============================================================================
+# Production stack with PostgreSQL database
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: finance-analyzer-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finance_analyzer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-finance_analyzer}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - finance-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finance_analyzer}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Ports removed - PostgreSQL only accessible from internal Docker network
+    # If you need external access for debugging, uncomment the line below:
+    # ports:
+    #   - "${POSTGRES_PORT:-5432}:5432"
+
+  # ---------------------------------------------------------------------------
+  # Finance Analyzer API
+  # ---------------------------------------------------------------------------
+  finance-analyzer:
+    image: ${REGISTRY_URL}/finance-analyzer:${IMAGE_TAG:-latest}
+    container_name: finance-analyzer
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # Application
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # Database (PostgreSQL)
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-finance_analyzer}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_analyzer}
+      
+      # Security
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
+      
+      # DeepSeek AI
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_API_URL=${DEEPSEEK_API_URL:-https://api.deepseek.com/v1/chat/completions}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      
+      # Firefly III
+      - FIREFLY_BASE_URL=${FIREFLY_BASE_URL}
+      - FIREFLY_API_TOKEN=${FIREFLY_API_TOKEN}
+      - FIREFLY_DEFAULT_ASSET_ACCOUNT=${FIREFLY_DEFAULT_ASSET_ACCOUNT:-Bancolombia}
+      
+      # Gmail
+      - GMAIL_REDIRECT_URI=${GMAIL_REDIRECT_URI}
+      - GMAIL_SUBJECT_FILTERS=${GMAIL_SUBJECT_FILTERS:-Factura,Pago,Recibo,Compra,Confirmación,Transferencia,Cargo,Abono}
+      - GMAIL_MAX_RESULTS=${GMAIL_MAX_RESULTS:-50}
+      
+      # Processing
+      - DRY_RUN=${DRY_RUN:-false}
+      - AUTO_CREATE_ACCOUNTS=${AUTO_CREATE_ACCOUNTS:-true}
+      - AUTO_CREATE_CATEGORIES=${AUTO_CREATE_CATEGORIES:-true}
+      - DEFAULT_CURRENCY=${DEFAULT_CURRENCY:-COP}
+      - EMAIL_LOOKBACK_DAYS=${EMAIL_LOOKBACK_DAYS:-7}
+      
+      # Scheduler
+      - SCHEDULER_ENABLED=${SCHEDULER_ENABLED:-true}
+      - SCHEDULER_PROCESSING_CRON=${SCHEDULER_PROCESSING_CRON:-0 */6 * * *}
+      
+      # Test mode (disable in production)
+      - TEST_MODE_CLEAR_PROCESSED=false
+    volumes:
+      # Credentials directory
+      # Note: google_credentials.json is read-only, but google_token.json needs write access
+      - ./credentials:/app/credentials
+      # Logs directory
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - finance-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  finance-network:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres-data:
+    driver: local
+

@@ -1,0 +1,88 @@
+# =============================================================================
+# Finance Analyzer - Docker Compose
+# =============================================================================
+# Development and production stack configuration
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Finance Analyzer API
+  # ---------------------------------------------------------------------------
+  finance-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-analyzer
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DATABASE_URL=sqlite+aiosqlite:///./data/finance_analyzer.db
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_API_URL=${DEEPSEEK_API_URL:-https://api.deepseek.com/v1/chat/completions}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - FIREFLY_BASE_URL=${FIREFLY_BASE_URL}
+      - FIREFLY_API_TOKEN=${FIREFLY_API_TOKEN}
+      - GMAIL_SUBJECT_FILTERS=${GMAIL_SUBJECT_FILTERS:-Factura,Pago,Recibo,Compra}
+      - DRY_RUN=${DRY_RUN:-false}
+    volumes:
+      - ./data:/app/data
+      - ./credentials:/app/credentials:ro
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - finance-network
+    depends_on:
+      firefly:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Firefly III (Optional - for local development)
+  # ---------------------------------------------------------------------------
+  firefly:
+    image: fireflyiii/core:latest
+    container_name: firefly-iii
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_KEY=${FIREFLY_APP_KEY:-SomeRandomStringOf32CharsExactly}
+      - DB_CONNECTION=sqlite
+      - TRUSTED_PROXIES=**
+      - APP_URL=http://localhost:8080
+      - TZ=UTC
+    volumes:
+      - firefly-upload:/var/www/html/storage/upload
+      - firefly-db:/var/www/html/storage/database
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - finance-network
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  finance-network:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  firefly-upload:
+  firefly-db:

@@ -1,0 +1,59 @@
+# =============================================================================
+# Finance Analyzer - Development Docker Compose
+# =============================================================================
+# Extended configuration for development with hot-reload and debugging
+
+version: '3.8'
+
+services:
+  finance-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: finance-analyzer-dev
+    ports:
+      - "8000:8000"
+      - "5678:5678"  # Debugger port
+    environment:
+      - APP_ENV=development
+      - DEBUG=true
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=sqlite+aiosqlite:///./data/finance_analyzer.db
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-dev-key-change-in-production-32chars}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - FIREFLY_BASE_URL=http://firefly:8080
+      - FIREFLY_API_TOKEN=${FIREFLY_API_TOKEN}
+      - DRY_RUN=true
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./credentials:/app/credentials
+    networks:
+      - finance-network
+    depends_on:
+      - firefly
+
+  firefly:
+    image: fireflyiii/core:latest
+    container_name: firefly-iii-dev
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_KEY=SomeRandomStringOf32CharsExactly
+      - DB_CONNECTION=sqlite
+      - TRUSTED_PROXIES=**
+      - APP_URL=http://localhost:8080
+      - APP_DEBUG=true
+    volumes:
+      - firefly-upload-dev:/var/www/html/storage/upload
+      - firefly-db-dev:/var/www/html/storage/database
+    networks:
+      - finance-network
+
+networks:
+  finance-network:
+    driver: bridge
+
+volumes:
+  firefly-upload-dev:
+  firefly-db-dev:

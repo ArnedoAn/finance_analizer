@@ -1,0 +1,33 @@
+# =============================================================================
+# Finance Analyzer - Development Dockerfile
+# =============================================================================
+# Development image with hot-reload support
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY pyproject.toml .
+RUN pip install --no-cache-dir -e ".[dev]"
+
+# Create directories
+RUN mkdir -p /app/data /app/credentials /app/logs
+
+# Environment
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    APP_ENV=development
+
+# Expose ports
+EXPOSE 8000 5678
+
+# Run with hot-reload
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     gmail_max_results: int = Field(
         default=50, ge=1, le=500, description="Max emails per batch"
     )
+    gmail_use_subject_filters: bool = Field(
+        default=True,
+        description="Whether to include subject filters in Gmail queries"
+    )
     
     # =========================================================================
     # DeepSeek AI

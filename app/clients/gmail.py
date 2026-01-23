@@ -262,9 +262,12 @@ class GmailClient:
             query_parts.append(f"({subject_query})")
         
         # Sender filters
+        # Now treated as exact From addresses for more precise matching.
+        # Each sender value should ideally be a full email address,
+        # e.g. "alertas@bancolombia.com" → from:"alertas@bancolombia.com"
         if filter_config.senders:
             sender_query = " OR ".join(
-                f"from:{s}" for s in filter_config.senders
+                f'from:"{s}"' for s in filter_config.senders
             )
             query_parts.append(f"({sender_query})")
         
@@ -302,7 +305,9 @@ class GmailClient:
         # Build default filter if not provided
         if filter_config is None:
             filter_config = EmailFilter(
-                subjects=self.settings.gmail_subjects_list,
+                subjects=self.settings.gmail_subjects_list
+                if self.settings.gmail_use_subject_filters
+                else [],
                 max_results=self.settings.gmail_max_results,
                 after_date=datetime.utcnow() - timedelta(
                     days=self.settings.email_lookback_days

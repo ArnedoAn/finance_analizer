@@ -415,7 +415,11 @@ class KnownSenderCreate(BaseModel):
         ...,
         min_length=2,
         max_length=100,
-        description="Keyword to match in sender email (e.g., 'lulo' for notificaciones@lulo.com)"
+        description=(
+            "Sender identifier. Recommended: full From email address for exact match "
+            "(e.g., 'alertas@bancolombia.com'). "
+            "Can also be a keyword contained in the email address."
+        ),
     )
     sender_name: str = Field(
         ...,

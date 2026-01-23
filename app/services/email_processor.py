@@ -116,7 +116,11 @@ class EmailProcessorService:
         
         # Build email filter
         filter_config = EmailFilter(
-            subjects=request.subject_filters or self.settings.gmail_subjects_list,
+            subjects=(
+                request.subject_filters or self.settings.gmail_subjects_list
+                if self.settings.gmail_use_subject_filters
+                else []
+            ),
             max_results=request.max_emails,
             after_date=request.after_date or datetime.utcnow() - timedelta(
                 days=self.settings.email_lookback_days
@@ -284,6 +288,8 @@ class EmailProcessorService:
         """
         start_time = time.time()
         dry_run = dry_run or self.settings.dry_run
+        # Normalize email_date to naive datetime (PostgreSQL column is TIMESTAMP WITHOUT TIME ZONE)
+        email_date = email.date.replace(tzinfo=None) if getattr(email.date, "tzinfo", None) else email.date
         
         logger.info(
             "processing_email",
@@ -313,7 +319,7 @@ class EmailProcessorService:
             email_internal_id=email.internal_id,
             email_subject=email.subject,
             email_sender=email.sender,
-            email_date=email.date,
+            email_date=email_date,
             status=ProcessingStatus.PROCESSING,
             dry_run=dry_run,
         )
@@ -348,7 +354,7 @@ class EmailProcessorService:
                 await self._processed_repo.mark_processed(
                     email.message_id,
                     email.internal_id,
-                    email.date,
+                    email_date,
                 )
             
         except FireflyDuplicateError as e:
@@ -365,7 +371,7 @@ class EmailProcessorService:
                 await self._processed_repo.mark_processed(
                     email.message_id,
                     email.internal_id,
-                    email.date,
+                    email_date,
                 )
             
         except DeepSeekError as e:

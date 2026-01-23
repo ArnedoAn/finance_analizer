@@ -103,9 +103,10 @@ def create_application() -> FastAPI:
         5. Log the result for audit purposes
         """,
         version=__version__,
-        docs_url="/docs" if settings.debug else None,
-        redoc_url="/redoc" if settings.debug else None,
-        openapi_url="/openapi.json" if settings.debug else "/api/openapi.json",
+        # Enable docs also in production
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
         lifespan=lifespan,
     )
     
@@ -162,7 +163,7 @@ def create_application() -> FastAPI:
         return {
             "name": "Finance Analyzer",
             "version": __version__,
-            "docs": "/docs" if settings.debug else None,
+            "docs": "/docs",
             "api": "/api/v1",
             "health": "/api/v1/health",
         }

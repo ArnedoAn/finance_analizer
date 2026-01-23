@@ -1,0 +1,60 @@
+# ============================================================================
+# CI/CD: Build & Deploy on push to master
+# - Build Docker image using Dockerfile.prod
+# - Push to custom registry
+# - Trigger Coolify webhook to redeploy
+# ============================================================================
+
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  IMAGE_NAME: finance-analyzer
+  REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+  # Tags: commit SHA and latest
+  IMAGE_TAG_SHA: ${{ github.sha }}
+  IMAGE_TAG_LATEST: latest
+  COOLIFY_WEBHOOK: https://services.toothless.codes/api/v1/deploy?uuid=vcoko4scowc8s88ogokwkc84&force=false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_URL }}
+          username: ${{ env.REGISTRY_USERNAME }}
+          password: ${{ env.REGISTRY_PASSWORD }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.prod
+          push: true
+          build-args: |
+            REGISTRY_URL=${{ env.REGISTRY_URL }}
+          tags: |
+            ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_SHA }}
+            ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
+
+      - name: Trigger Coolify deploy
+        run: |
+          curl -X POST "${{ env.COOLIFY_WEBHOOK }}"
+

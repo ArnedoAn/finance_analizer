@@ -161,7 +161,7 @@ class Settings(BaseSettings):
         default=True, description="Enable scheduled tasks"
     )
     scheduler_processing_cron: str = Field(
-        default="0 */6 * * *",  # Every 6 hours
+        default="0 * * * *",  # Every hour
         description="CRON expression for email processing job"
     )
     scheduler_learning_cron: str = Field(

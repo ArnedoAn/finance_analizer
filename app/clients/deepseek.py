@@ -43,7 +43,7 @@ FORMATO:
 {"amount":0.00,"currency":"USD","date":"YYYY-MM-DD","description":"","merchant":"","suggested_category":"","suggested_account_name":"","transaction_type":"withdrawal|deposit","confidence_score":0.0}
 
 REGLAS:
-- amount: positivo, decimal
+- amount: positivo, decimal. IMPORTANTE: Si la moneda es COP (pesos colombianos), las cantidades son típicamente grandes (miles o millones). Ejemplo: $50.000 COP, $1.200.000 COP. NO confundas con centavos. Si ves "$50" en un email de banco colombiano, probablemente son $50.000 COP, no $50 COP.
 - currency: ISO 4217 (USD,EUR,COP,MXN)
 - date: YYYY-MM-DD
 - transaction_type: withdrawal=gasto, deposit=ingreso
@@ -348,10 +348,28 @@ class DeepSeekClient:
             # Parse JSON directly (JSON mode ensures valid JSON)
             data = json.loads(content)
             
+            # Parse currency and amount
+            currency = data.get("currency", default_currency).upper()
+            amount = self._parse_amount(data.get("amount", 0))
+            
+            # Corrección para pesos colombianos: si la cantidad es menor a 100 COP,
+            # probablemente está en la escala incorrecta (centavos en lugar de pesos)
+            # Multiplicar por 1000 para corregir
+            if currency == "COP" and amount < Decimal("100"):
+                original_amount = amount
+                amount = amount * Decimal("1000")
+                logger.warning(
+                    "deepseek_amount_corrected",
+                    original_amount=float(original_amount),
+                    corrected_amount=float(amount),
+                    currency=currency,
+                    reason="Amount < 100 COP, likely scale error"
+                )
+            
             # Build TransactionAnalysis with validation and defaults
             return TransactionAnalysis(
-                amount=self._parse_amount(data.get("amount", 0)),
-                currency=data.get("currency", default_currency).upper(),
+                amount=amount,
+                currency=currency,
                 date=self._parse_date(data.get("date")),
                 description=data.get("description", "Transacción sin descripción"),
                 merchant=data.get("merchant", ""),

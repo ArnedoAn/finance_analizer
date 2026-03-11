@@ -24,6 +24,7 @@ services:
       - FIREFLY_BASE_URL=http://firefly:8080
       - FIREFLY_API_TOKEN=${FIREFLY_API_TOKEN}
       - DRY_RUN=true
+      - TZ=America/Bogota
     volumes:
       - .:/app
       - ./data:/app/data

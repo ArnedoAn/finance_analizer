@@ -14,6 +14,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials

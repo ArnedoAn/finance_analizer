@@ -81,6 +81,9 @@ services:
       
       # Test mode (disable in production)
       - TEST_MODE_CLEAR_PROCESSED=false
+      
+      # Timezone
+      - TZ=America/Bogota
     volumes:
       # Credentials directory
       # Note: google_credentials.json is read-only, but google_token.json needs write access

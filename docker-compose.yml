@@ -30,6 +30,7 @@ services:
       - FIREFLY_API_TOKEN=${FIREFLY_API_TOKEN}
       - GMAIL_SUBJECT_FILTERS=${GMAIL_SUBJECT_FILTERS:-Factura,Pago,Recibo,Compra}
       - DRY_RUN=${DRY_RUN:-false}
+      - TZ=America/Bogota
     volumes:
       - ./data:/app/data
       - ./credentials:/app/credentials:ro

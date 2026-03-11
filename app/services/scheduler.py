@@ -14,6 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.timezone import get_app_timezone
 
 logger = get_logger(__name__)
 
@@ -22,10 +23,11 @@ _scheduler: AsyncIOScheduler | None = None
 
 
 def get_scheduler() -> AsyncIOScheduler:
-    """Get the global scheduler instance."""
+    """Get the global scheduler instance with timezone configured."""
     global _scheduler
     if _scheduler is None:
-        _scheduler = AsyncIOScheduler()
+        app_tz = get_app_timezone()
+        _scheduler = AsyncIOScheduler(timezone=app_tz)
     return _scheduler
 
 

@@ -5,6 +5,7 @@ Handles creation of transactions in Firefly III with proper
 account and category resolution.
 """
 
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +48,7 @@ class TransactionService:
         analysis: TransactionAnalysis,
         external_id: str | None = None,
         dry_run: bool = False,
+        transaction_datetime: datetime | None = None,
     ) -> dict[str, Any]:
         """
         Create a Firefly III transaction from AI analysis.
@@ -55,6 +57,9 @@ class TransactionService:
             analysis: Transaction analysis from DeepSeek.
             external_id: External reference ID for deduplication.
             dry_run: If True, don't actually create the transaction.
+            transaction_datetime: Exact datetime of the transaction/email.
+                If provided, this will be used (with time) for the Firefly
+                `date` field instead of only the analysis date.
             
         Returns:
             Transaction data if created, or mock data if dry_run.
@@ -99,8 +104,28 @@ class TransactionService:
                 resolved=category["name"],
             )
             
-            # Format date
-            date_str = analysis.date.strftime("%Y-%m-%d")
+            # Format date with time when available.
+            # Prefer the explicit transaction_datetime (typically email date),
+            # otherwise fall back to the analysis date.
+            effective_dt = transaction_datetime or analysis.date
+            
+            # Convert to Colombia timezone (UTC-5) for Firefly
+            # If datetime has timezone info and is UTC, subtract 5 hours
+            # If datetime is naive, assume it's UTC and subtract 5 hours
+            if effective_dt.tzinfo is not None:
+                # Timezone-aware datetime
+                # If it's UTC, convert to Colombia time (subtract 5 hours)
+                from datetime import timezone as tz
+                if effective_dt.tzinfo == tz.utc or str(effective_dt.tzinfo) == 'UTC':
+                    effective_dt = effective_dt - timedelta(hours=5)
+                # Remove timezone info for Firefly
+                effective_dt = effective_dt.replace(tzinfo=None)
+            else:
+                # Naive datetime - assume UTC and subtract 5 hours for Colombia
+                effective_dt = effective_dt - timedelta(hours=5)
+            
+            # Use full ISO 8601 with seconds (e.g. 2024-01-15T14:23:00)
+            date_str = effective_dt.isoformat(timespec="seconds")
             
             # Build transaction - Use only names, let Firefly resolve IDs
             transaction = TransactionCreate(

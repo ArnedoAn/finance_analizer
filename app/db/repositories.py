@@ -5,7 +5,7 @@ Data access layer with async CRUD operations for all database models.
 Follows repository pattern for clean separation of concerns.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Sequence
 
 from sqlalchemy import and_, delete, select, update
@@ -19,8 +19,10 @@ from app.db.models import (
     CategoryCache,
     KnownSender,
     ProcessedEmail,
+    ProcessedNotification,
     SchedulerJobLog,
     TagCache,
+    TransactionFingerprint,
 )
 from app.models.schemas import AuditLogCreate, ProcessingStatus
 
@@ -625,3 +627,171 @@ class SchedulerJobLogRepository:
         
         result = await self.session.execute(query)
         return result.scalars().all()
+
+
+class ProcessedNotificationRepository:
+    """Repository for managing processed notification records."""
+    
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+    
+    async def exists(self, notification_hash: str) -> bool:
+        """Check if a notification has been processed."""
+        query = select(ProcessedNotification).where(
+            ProcessedNotification.notification_hash == notification_hash
+        )
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none() is not None
+    
+    async def mark_processed(
+        self,
+        notification_hash: str,
+        source_app: str,
+        sender: str,
+        title: str,
+        notification_date: datetime,
+    ) -> ProcessedNotification:
+        """Mark a notification as processed."""
+        record = ProcessedNotification(
+            notification_hash=notification_hash,
+            source_app=source_app,
+            sender=sender,
+            title=title,
+            notification_date=notification_date,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        logger.debug("notification_marked_processed", hash=notification_hash[:12])
+        return record
+    
+    async def get_recent(
+        self,
+        limit: int = 100,
+        source_app: str | None = None,
+    ) -> Sequence[ProcessedNotification]:
+        """Get recent processed notifications."""
+        query = (
+            select(ProcessedNotification)
+            .order_by(ProcessedNotification.processed_at.desc())
+            .limit(limit)
+        )
+        if source_app:
+            query = query.where(ProcessedNotification.source_app == source_app)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
+    
+    async def get_count(self, source_app: str | None = None) -> int:
+        """Get count of processed notifications."""
+        from sqlalchemy import func
+        
+        query = select(func.count(ProcessedNotification.id))
+        if source_app:
+            query = query.where(ProcessedNotification.source_app == source_app)
+        
+        result = await self.session.execute(query)
+        return result.scalar_one()
+
+
+class TransactionFingerprintRepository:
+    """
+    Repository for cross-channel transaction deduplication.
+    
+    Stores fingerprints (hash of amount + date + account) for created
+    transactions regardless of source channel. Used to detect when the
+    same transaction arrives from both email and notification.
+    """
+    
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+    
+    async def find_duplicate(
+        self,
+        fingerprint_hash: str,
+        transaction_date: datetime,
+        window_hours: int = 2,
+    ) -> TransactionFingerprint | None:
+        """
+        Find a duplicate transaction within a time window.
+        
+        Args:
+            fingerprint_hash: Hash of (amount + date + account).
+            transaction_date: Date of the transaction to check.
+            window_hours: Time window in hours for fuzzy matching.
+            
+        Returns:
+            Existing fingerprint if duplicate found, None otherwise.
+        """
+        window_start = transaction_date - timedelta(hours=window_hours)
+        window_end = transaction_date + timedelta(hours=window_hours)
+        
+        query = select(TransactionFingerprint).where(
+            and_(
+                TransactionFingerprint.fingerprint_hash == fingerprint_hash,
+                TransactionFingerprint.transaction_date >= window_start,
+                TransactionFingerprint.transaction_date <= window_end,
+            )
+        ).order_by(TransactionFingerprint.created_at.desc()).limit(1)
+        
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+    
+    async def create(
+        self,
+        fingerprint_hash: str,
+        amount: str,
+        transaction_date: datetime,
+        source_channel: str,
+        source_id: str,
+        description: str = "",
+        firefly_transaction_id: str | None = None,
+    ) -> TransactionFingerprint:
+        """Create a new transaction fingerprint."""
+        record = TransactionFingerprint(
+            fingerprint_hash=fingerprint_hash,
+            amount=amount,
+            transaction_date=transaction_date,
+            source_channel=source_channel,
+            source_id=source_id,
+            description=description,
+            firefly_transaction_id=firefly_transaction_id,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        logger.debug(
+            "fingerprint_created",
+            hash=fingerprint_hash[:12],
+            channel=source_channel,
+        )
+        return record
+    
+    @staticmethod
+    def compute_hash(
+        amount: str,
+        transaction_date: datetime,
+        account_name: str,
+    ) -> str:
+        """
+        Compute a fingerprint hash from transaction data.
+        
+        Normalizes the amount (rounds to integer for COP) and uses
+        only the date part (not time) for matching.
+        """
+        import hashlib
+        from decimal import Decimal, ROUND_HALF_UP
+        
+        # Normalize amount: round to integer for large currencies (COP)
+        try:
+            amt = Decimal(str(amount))
+            normalized_amount = str(amt.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        except Exception:
+            normalized_amount = str(amount)
+        
+        # Use only date part for matching
+        date_str = transaction_date.strftime("%Y-%m-%d")
+        
+        # Normalize account name
+        normalized_account = account_name.strip().lower()
+        
+        raw = f"{normalized_amount}:{date_str}:{normalized_account}"
+        return hashlib.sha256(raw.encode()).hexdigest()

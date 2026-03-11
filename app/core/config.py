@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     )
     
     # =========================================================================
+    # Timezone Settings
+    # =========================================================================
+    timezone: str = Field(
+        default="America/Bogota", description="Application timezone (IANA timezone name)"
+    )
+    
+    # =========================================================================
     # Processing Options
     # =========================================================================
     dry_run: bool = Field(
@@ -146,6 +153,23 @@ class Settings(BaseSettings):
         default=False,
         description="TEST MODE: Clear processed emails table before processing (for testing only)"
     )
+    
+    # =========================================================================
+    # Webhook / Notification Settings
+    # =========================================================================
+    webhook_known_apps: str = Field(
+        default="com.nequi.MobileApp,ar.com.bancar.uala",
+        description="Comma-separated list of known financial app package names"
+    )
+    webhook_fingerprint_window_hours: int = Field(
+        default=2, ge=1, le=24,
+        description="Time window (hours) for cross-channel transaction deduplication"
+    )
+    
+    @property
+    def webhook_known_apps_list(self) -> list[str]:
+        """Parse comma-separated known apps into list."""
+        return [a.strip() for a in self.webhook_known_apps.split(",") if a.strip()]
     
     # =========================================================================
     # Retry Configuration

@@ -138,6 +138,25 @@ class TransactionCreationError(ProcessingError):
 
 
 # =============================================================================
+# Notification Exceptions
+# =============================================================================
+
+class NotificationError(FinanceAnalyzerError):
+    """Base exception for notification/webhook errors."""
+    pass
+
+
+class DuplicateNotificationError(NotificationError):
+    """Raised when a notification has already been processed."""
+    pass
+
+
+class NotificationFilteredError(NotificationError):
+    """Raised when a notification is filtered out (not financial)."""
+    pass
+
+
+# =============================================================================
 # Database Exceptions
 # =============================================================================
 

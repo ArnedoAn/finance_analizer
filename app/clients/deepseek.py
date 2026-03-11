@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -84,6 +85,33 @@ From: newsletter@amazon.com - Ofertas del día
 
 EJEMPLO OUTPUT:
 [{"keyword":"bancolombia","sender_name":"Bancolombia","sender_type":"bank","is_financial":true,"confidence_score":0.95},{"keyword":"nequi","sender_name":"Nequi","sender_type":"payment","is_financial":true,"confidence_score":0.9}]"""
+
+
+# System prompt for notification/SMS analysis
+SYSTEM_PROMPT_NOTIFICATION = """Extrae transacción financiera de una notificación SMS/push de app bancaria. Responde JSON:
+
+FORMATO:
+{"is_financial":true,"amount":0.00,"currency":"USD","date":"YYYY-MM-DD","description":"","merchant":"","suggested_category":"","suggested_account_name":"","transaction_type":"withdrawal|deposit","confidence_score":0.0}
+
+REGLAS:
+- is_financial: true si es una transacción (compra, transferencia, pago, retiro, depósito). false si es publicidad, OTP, saldo, recordatorio.
+- amount: positivo, decimal. Para COP las cantidades son grandes (miles o millones). "$50.000" = 50000 COP.
+- currency: ISO 4217 (USD,EUR,COP,MXN,ARS)
+- date: YYYY-MM-DD (usa la fecha proporcionada)
+- transaction_type: withdrawal=gasto/compra/retiro, deposit=ingreso/transferencia_recibida
+- suggested_category: Alimentación|Transporte|Entretenimiento|Servicios|Compras|Salud|Educación|Hogar|Transferencias
+- suggested_account_name: nombre del banco/app (ej: "Nequi", "Ualá", "Bancolombia", "Davivienda"). NO tarjetas específicas.
+- confidence_score: 0.0-1.0
+
+Si NO es financiero, responde: {"is_financial":false}
+
+EJEMPLO INPUT (Nequi):
+App: com.nequi.MobileApp
+Título: Nequi
+Compra aprobada por $45.000 en Rappi el 15/01/2024
+
+EJEMPLO OUTPUT:
+{"is_financial":true,"amount":45000,"currency":"COP","date":"2024-01-15","description":"Compra en Rappi","merchant":"Rappi","suggested_category":"Alimentación","suggested_account_name":"Nequi","transaction_type":"withdrawal","confidence_score":0.95}"""
 
 
 class DeepSeekClient:
@@ -304,6 +332,145 @@ class DeepSeekClient:
             logger.error("deepseek_analysis_failed", error=str(e))
             raise DeepSeekParseError(
                 "Failed to analyze email content",
+                original_error=e,
+            ) from e
+    
+    async def analyze_notification(
+        self,
+        notification_content: str,
+        notification_title: str = "",
+        source_app: str = "",
+        sender: str = "",
+        notification_date: str = "",
+        preferred_currency: str = "COP",
+    ) -> TransactionAnalysis | None:
+        """
+        Analyze notification/SMS content and extract transaction data.
+        
+        Args:
+            notification_content: The notification body text.
+            notification_title: Notification title.
+            source_app: Source app package name.
+            sender: Notification sender.
+            notification_date: Date string from notification.
+            preferred_currency: Default currency if not detected.
+            
+        Returns:
+            TransactionAnalysis if financial, None if not financial.
+            
+        Raises:
+            DeepSeekAPIError: If API call fails.
+            DeepSeekParseError: If response parsing fails.
+        """
+        # Build compact message for notification
+        parts = []
+        if source_app:
+            parts.append(f"App:{source_app}")
+        if sender:
+            parts.append(f"De:{sender}")
+        if notification_title:
+            parts.append(f"Título:{notification_title}")
+        parts.append(f"Moneda:{preferred_currency}")
+        if notification_date:
+            parts.append(f"Fecha:{notification_date}")
+        else:
+            parts.append(f"Hoy:{datetime.utcnow().strftime('%Y-%m-%d')}")
+        parts.append("")
+        parts.append(notification_content)
+        
+        user_content = "\n".join(parts)
+        
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_NOTIFICATION},
+            {"role": "user", "content": user_content},
+        ]
+        
+        logger.info(
+            "deepseek_analyzing_notification",
+            app=source_app,
+            title=notification_title[:30] if notification_title else "N/A",
+            content_chars=len(notification_content),
+        )
+        
+        try:
+            response = await self._call_api(messages, max_tokens=300)
+            return self._parse_notification_response(
+                response, preferred_currency, source_app
+            )
+        except (DeepSeekAPIError, DeepSeekRateLimitError):
+            raise
+        except Exception as e:
+            logger.error("deepseek_notification_analysis_failed", error=str(e))
+            raise DeepSeekParseError(
+                "Failed to analyze notification content",
+                original_error=e,
+            ) from e
+    
+    def _parse_notification_response(
+        self,
+        response: dict[str, Any],
+        default_currency: str,
+        source_app: str = "",
+    ) -> TransactionAnalysis | None:
+        """Parse notification API response. Returns None if not financial."""
+        try:
+            choices = response.get("choices", [])
+            if not choices:
+                raise DeepSeekParseError("Empty response from DeepSeek")
+            
+            content = choices[0].get("message", {}).get("content", "")
+            data = json.loads(content)
+            
+            # Check if AI determined this is a financial notification
+            if not data.get("is_financial", False):
+                logger.info(
+                    "notification_not_financial",
+                    app=source_app,
+                )
+                return None
+            
+            currency = data.get("currency", default_currency).upper()
+            amount = self._parse_amount(data.get("amount", 0))
+            
+            # COP scale correction (same as email)
+            if currency == "COP" and amount < Decimal("100"):
+                original_amount = amount
+                amount = amount * Decimal("1000")
+                logger.warning(
+                    "deepseek_notification_amount_corrected",
+                    original_amount=float(original_amount),
+                    corrected_amount=float(amount),
+                    currency=currency,
+                )
+            
+            return TransactionAnalysis(
+                amount=amount,
+                currency=currency,
+                date=self._parse_date(data.get("date")),
+                description=data.get("description", "Transacción sin descripción"),
+                merchant=data.get("merchant", ""),
+                suggested_category=data.get("suggested_category", "Sin Categoría"),
+                suggested_account_name=data.get("suggested_account_name", ""),
+                transaction_type=self._parse_transaction_type(
+                    data.get("transaction_type", "withdrawal")
+                ),
+                confidence_score=float(data.get("confidence_score", 0.5)),
+                raw_extracted=data,
+                email_sender=source_app,
+            )
+        except json.JSONDecodeError as e:
+            logger.error("deepseek_notification_json_parse_failed", error=str(e))
+            raise DeepSeekParseError(
+                "Failed to parse notification JSON response",
+                details={"content": content[:200]},
+                original_error=e,
+            ) from e
+        except Exception as e:
+            if isinstance(e, DeepSeekParseError):
+                raise
+            logger.error("deepseek_notification_parse_failed", error=str(e))
+            raise DeepSeekParseError(
+                "Failed to parse DeepSeek notification response",
                 original_error=e,
             ) from e
     

@@ -221,6 +221,61 @@ class KnownSender(Base):
         return f"<KnownSender(keyword={self.keyword}, name={self.sender_name})>"
 
 
+class ProcessedNotification(Base):
+    """
+    Tracks notifications that have been processed.
+    
+    Used for idempotency to prevent reprocessing the same notification/SMS.
+    The notification_hash is a SHA-256 of (sender + message + timestamp).
+    """
+    
+    __tablename__ = "processed_notifications"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    notification_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    source_app: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    sender: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    notification_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=func.now()
+    )
+    
+    def __repr__(self) -> str:
+        return f"<ProcessedNotification(id={self.id}, hash={self.notification_hash[:12]}..., app={self.source_app})>"
+
+
+class TransactionFingerprint(Base):
+    """
+    Cross-channel transaction deduplication.
+    
+    Stores a fingerprint (hash of amount + date + account) for each created
+    transaction, regardless of source channel (email or notification).
+    Used to detect when the same transaction arrives from both email and SMS.
+    """
+    
+    __tablename__ = "transaction_fingerprints"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fingerprint_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    amount: Mapped[str] = mapped_column(String(50), nullable=False)
+    transaction_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    source_channel: Mapped[str] = mapped_column(String(20), nullable=False)  # email, notification
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    firefly_transaction_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=func.now()
+    )
+    
+    __table_args__ = (
+        Index("ix_fingerprint_hash_date", "fingerprint_hash", "transaction_date"),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<TransactionFingerprint(id={self.id}, channel={self.source_channel}, amount={self.amount})>"
+
+
 class SchedulerJobLog(Base):
     """
     Log of scheduled job executions.

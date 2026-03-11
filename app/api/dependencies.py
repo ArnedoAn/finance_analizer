@@ -17,6 +17,7 @@ from app.clients.firefly import FireflyClient
 from app.clients.gmail import GmailClient
 from app.db.database import get_db, get_db_session as db_session_context
 from app.services.email_processor import EmailProcessorService
+from app.services.notification_processor import NotificationProcessorService
 from app.services.sync_service import SyncService
 from app.services.transaction_service import TransactionService
 
@@ -71,6 +72,7 @@ class Services:
     """Container for all application services."""
     
     email_processor: EmailProcessorService
+    notification_processor: NotificationProcessorService
     sync_service: SyncService
     transaction_service: TransactionService
     gmail: GmailClient
@@ -96,9 +98,11 @@ async def get_services(
     sync_service = SyncService(db, firefly)
     transaction_service = TransactionService(db, firefly, sync_service)
     email_processor = EmailProcessorService(db, gmail, deepseek, firefly)
+    notification_processor = NotificationProcessorService(db, deepseek, firefly)
     
     yield Services(
         email_processor=email_processor,
+        notification_processor=notification_processor,
         sync_service=sync_service,
         transaction_service=transaction_service,
         gmail=gmail,

@@ -10,6 +10,7 @@ from app.api.endpoints import (
     auth,
     emails,
     health,
+    notifications,
     processing,
     scheduler,
     senders,
@@ -57,4 +58,10 @@ api_router.include_router(
 api_router.include_router(
     scheduler.router,
     tags=["Scheduler"],
+)
+
+api_router.include_router(
+    notifications.router,
+    prefix="/notifications",
+    tags=["Notifications"],
 )

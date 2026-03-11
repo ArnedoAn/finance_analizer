@@ -499,3 +499,68 @@ class SenderLearningResponse(BaseModel):
     emails_analyzed: int
     senders_learned: int
     new_senders: list[dict[str, Any]]
+
+
+# =============================================================================
+# Notification / Webhook Models
+# =============================================================================
+
+class NotificationPayload(BaseModel):
+    """
+    Incoming webhook payload from phone notification app.
+    
+    Maps the template variables from the phone app's webhook configuration.
+    """
+    
+    model_config = ConfigDict(frozen=True)
+    
+    id: str = Field(..., description="Notification ID (from-date)")
+    type: str = Field(default="", description="Notification type")
+    app: str = Field(..., description="Source app package name (e.g., com.nequi.MobileApp)")
+    sender: str = Field(default="", description="Notification sender")
+    message: str = Field(default="", description="Notification body")
+    title: str = Field(default="", description="Notification title")
+    text: str = Field(default="", description="Notification text content")
+    timestamp: str = Field(default="", description="Notification timestamp")
+    date: str = Field(default="", description="Notification date")
+    category: str = Field(default="", description="Notification category")
+    device: str = Field(default="", description="Device that received the notification")
+    
+    @property
+    def content(self) -> str:
+        """Return the best available content (message > text)."""
+        return self.message or self.text
+    
+    @property
+    def notification_hash(self) -> str:
+        """Generate SHA-256 hash for idempotency."""
+        import hashlib
+        raw = f"{self.sender}:{self.message}:{self.timestamp}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+
+class NotificationProcessingResult(BaseModel):
+    """Result of processing a single notification."""
+    
+    notification_hash: str = Field(..., description="Notification idempotency hash")
+    source_app: str = Field(default="", description="Source app package name")
+    status: ProcessingStatus
+    analysis: TransactionAnalysis | None = Field(default=None)
+    transaction_id: str | None = Field(default=None)
+    error_message: str | None = Field(default=None)
+    error_details: dict[str, Any] = Field(default_factory=dict)
+    processing_time_ms: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    @property
+    def is_success(self) -> bool:
+        """Check if processing was successful."""
+        return self.status in (ProcessingStatus.CREATED, ProcessingStatus.DRY_RUN)
+
+
+class NotificationWebhookResponse(BaseModel):
+    """Immediate response for webhook (202 Accepted)."""
+    
+    accepted: bool = Field(default=True)
+    notification_hash: str = Field(..., description="Hash for tracking")
+    message: str = Field(default="Notification accepted for processing")

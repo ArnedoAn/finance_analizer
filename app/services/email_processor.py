@@ -30,6 +30,7 @@ from app.db.repositories import (
     AuditLogRepository,
     KnownSenderRepository,
     ProcessedEmailRepository,
+    TransactionFingerprintRepository,
 )
 from app.models.schemas import (
     AuditLogCreate,
@@ -72,6 +73,7 @@ class EmailProcessorService:
         self._processed_repo = ProcessedEmailRepository(session)
         self._audit_repo = AuditLogRepository(session)
         self._sender_repo = KnownSenderRepository(session)
+        self._fingerprint_repo = TransactionFingerprintRepository(session)
         
         # Services
         self._sync_service = SyncService(session, firefly_client)
@@ -289,7 +291,11 @@ class EmailProcessorService:
         start_time = time.time()
         dry_run = dry_run or self.settings.dry_run
         # Normalize email_date to naive datetime (PostgreSQL column is TIMESTAMP WITHOUT TIME ZONE)
-        email_date = email.date.replace(tzinfo=None) if getattr(email.date, "tzinfo", None) else email.date
+        email_date = (
+            email.date.replace(tzinfo=None)
+            if getattr(email.date, "tzinfo", None)
+            else email.date
+        )
         
         logger.info(
             "processing_email",
@@ -341,6 +347,8 @@ class EmailProcessorService:
                 analysis,
                 external_id=email.idempotency_key,
                 dry_run=dry_run,
+                # Use the email's datetime (with time) for Firefly transaction date
+                transaction_datetime=email_date,
             )
             
             transaction_id = result.get("id")
@@ -355,6 +363,22 @@ class EmailProcessorService:
                     email.message_id,
                     email.internal_id,
                     email_date,
+                )
+                
+                # Save fingerprint for cross-channel deduplication
+                fingerprint_hash = TransactionFingerprintRepository.compute_hash(
+                    amount=str(analysis.amount),
+                    transaction_date=analysis.date,
+                    account_name=analysis.suggested_account_name,
+                )
+                await self._fingerprint_repo.create(
+                    fingerprint_hash=fingerprint_hash,
+                    amount=str(analysis.amount),
+                    transaction_date=analysis.date,
+                    source_channel="email",
+                    source_id=email.idempotency_key,
+                    description=analysis.description,
+                    firefly_transaction_id=transaction_id,
                 )
             
         except FireflyDuplicateError as e:

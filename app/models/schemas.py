@@ -46,6 +46,14 @@ class ProcessingStatus(str, Enum):
     DRY_RUN = "dry_run"
 
 
+class ProcessingJobStatus(str, Enum):
+    """Async email batch job lifecycle status."""
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 # =============================================================================
 # Gmail Models
 # =============================================================================
@@ -395,6 +403,28 @@ class BatchProcessResponse(BaseModel):
     dry_run: bool
     results: list[ProcessingResult]
     processing_time_ms: int
+
+
+class ProcessingJobCreateResponse(BaseModel):
+    """Immediate response when an async processing job is enqueued."""
+
+    job_id: str
+    status: ProcessingJobStatus
+    poll_url: str
+    message: str
+
+
+class ProcessingJobStatusResponse(BaseModel):
+    """Polling response for async processing job state."""
+
+    job_id: str
+    status: ProcessingJobStatus
+    session_id: str
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    result: BatchProcessResponse | None = None
+    error_message: str | None = None
 
 
 class ErrorResponse(BaseModel):

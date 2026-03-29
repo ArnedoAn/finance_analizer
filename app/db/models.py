@@ -377,3 +377,32 @@ class SchedulerJobLog(Base):
     
     def __repr__(self) -> str:
         return f"<SchedulerJobLog(job={self.job_name}, status={self.status})>"
+
+
+class ProcessingJob(Base):
+    """
+    Async processing job state for email batch execution.
+
+    Stores request payload, lifecycle status, and final result/error to support
+    frontend polling without keeping the HTTP request open.
+    """
+
+    __tablename__ = "processing_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", index=True)
+    request_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_processing_jobs_session_created", "session_id", "created_at"),
+        Index("ix_processing_jobs_session_status", "session_id", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ProcessingJob(id={self.id}, session_id={self.session_id}, status={self.status})>"

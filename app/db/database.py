@@ -191,6 +191,7 @@ def _ensure_session_columns(sync_conn: object) -> None:
         "processed_notifications",
         "transaction_fingerprints",
         "scheduler_job_logs",
+        "processing_jobs",
         "account_cache",
         "category_cache",
         "tag_cache",
@@ -267,6 +268,16 @@ def _ensure_session_columns(sync_conn: object) -> None:
         sync_conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_scheduler_job_logs_session_job_date "
             "ON scheduler_job_logs (session_id, job_name, started_at)"
+        )
+
+    if "processing_jobs" in table_names:
+        sync_conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_processing_jobs_session_created "
+            "ON processing_jobs (session_id, created_at)"
+        )
+        sync_conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_processing_jobs_session_status "
+            "ON processing_jobs (session_id, status)"
         )
 
     # Session-aware cache indexes and constraints.

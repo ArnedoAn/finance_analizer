@@ -6,6 +6,7 @@ Follows repository pattern for clean separation of concerns.
 """
 
 from datetime import datetime, timedelta
+import uuid
 from typing import Sequence
 
 from sqlalchemy import and_, delete, select, update
@@ -19,6 +20,7 @@ from app.db.models import (
     AuditLog,
     CategoryCache,
     KnownSender,
+    ProcessingJob,
     ProcessedEmail,
     ProcessedNotification,
     SchedulerJobLog,
@@ -772,6 +774,97 @@ class ProcessedNotificationRepository:
         
         result = await self.session.execute(query)
         return result.scalar_one()
+
+
+class ProcessingJobRepository:
+    """Repository for async processing jobs."""
+
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
+        self.session = session
+        self.session_id = _validate_session_id(session_id)
+
+    async def create(self, request_payload: dict | None = None) -> ProcessingJob:
+        """Create a queued processing job."""
+        job = ProcessingJob(
+            id=uuid.uuid4().hex,
+            session_id=self.session_id,
+            status="queued",
+            request_payload=request_payload,
+        )
+        self.session.add(job)
+        await self.session.flush()
+        return job
+
+    async def mark_running(self, job_id: str) -> bool:
+        """Mark a processing job as running."""
+        query = (
+            update(ProcessingJob)
+            .where(
+                and_(
+                    ProcessingJob.id == job_id,
+                    ProcessingJob.session_id == self.session_id,
+                )
+            )
+            .values(
+                status="running",
+                started_at=datetime.utcnow(),
+            )
+        )
+        result = await self.session.execute(query)
+        await self.session.flush()
+        return bool(result.rowcount)
+
+    async def mark_completed(self, job_id: str, result_payload: dict | None = None) -> bool:
+        """Mark a processing job as completed."""
+        query = (
+            update(ProcessingJob)
+            .where(
+                and_(
+                    ProcessingJob.id == job_id,
+                    ProcessingJob.session_id == self.session_id,
+                )
+            )
+            .values(
+                status="completed",
+                completed_at=datetime.utcnow(),
+                result_payload=result_payload,
+                error_message=None,
+            )
+        )
+        result = await self.session.execute(query)
+        await self.session.flush()
+        return bool(result.rowcount)
+
+    async def mark_failed(self, job_id: str, error_message: str) -> bool:
+        """Mark a processing job as failed."""
+        query = (
+            update(ProcessingJob)
+            .where(
+                and_(
+                    ProcessingJob.id == job_id,
+                    ProcessingJob.session_id == self.session_id,
+                )
+            )
+            .values(
+                status="failed",
+                completed_at=datetime.utcnow(),
+                error_message=error_message,
+            )
+        )
+        result = await self.session.execute(query)
+        await self.session.flush()
+        return bool(result.rowcount)
+
+    async def get_by_id(self, job_id: str) -> ProcessingJob | None:
+        """Get a processing job by id for this session."""
+        query = select(ProcessingJob).where(
+            and_(
+                ProcessingJob.id == job_id,
+                ProcessingJob.session_id == self.session_id,
+            )
+        )
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
 
 
 class TransactionFingerprintRepository:

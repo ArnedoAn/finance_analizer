@@ -7,17 +7,31 @@ Main endpoints for processing emails and creating transactions.
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import ServicesDep
+from app.api.dependencies import (
+    SessionDep,
+    ServicesDep,
+    async_session_factory,
+    get_db_session,
+    get_deepseek_client,
+    get_firefly_client,
+    get_gmail_client,
+)
 from app.core.exceptions import ProcessingError
+from app.db.repositories import ProcessingJobRepository
 from app.models.schemas import (
     BatchProcessRequest,
     BatchProcessResponse,
+    ProcessingJobCreateResponse,
+    ProcessingJobStatus,
+    ProcessingJobStatusResponse,
     ProcessingResult,
     ProcessingStatus,
 )
+from app.services.email_processor import EmailProcessorService
 
 router = APIRouter()
 
@@ -40,14 +54,17 @@ class ProcessSingleResponse(BaseModel):
 
 @router.post(
     "/batch",
-    response_model=BatchProcessResponse,
+    response_model=ProcessingJobCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Process Email Batch",
-    description="Process a batch of emails from Gmail.",
+    description="Enqueue a batch of emails for asynchronous processing.",
 )
 async def process_batch(
-    services: ServicesDep,
+    background_tasks: BackgroundTasks,
+    session_ctx: SessionDep,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
     request: BatchProcessRequest | None = None,
-) -> BatchProcessResponse:
+) -> ProcessingJobCreateResponse:
     """
     Process a batch of financial emails.
     
@@ -63,15 +80,94 @@ async def process_batch(
         BatchProcessResponse with results for each email.
     """
     request = request or BatchProcessRequest()
-    
+    job_repo = ProcessingJobRepository(db, session_id=session_ctx.session_id)
+    job = await job_repo.create(request_payload=request.model_dump(mode="json"))
+    await db.commit()
+
+    background_tasks.add_task(
+        _run_batch_processing_job,
+        session_ctx.session_id,
+        job.id,
+        request.model_dump(mode="json"),
+    )
+
+    return ProcessingJobCreateResponse(
+        job_id=job.id,
+        status=ProcessingJobStatus.QUEUED,
+        poll_url=f"/api/v1/processing/jobs/{job.id}",
+        message="Processing job enqueued. Poll poll_url for status.",
+    )
+
+
+async def _run_batch_processing_job(
+    session_id: str,
+    job_id: str,
+    request_payload: dict,
+) -> None:
+    """Background task that executes an email batch processing job."""
+    request = BatchProcessRequest.model_validate(request_payload)
+
+    async with async_session_factory() as db:
+        job_repo = ProcessingJobRepository(db, session_id=session_id)
+        await job_repo.mark_running(job_id)
+        await db.commit()
+
     try:
-        result = await services.email_processor.process_batch(request)
-        return result
+        async with async_session_factory() as db:
+            gmail = get_gmail_client(session_id)
+            deepseek = get_deepseek_client()
+            firefly = get_firefly_client(session_id)
+            processor = EmailProcessorService(
+                session=db,
+                gmail_client=gmail,
+                deepseek_client=deepseek,
+                firefly_client=firefly,
+                session_id=session_id,
+            )
+            result = await processor.process_batch(request)
+            job_repo = ProcessingJobRepository(db, session_id=session_id)
+            await job_repo.mark_completed(job_id, result_payload=result.model_dump(mode="json"))
+            await db.commit()
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Batch processing failed: {str(e)}",
-        )
+        async with async_session_factory() as db:
+            job_repo = ProcessingJobRepository(db, session_id=session_id)
+            await job_repo.mark_failed(job_id, error_message=str(e))
+            await db.commit()
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=ProcessingJobStatusResponse,
+    summary="Get async job status",
+    description="Poll the status/result of an asynchronous batch processing job.",
+)
+async def get_processing_job_status(
+    job_id: str,
+    session_ctx: SessionDep,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+) -> ProcessingJobStatusResponse:
+    """Get status of a processing job scoped to current session."""
+    job_repo = ProcessingJobRepository(db, session_id=session_ctx.session_id)
+    job = await job_repo.get_by_id(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Processing job not found")
+
+    result_payload = job.result_payload
+    parsed_result = (
+        BatchProcessResponse.model_validate(result_payload)
+        if isinstance(result_payload, dict)
+        else None
+    )
+    return ProcessingJobStatusResponse(
+        job_id=job.id,
+        status=ProcessingJobStatus(job.status),
+        session_id=job.session_id,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        result=parsed_result,
+        error_message=job.error_message,
+    )
 
 
 @router.post(

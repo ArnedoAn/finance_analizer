@@ -27,6 +27,7 @@ TELEGRAM_CHAT_ID_HEADER_NAME = "X-Telegram-Chat-ID"
 
 _SESSION_ID_PATTERN: Pattern[str] = re_compile(r"^[a-zA-Z0-9_-]{8,64}$")
 _TELEGRAM_ID_PATTERN: Pattern[str] = re_compile(r"^-?[0-9]{4,24}$")
+_PKCE_VERIFIER_PATTERN: Pattern[str] = re_compile(r"^[A-Za-z0-9._~-]{43,128}$")
 
 
 def normalize_session_id(raw_value: str | None) -> str | None:
@@ -160,7 +161,18 @@ def _sign_oauth_payload(payload_json: str) -> str:
     return _b64url_encode(digest)
 
 
-def create_oauth_state(session_id: str, issued_at: int | None = None) -> str:
+def create_pkce_code_verifier() -> str:
+    """Create PKCE code verifier compatible with RFC 7636."""
+    # token_urlsafe(64) yields a URL-safe string in allowed PKCE charset
+    # and length usually greater than 43.
+    return secrets.token_urlsafe(64)
+
+
+def create_oauth_state(
+    session_id: str,
+    issued_at: int | None = None,
+    code_verifier: str | None = None,
+) -> str:
     """
     Create a signed OAuth state payload that carries session_id.
 
@@ -175,6 +187,11 @@ def create_oauth_state(session_id: str, issued_at: int | None = None) -> str:
         "iat": issued_at if issued_at is not None else int(time.time()),
         "nonce": secrets.token_urlsafe(12),
     }
+    if code_verifier is not None:
+        verifier = code_verifier.strip()
+        if not _PKCE_VERIFIER_PATTERN.fullmatch(verifier):
+            raise ValueError("Invalid PKCE code verifier")
+        payload["cv"] = verifier
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     envelope = {
         "v": 1,
@@ -185,12 +202,12 @@ def create_oauth_state(session_id: str, issued_at: int | None = None) -> str:
     return _b64url_encode(encoded)
 
 
-def parse_oauth_state(state: str) -> str:
+def parse_oauth_state_payload(state: str) -> dict[str, str]:
     """
-    Validate and decode OAuth state, returning the embedded session_id.
+    Validate and decode OAuth state payload.
 
-    Raises:
-        ValueError: If state is malformed, expired, or tampered with.
+    Returns:
+        Dict with session_id and optional code_verifier.
     """
     if not state:
         raise ValueError("Missing OAuth state")
@@ -229,4 +246,25 @@ def parse_oauth_state(state: str) -> str:
     if age < 0 or age > max_age:
         raise ValueError("OAuth state expired")
 
-    return session_id
+    code_verifier = payload.get("cv")
+    if code_verifier is not None:
+        if not isinstance(code_verifier, str):
+            raise ValueError("Invalid PKCE code verifier in OAuth state")
+        if not _PKCE_VERIFIER_PATTERN.fullmatch(code_verifier):
+            raise ValueError("Invalid PKCE code verifier in OAuth state")
+
+    return {
+        "session_id": session_id,
+        "code_verifier": code_verifier or "",
+    }
+
+
+def parse_oauth_state(state: str) -> str:
+    """
+    Validate and decode OAuth state, returning the embedded session_id.
+
+    Raises:
+        ValueError: If state is malformed, expired, or tampered with.
+    """
+    payload = parse_oauth_state_payload(state)
+    return payload["session_id"]

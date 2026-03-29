@@ -7,6 +7,7 @@ Uses the Google API Python client with async wrappers.
 
 import asyncio
 import base64
+import hashlib
 import json
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -211,7 +212,17 @@ class GmailClient:
             details={"action": "visit_auth_url"},
         )
     
-    def get_authorization_url(self, state: str | None = None) -> tuple[str, str]:
+    @staticmethod
+    def _pkce_code_challenge(code_verifier: str) -> str:
+        """Generate S256 PKCE code challenge from code verifier."""
+        digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+        return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+    def get_authorization_url(
+        self,
+        state: str | None = None,
+        code_verifier: str | None = None,
+    ) -> tuple[str, str]:
         """
         Generate OAuth authorization URL for web-based flow.
         
@@ -232,11 +243,16 @@ class GmailClient:
             redirect_uri=self.settings.gmail_redirect_uri,
         )
         
-        authorization_url, returned_state = flow.authorization_url(
-            access_type="offline",
-            prompt="consent",  # Force consent to get refresh_token
-            state=state,
-        )
+        auth_kwargs: dict[str, Any] = {
+            "access_type": "offline",
+            "prompt": "consent",  # Force consent to get refresh_token
+            "state": state,
+        }
+        if code_verifier:
+            auth_kwargs["code_challenge"] = self._pkce_code_challenge(code_verifier)
+            auth_kwargs["code_challenge_method"] = "S256"
+
+        authorization_url, returned_state = flow.authorization_url(**auth_kwargs)
         
         return authorization_url, returned_state
     
@@ -245,6 +261,7 @@ class GmailClient:
         code: str,
         state: str | None = None,
         expected_state: str | None = None,
+        code_verifier: str | None = None,
     ) -> bool:
         """
         Handle OAuth callback with authorization code.
@@ -279,7 +296,10 @@ class GmailClient:
             )
             
             # Exchange code for credentials
-            await self._run_sync(flow.fetch_token, code=code)
+            token_kwargs: dict[str, Any] = {"code": code}
+            if code_verifier:
+                token_kwargs["code_verifier"] = code_verifier
+            await self._run_sync(flow.fetch_token, **token_kwargs)
             creds = flow.credentials
             
             # Save credentials

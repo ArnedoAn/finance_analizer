@@ -19,8 +19,9 @@ from app.core.logging import get_logger
 from app.core.session import (
     TELEGRAM_SESSION_HEADER_NAME,
     build_telegram_session_id,
+    create_pkce_code_verifier,
     create_oauth_state,
-    parse_oauth_state,
+    parse_oauth_state_payload,
 )
 
 logger = get_logger(__name__)
@@ -90,9 +91,16 @@ async def get_auth_url(session: SessionDep) -> AuthUrlResponse:
         Authorization URL and state for CSRF protection.
     """
     try:
-        oauth_state = create_oauth_state(session.session_id)
+        code_verifier = create_pkce_code_verifier()
+        oauth_state = create_oauth_state(
+            session.session_id,
+            code_verifier=code_verifier,
+        )
         gmail = get_gmail_client(session.session_id)
-        auth_url, state = gmail.get_authorization_url(state=oauth_state)
+        auth_url, state = gmail.get_authorization_url(
+            state=oauth_state,
+            code_verifier=code_verifier,
+        )
         
         logger.info(
             "gmail_auth_url_generated",
@@ -153,12 +161,15 @@ async def oauth_callback(
     
     try:
         provided_state = state or ""
-        session_id = parse_oauth_state(provided_state)
+        state_payload = parse_oauth_state_payload(provided_state)
+        session_id = state_payload["session_id"]
+        code_verifier = state_payload.get("code_verifier") or None
         gmail = get_gmail_client(session_id)
         success = await gmail.handle_oauth_callback(
             code=code,
             state=provided_state,
             expected_state=provided_state,
+            code_verifier=code_verifier,
         )
         
         if success:

@@ -482,12 +482,7 @@ class KnownSenderRepository:
     
     async def get_by_keyword(self, keyword: str) -> KnownSender | None:
         """Get sender by keyword."""
-        query = select(KnownSender).where(
-            and_(
-                KnownSender.session_id == self.session_id,
-                KnownSender.keyword == keyword.lower(),
-            )
-        )
+        query = select(KnownSender).where(KnownSender.keyword == keyword.lower())
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
     
@@ -516,23 +511,13 @@ class KnownSenderRepository:
     
     async def get_all_active(self) -> Sequence[KnownSender]:
         """Get all active known senders."""
-        query = select(KnownSender).where(
-            and_(
-                KnownSender.session_id == self.session_id,
-                KnownSender.is_active == True,
-            )
-        )
+        query = select(KnownSender).where(KnownSender.is_active == True)
         result = await self.session.execute(query)
         return result.scalars().all()
     
     async def get_all_keywords(self) -> set[str]:
         """Get all active sender keywords as a set."""
-        query = select(KnownSender.keyword).where(
-            and_(
-                KnownSender.session_id == self.session_id,
-                KnownSender.is_active == True,
-            )
-        )
+        query = select(KnownSender.keyword).where(KnownSender.is_active == True)
         result = await self.session.execute(query)
         return {row[0].lower() for row in result.fetchall()}
     
@@ -546,7 +531,6 @@ class KnownSenderRepository:
     ) -> KnownSender:
         """Add a new known sender."""
         sender = KnownSender(
-            session_id=self.session_id,
             keyword=keyword.lower(),
             sender_name=sender_name,
             sender_type=sender_type,
@@ -561,12 +545,7 @@ class KnownSenderRepository:
         """Increment match count for a sender."""
         query = (
             update(KnownSender)
-            .where(
-                and_(
-                    KnownSender.session_id == self.session_id,
-                    KnownSender.keyword == keyword.lower(),
-                )
-            )
+            .where(KnownSender.keyword == keyword.lower())
             .values(
                 emails_matched=KnownSender.emails_matched + 1,
                 last_matched_at=datetime.utcnow(),
@@ -579,12 +558,7 @@ class KnownSenderRepository:
         """Deactivate a sender."""
         query = (
             update(KnownSender)
-            .where(
-                and_(
-                    KnownSender.session_id == self.session_id,
-                    KnownSender.keyword == keyword.lower(),
-                )
-            )
+            .where(KnownSender.keyword == keyword.lower())
             .values(is_active=False)
         )
         await self.session.execute(query)
@@ -592,12 +566,7 @@ class KnownSenderRepository:
     
     async def exists(self, keyword: str) -> bool:
         """Check if a sender keyword exists."""
-        query = select(KnownSender).where(
-            and_(
-                KnownSender.session_id == self.session_id,
-                KnownSender.keyword == keyword.lower(),
-            )
-        )
+        query = select(KnownSender).where(KnownSender.keyword == keyword.lower())
         result = await self.session.execute(query)
         return result.scalar_one_or_none() is not None
     

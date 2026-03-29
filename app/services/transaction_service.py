@@ -55,6 +55,8 @@ class TransactionService:
         external_id: str | None = None,
         dry_run: bool = False,
         transaction_datetime: datetime | None = None,
+        source_channel: str = "email",
+        source_app: str | None = None,
     ) -> dict[str, Any]:
         """
         Create a Firefly III transaction from AI analysis.
@@ -149,7 +151,12 @@ class TransactionService:
                         category_name=category["name"],
                         currency_code=analysis.currency,
                         external_id=external_id,
-                        notes=self._build_notes(analysis),
+                        notes=self._build_notes(
+                            analysis,
+                            source_channel=source_channel,
+                            source_app=source_app,
+                        ),
+                        tags=[f"source_{source_channel}"],
                     )
                 ],
             )
@@ -203,10 +210,17 @@ class TransactionService:
                 original_error=e,
             ) from e
     
-    def _build_notes(self, analysis: TransactionAnalysis) -> str:
+    def _build_notes(
+        self,
+        analysis: TransactionAnalysis,
+        source_channel: str = "email",
+        source_app: str | None = None,
+    ) -> str:
         """Build transaction notes from analysis."""
         notes_parts = [
             "Created by Finance Analyzer",
+            f"Source channel: {source_channel}",
+            f"Source app: {source_app}" if source_app else None,
             f"Merchant: {analysis.merchant}" if analysis.merchant else None,
             f"AI Confidence: {analysis.confidence_score:.0%}",
         ]

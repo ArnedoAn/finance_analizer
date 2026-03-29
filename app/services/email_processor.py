@@ -218,13 +218,42 @@ class EmailProcessorService:
                 processing_time_ms=int((time.time() - start_time) * 1000),
             )
         
-        # Process each email
+        # Prefilter obvious non-financial emails before AI analysis.
+        sender_keywords = await self._sender_repo.get_all_keywords()
+        candidate_emails: list[EmailMessage] = []
+        prefiltered_results: list[ProcessingResult] = []
+        for email in emails:
+            if self._is_likely_financial_email(
+                email,
+                sender_keywords=sender_keywords,
+                subject_filters=filter_config.subjects,
+            ):
+                candidate_emails.append(email)
+            else:
+                prefiltered_results.append(
+                    ProcessingResult(
+                        email_id=email.internal_id,
+                        status=ProcessingStatus.SKIPPED,
+                        error_message="Filtered as non-financial email",
+                    )
+                )
+
+        if prefiltered_results:
+            logger.info(
+                "batch_prefilter_applied",
+                total=len(emails),
+                candidates=len(candidate_emails),
+                skipped=len(prefiltered_results),
+            )
+
+        # Process each candidate email
         results: list[ProcessingResult] = []
         created = 0
-        skipped = 0
+        skipped = len(prefiltered_results)
         failed = 0
+        results.extend(prefiltered_results)
         
-        for email in emails:
+        for email in candidate_emails:
             try:
                 result = await self.process_single_email(
                     email,
@@ -258,7 +287,7 @@ class EmailProcessorService:
         
         logger.info(
             "batch_processing_completed",
-            total=len(emails),
+            total=len(results),
             created=created,
             skipped=skipped,
             failed=failed,
@@ -266,7 +295,7 @@ class EmailProcessorService:
         )
         
         return BatchProcessResponse(
-            total_emails=len(emails),
+            total_emails=len(results),
             processed=len(results),
             created=created,
             skipped=skipped,
@@ -359,6 +388,7 @@ class EmailProcessorService:
                 dry_run=dry_run,
                 # Use the email's datetime (with time) for Firefly transaction date
                 transaction_datetime=email_date,
+                source_channel="email",
             )
             
             transaction_id = result.get("id")
@@ -461,6 +491,43 @@ class EmailProcessorService:
             email_sender=email.sender,
             preferred_currency=self.settings.default_currency,
         )
+
+    def _is_likely_financial_email(
+        self,
+        email: EmailMessage,
+        sender_keywords: set[str],
+        subject_filters: list[str],
+    ) -> bool:
+        """Heuristic filter to avoid sending obvious non-financial emails to AI."""
+        sender_lower = (email.sender or "").lower()
+        subject_lower = (email.subject or "").lower()
+        body_lower = (email.body or "").lower()
+
+        if any(keyword in sender_lower for keyword in sender_keywords):
+            return True
+
+        normalized_subject_filters = [s.lower().strip() for s in subject_filters if s.strip()]
+        if any(token in subject_lower for token in normalized_subject_filters):
+            return True
+
+        financial_tokens = (
+            "compra",
+            "pago",
+            "transfer",
+            "debito",
+            "crédito",
+            "credito",
+            "factura",
+            "recibo",
+            "retiro",
+            "abono",
+            "consumo",
+            "tarjeta",
+            "saldo",
+            "transaccion",
+        )
+        searchable = f"{subject_lower} {body_lower[:800]}"
+        return any(token in searchable for token in financial_tokens)
     
     async def analyze_email_preview(
         self,

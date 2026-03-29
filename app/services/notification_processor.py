@@ -267,6 +267,8 @@ class NotificationProcessorService:
                 external_id=f"notif:{notification_hash}",
                 dry_run=dry_run,
                 transaction_datetime=notification_date,
+                source_channel="notification",
+                source_app=notification.app,
             )
             
             transaction_id = result.get("id")

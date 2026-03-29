@@ -284,7 +284,7 @@ class TestSessionScopedRepositories:
         assert await repo_a.get_by_name("Food") is not None
         assert await repo_b.get_by_name("Food") is None
 
-    async def test_known_senders_isolation_by_session(self, db_session):
+    async def test_known_senders_are_global(self, db_session):
         repo_a = KnownSenderRepository(db_session, session_id="sndA1111")
         repo_b = KnownSenderRepository(db_session, session_id="sndB1111")
 
@@ -292,4 +292,4 @@ class TestSessionScopedRepositories:
         await db_session.commit()
 
         assert await repo_a.exists("banco") is True
-        assert await repo_b.exists("banco") is False
+        assert await repo_b.exists("banco") is True

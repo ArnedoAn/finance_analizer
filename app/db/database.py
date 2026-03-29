@@ -323,18 +323,33 @@ def _ensure_session_columns(sync_conn: object) -> None:
         )
 
     if "known_senders" in table_names:
+        # Merge duplicates from per-session era before restoring global uniqueness.
+        sync_conn.exec_driver_sql(
+            """
+            DELETE FROM known_senders
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM known_senders
+                GROUP BY keyword
+            )
+            """
+        )
         if dialect_name == "postgresql":
             sync_conn.exec_driver_sql(
                 "ALTER TABLE known_senders DROP CONSTRAINT IF EXISTS known_senders_keyword_key"
             )
+            sync_conn.exec_driver_sql(
+                "DROP INDEX IF EXISTS ix_known_senders_session_keyword"
+            )
         sync_conn.exec_driver_sql("DROP INDEX IF EXISTS ix_known_senders_active")
         sync_conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_known_senders_active "
-            "ON known_senders (session_id, is_active, keyword)"
+            "ON known_senders (is_active, keyword)"
         )
+        sync_conn.exec_driver_sql("DROP INDEX IF EXISTS ix_known_senders_session_keyword")
         sync_conn.exec_driver_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_known_senders_session_keyword "
-            "ON known_senders (session_id, keyword)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_known_senders_keyword "
+            "ON known_senders (keyword)"
         )
 
 

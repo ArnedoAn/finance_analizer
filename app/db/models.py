@@ -254,7 +254,7 @@ class KnownSender(Base):
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
-    keyword: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    keyword: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
     sender_name: Mapped[str] = mapped_column(String(255), nullable=False)
     sender_type: Mapped[str] = mapped_column(
         String(50), nullable=False, default="bank"
@@ -273,8 +273,7 @@ class KnownSender(Base):
     )
     
     __table_args__ = (
-        Index("ix_known_senders_active", "session_id", "is_active", "keyword"),
-        Index("ix_known_senders_session_keyword", "session_id", "keyword", unique=True),
+        Index("ix_known_senders_active", "is_active", "keyword"),
     )
     
     def __repr__(self) -> str:

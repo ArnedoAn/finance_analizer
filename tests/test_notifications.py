@@ -198,6 +198,21 @@ class TestProcessedNotificationRepository:
         
         nequi_count = await repo.get_count(source_app="com.nequi.MobileApp")
         assert nequi_count == 1
+    
+    async def test_notification_isolation_by_session(self, db_session: AsyncSession) -> None:
+        repo_a = ProcessedNotificationRepository(db_session, session_id="notifA11")
+        repo_b = ProcessedNotificationRepository(db_session, session_id="notifB11")
+        
+        await repo_a.mark_processed(
+            notification_hash="hash-shared",
+            source_app="com.nequi.MobileApp",
+            sender="Nequi",
+            title="Title",
+            notification_date=datetime(2024, 1, 15),
+        )
+        
+        assert await repo_a.exists("hash-shared") is True
+        assert await repo_b.exists("hash-shared") is False
 
 
 # =============================================================================
@@ -315,6 +330,31 @@ class TestTransactionFingerprintRepository:
             window_hours=2,
         )
         assert dup is None
+    
+    async def test_fingerprint_isolation_by_session(self, db_session: AsyncSession) -> None:
+        repo_a = TransactionFingerprintRepository(db_session, session_id="fpSessA1")
+        repo_b = TransactionFingerprintRepository(db_session, session_id="fpSessB1")
+        
+        await repo_a.create(
+            fingerprint_hash="fp_iso_hash",
+            amount="10000",
+            transaction_date=datetime(2024, 1, 15, 10, 0),
+            source_channel="email",
+            source_id="email:iso",
+        )
+        
+        found_a = await repo_a.find_duplicate(
+            fingerprint_hash="fp_iso_hash",
+            transaction_date=datetime(2024, 1, 15, 10, 10),
+            window_hours=1,
+        )
+        found_b = await repo_b.find_duplicate(
+            fingerprint_hash="fp_iso_hash",
+            transaction_date=datetime(2024, 1, 15, 10, 10),
+            window_hours=1,
+        )
+        assert found_a is not None
+        assert found_b is None
 
 
 # =============================================================================

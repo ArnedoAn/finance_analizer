@@ -10,9 +10,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import (
+    SessionDep,
     get_db_session,
     get_deepseek_client,
-    get_gmail_client,
+    get_request_gmail_client,
 )
 from app.clients.deepseek import DeepSeekClient
 from app.clients.gmail import GmailClient
@@ -37,13 +38,19 @@ router = APIRouter(prefix="/senders", tags=["Senders"])
     description="Get all known financial email senders.",
 )
 async def list_senders(
+    session_ctx: SessionDep,
     include_inactive: bool = False,
     session: AsyncSession = Depends(get_db_session),
-    gmail: GmailClient = Depends(get_gmail_client),
+    gmail: GmailClient = Depends(get_request_gmail_client),
     deepseek: DeepSeekClient = Depends(get_deepseek_client),
 ) -> list[dict[str, Any]]:
     """List all known senders."""
-    service = SenderLearningService(session, gmail, deepseek)
+    service = SenderLearningService(
+        session,
+        gmail,
+        deepseek,
+        session_id=session_ctx.session_id,
+    )
     return await service.get_all_senders(include_inactive=include_inactive)
 
 
@@ -56,12 +63,18 @@ async def list_senders(
 )
 async def add_sender(
     sender: KnownSenderCreate,
+    session_ctx: SessionDep,
     session: AsyncSession = Depends(get_db_session),
-    gmail: GmailClient = Depends(get_gmail_client),
+    gmail: GmailClient = Depends(get_request_gmail_client),
     deepseek: DeepSeekClient = Depends(get_deepseek_client),
 ) -> dict[str, Any]:
     """Add a new known sender."""
-    service = SenderLearningService(session, gmail, deepseek)
+    service = SenderLearningService(
+        session,
+        gmail,
+        deepseek,
+        session_id=session_ctx.session_id,
+    )
     result = await service.add_sender_manually(
         keyword=sender.keyword,
         sender_name=sender.sender_name,
@@ -86,12 +99,18 @@ async def add_sender(
 )
 async def bulk_add_senders(
     request: KnownSenderBulkCreate,
+    session_ctx: SessionDep,
     session: AsyncSession = Depends(get_db_session),
-    gmail: GmailClient = Depends(get_gmail_client),
+    gmail: GmailClient = Depends(get_request_gmail_client),
     deepseek: DeepSeekClient = Depends(get_deepseek_client),
 ) -> dict[str, Any]:
     """Bulk add known senders."""
-    service = SenderLearningService(session, gmail, deepseek)
+    service = SenderLearningService(
+        session,
+        gmail,
+        deepseek,
+        session_id=session_ctx.session_id,
+    )
     return await service.bulk_add_senders(
         senders=[s.model_dump() for s in request.senders]
     )
@@ -105,12 +124,18 @@ async def bulk_add_senders(
 )
 async def deactivate_sender(
     keyword: str,
+    session_ctx: SessionDep,
     session: AsyncSession = Depends(get_db_session),
-    gmail: GmailClient = Depends(get_gmail_client),
+    gmail: GmailClient = Depends(get_request_gmail_client),
     deepseek: DeepSeekClient = Depends(get_deepseek_client),
 ) -> None:
     """Deactivate a sender."""
-    service = SenderLearningService(session, gmail, deepseek)
+    service = SenderLearningService(
+        session,
+        gmail,
+        deepseek,
+        session_id=session_ctx.session_id,
+    )
     await service.deactivate_sender(keyword)
 
 
@@ -126,15 +151,21 @@ async def deactivate_sender(
     """,
 )
 async def learn_senders(
+    session_ctx: SessionDep,
     request: SenderLearningRequest | None = None,
     session: AsyncSession = Depends(get_db_session),
-    gmail: GmailClient = Depends(get_gmail_client),
+    gmail: GmailClient = Depends(get_request_gmail_client),
     deepseek: DeepSeekClient = Depends(get_deepseek_client),
 ) -> dict[str, Any]:
     """Run sender learning from recent emails."""
     request = request or SenderLearningRequest()
     
-    service = SenderLearningService(session, gmail, deepseek)
+    service = SenderLearningService(
+        session,
+        gmail,
+        deepseek,
+        session_id=session_ctx.session_id,
+    )
     return await service.learn_from_recent_emails(
         email_count=request.email_count,
         days_back=request.days_back,
@@ -167,10 +198,16 @@ EXAMPLE_SENDERS = [
     description="Add common Colombian financial senders as initial data.",
 )
 async def seed_senders(
+    session_ctx: SessionDep,
     session: AsyncSession = Depends(get_db_session),
-    gmail: GmailClient = Depends(get_gmail_client),
+    gmail: GmailClient = Depends(get_request_gmail_client),
     deepseek: DeepSeekClient = Depends(get_deepseek_client),
 ) -> dict[str, Any]:
     """Seed database with example senders."""
-    service = SenderLearningService(session, gmail, deepseek)
+    service = SenderLearningService(
+        session,
+        gmail,
+        deepseek,
+        session_id=session_ctx.session_id,
+    )
     return await service.bulk_add_senders(EXAMPLE_SENDERS)

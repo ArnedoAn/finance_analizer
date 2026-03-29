@@ -322,6 +322,7 @@ class ProcessingResult(BaseModel):
 class AuditLogCreate(BaseModel):
     """Model for creating an audit log entry."""
     
+    session_id: str | None = None
     email_message_id: str = Field(..., description="Gmail Message-ID")
     email_internal_id: str = Field(..., description="Gmail internal ID")
     email_subject: str = Field(default="")
@@ -366,6 +367,7 @@ class HealthCheck(BaseModel):
     status: str = Field(default="healthy")
     version: str
     environment: str
+    session_id: str | None = None
     services: dict[str, bool] = Field(default_factory=dict)
 
 

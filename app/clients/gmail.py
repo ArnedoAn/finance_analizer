@@ -29,6 +29,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import get_logger
 from app.core.security import get_token_encryption
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.models.schemas import EmailFilter, EmailMessage
 
 logger = get_logger(__name__)
@@ -45,10 +46,27 @@ class GmailClient:
     filtering and deduplication support.
     """
     
-    def __init__(self) -> None:
+    def __init__(self, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.settings = get_settings()
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
+        self._token_path = self._resolve_token_path(normalized_session_id)
         self._service: Resource | None = None
         self._credentials: Credentials | None = None
+    
+    def _resolve_token_path(self, session_id: str) -> Path:
+        """
+        Resolve token path for a session.
+        
+        Uses the legacy token file for default session and a session-suffixed
+        filename for all other sessions.
+        """
+        base = self.settings.google_token_path
+        if session_id == DEFAULT_SESSION_ID:
+            return base
+        return base.with_name(f"{base.stem}_{session_id}{base.suffix}")
     
     async def _run_sync(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         """Run synchronous function in executor."""
@@ -117,12 +135,21 @@ class GmailClient:
     
     async def _load_credentials(self) -> Credentials | None:
         """Load credentials from encrypted storage."""
-        token_path = self.settings.google_token_path
+        token_path = self._token_path
         
-        logger.debug("gmail_loading_credentials", token_path=str(token_path), exists=token_path.exists())
+        logger.debug(
+            "gmail_loading_credentials",
+            session_id=self.session_id,
+            token_path=str(token_path),
+            exists=token_path.exists(),
+        )
         
         if not token_path.exists():
-            logger.warning("gmail_token_not_found", token_path=str(token_path))
+            logger.warning(
+                "gmail_token_not_found",
+                session_id=self.session_id,
+                token_path=str(token_path),
+            )
             return None
         
         try:
@@ -130,16 +157,24 @@ class GmailClient:
             encrypted_data = token_path.read_text()
             token_data = encryption.decrypt_dict(encrypted_data)
             
-            logger.info("gmail_credentials_loaded_successfully")
+            logger.info(
+                "gmail_credentials_loaded_successfully",
+                session_id=self.session_id,
+            )
             return Credentials.from_authorized_user_info(token_data, SCOPES)
         except Exception as e:
-            logger.warning("gmail_failed_load_credentials", error=str(e), error_type=type(e).__name__)
+            logger.warning(
+                "gmail_failed_load_credentials",
+                session_id=self.session_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
             return None
     
     async def _save_credentials(self, creds: Credentials) -> None:
         """Save credentials to encrypted storage."""
         try:
-            token_path = self.settings.google_token_path
+            token_path = self._token_path
             token_path.parent.mkdir(parents=True, exist_ok=True)
             
             encryption = get_token_encryption()
@@ -155,9 +190,17 @@ class GmailClient:
             encrypted = encryption.encrypt_dict(token_data)
             token_path.write_text(encrypted)
             
-            logger.debug("gmail_credentials_saved")
+            logger.debug(
+                "gmail_credentials_saved",
+                session_id=self.session_id,
+                token_path=str(token_path),
+            )
         except Exception as e:
-            logger.error("gmail_failed_save_credentials", error=str(e))
+            logger.error(
+                "gmail_failed_save_credentials",
+                session_id=self.session_id,
+                error=str(e),
+            )
             raise
     
     async def _run_oauth_flow(self) -> Credentials:
@@ -168,7 +211,7 @@ class GmailClient:
             details={"action": "visit_auth_url"},
         )
     
-    def get_authorization_url(self) -> tuple[str, str]:
+    def get_authorization_url(self, state: str | None = None) -> tuple[str, str]:
         """
         Generate OAuth authorization URL for web-based flow.
         
@@ -189,20 +232,27 @@ class GmailClient:
             redirect_uri=self.settings.gmail_redirect_uri,
         )
         
-        authorization_url, state = flow.authorization_url(
+        authorization_url, returned_state = flow.authorization_url(
             access_type="offline",
             prompt="consent",  # Force consent to get refresh_token
+            state=state,
         )
         
-        return authorization_url, state
+        return authorization_url, returned_state
     
-    async def handle_oauth_callback(self, code: str, state: str | None = None) -> bool:
+    async def handle_oauth_callback(
+        self,
+        code: str,
+        state: str | None = None,
+        expected_state: str | None = None,
+    ) -> bool:
         """
         Handle OAuth callback with authorization code.
         
         Args:
             code: Authorization code from Google
             state: State parameter for CSRF protection (optional)
+            expected_state: Expected state value to validate.
             
         Returns:
             True if authentication successful
@@ -215,10 +265,17 @@ class GmailClient:
             )
         
         try:
+            if expected_state is not None and state != expected_state:
+                raise GmailAuthenticationError(
+                    "OAuth state mismatch",
+                    details={"reason": "state_mismatch"},
+                )
+            
             flow = Flow.from_client_secrets_file(
                 str(creds_path),
                 scopes=SCOPES,
                 redirect_uri=self.settings.gmail_redirect_uri,
+                state=expected_state,
             )
             
             # Exchange code for credentials
@@ -234,11 +291,15 @@ class GmailClient:
                 build, "gmail", "v1", credentials=creds
             )
             
-            logger.info("gmail_oauth_callback_success")
+            logger.info("gmail_oauth_callback_success", session_id=self.session_id)
             return True
             
         except Exception as e:
-            logger.error("gmail_oauth_callback_failed", error=str(e))
+            logger.error(
+                "gmail_oauth_callback_failed",
+                session_id=self.session_id,
+                error=str(e),
+            )
             raise GmailAuthenticationError(
                 f"OAuth callback failed: {str(e)}",
                 original_error=e,

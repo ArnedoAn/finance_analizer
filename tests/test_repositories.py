@@ -13,6 +13,7 @@ from app.db.repositories import (
     AuditLogRepository,
     AccountCacheRepository,
     CategoryCacheRepository,
+    KnownSenderRepository,
 )
 from app.models.schemas import AuditLogCreate, ProcessingStatus
 
@@ -217,3 +218,78 @@ class TestCategoryCacheRepository:
         
         result2 = await repo.get_by_name("NonExistent")
         assert result2 is None
+
+
+@pytest.mark.asyncio
+class TestSessionScopedRepositories:
+    """Tests for repositories with session isolation."""
+    
+    async def test_processed_email_isolation_by_session(self, db_session):
+        repo_a = ProcessedEmailRepository(db_session, session_id="sessionA1")
+        repo_b = ProcessedEmailRepository(db_session, session_id="sessionB1")
+        
+        await repo_a.mark_processed("<iso@test.com>", "same-id", datetime.now())
+        await db_session.commit()
+        
+        assert await repo_a.exists("<iso@test.com>", "same-id") is True
+        assert await repo_b.exists("<iso@test.com>", "same-id") is False
+    
+    async def test_audit_logs_isolation_by_session(self, db_session):
+        repo_a = AuditLogRepository(db_session, session_id="auditA11")
+        repo_b = AuditLogRepository(db_session, session_id="auditB11")
+        
+        await repo_a.create(
+            AuditLogCreate(
+                email_message_id="<a@test.com>",
+                email_internal_id="id-a",
+                email_date=datetime.now(),
+                status=ProcessingStatus.CREATED,
+            )
+        )
+        await repo_b.create(
+            AuditLogCreate(
+                email_message_id="<b@test.com>",
+                email_internal_id="id-b",
+                email_date=datetime.now(),
+                status=ProcessingStatus.FAILED,
+            )
+        )
+        await db_session.commit()
+        
+        logs_a = await repo_a.get_recent(limit=10)
+        logs_b = await repo_b.get_recent(limit=10)
+        
+        assert len(logs_a) == 1
+        assert logs_a[0].email_internal_id == "id-a"
+        assert len(logs_b) == 1
+        assert logs_b[0].email_internal_id == "id-b"
+
+    async def test_account_cache_isolation_by_session(self, db_session):
+        repo_a = AccountCacheRepository(db_session, session_id="acctA111")
+        repo_b = AccountCacheRepository(db_session, session_id="acctB111")
+
+        await repo_a.upsert("100", "Cuenta A", "asset", "USD")
+        await db_session.commit()
+
+        assert await repo_a.get_by_name("Cuenta A", "asset") is not None
+        assert await repo_b.get_by_name("Cuenta A", "asset") is None
+
+    async def test_category_cache_isolation_by_session(self, db_session):
+        repo_a = CategoryCacheRepository(db_session, session_id="catA1111")
+        repo_b = CategoryCacheRepository(db_session, session_id="catB1111")
+
+        await repo_a.upsert("200", "Food")
+        await db_session.commit()
+
+        assert await repo_a.get_by_name("Food") is not None
+        assert await repo_b.get_by_name("Food") is None
+
+    async def test_known_senders_isolation_by_session(self, db_session):
+        repo_a = KnownSenderRepository(db_session, session_id="sndA1111")
+        repo_b = KnownSenderRepository(db_session, session_id="sndB1111")
+
+        await repo_a.add_sender(keyword="banco", sender_name="Banco A")
+        await db_session.commit()
+
+        assert await repo_a.exists("banco") is True
+        assert await repo_b.exists("banco") is False

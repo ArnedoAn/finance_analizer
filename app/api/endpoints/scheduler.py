@@ -9,11 +9,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import get_db_session
+from app.api.dependencies import SessionDep, get_db_session
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.repositories import SchedulerJobLogRepository
-from app.models.schemas import SchedulerJobLogResponse, SchedulerJobStatus
+from app.models.schemas import SchedulerJobLogResponse
 from app.services.scheduler import SchedulerService, describe_cron, get_scheduler
 
 logger = get_logger(__name__)
@@ -30,7 +30,7 @@ async def get_scheduler_status() -> dict[str, Any]:
     """Get scheduler status."""
     settings = get_settings()
     scheduler = get_scheduler()
-    service = SchedulerService()
+    service = SchedulerService(session_id=settings.scheduler_default_session_id)
     
     return {
         "enabled": settings.scheduler_enabled,
@@ -53,6 +53,7 @@ async def get_scheduler_status() -> dict[str, Any]:
 )
 async def trigger_job(
     job_id: str,
+    session: SessionDep,
 ) -> dict[str, Any]:
     """Trigger a job manually."""
     if job_id not in ("email_processing", "sender_learning"):
@@ -61,7 +62,7 @@ async def trigger_job(
             detail=f"Unknown job: {job_id}. Valid jobs: email_processing, sender_learning",
         )
     
-    service = SchedulerService()
+    service = SchedulerService(session_id=session.session_id)
     result = await service.trigger_job_now(job_id)
     
     if "error" in result:
@@ -80,12 +81,13 @@ async def trigger_job(
     description="Get recent scheduler job execution logs.",
 )
 async def get_job_logs(
+    session_dep: SessionDep,
     limit: int = 50,
     job_type: str | None = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
     """Get recent job logs."""
-    repo = SchedulerJobLogRepository(session)
+    repo = SchedulerJobLogRepository(session, session_id=session_dep.session_id)
     logs = await repo.get_recent(limit=limit, job_type=job_type)
     
     return [
@@ -113,10 +115,11 @@ async def get_job_logs(
 )
 async def get_last_job_run(
     job_name: str,
+    session_dep: SessionDep,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any] | None:
     """Get last run of a specific job."""
-    repo = SchedulerJobLogRepository(session)
+    repo = SchedulerJobLogRepository(session, session_id=session_dep.session_id)
     log = await repo.get_last_run(job_name)
     
     if not log:
@@ -151,7 +154,7 @@ async def start_scheduler() -> dict[str, str]:
             detail="Scheduler is disabled in configuration",
         )
     
-    service = SchedulerService()
+    service = SchedulerService(session_id=settings.scheduler_default_session_id)
     service.start()
     
     return {"status": "started"}
@@ -164,7 +167,7 @@ async def start_scheduler() -> dict[str, str]:
 )
 async def stop_scheduler() -> dict[str, str]:
     """Stop the scheduler."""
-    service = SchedulerService()
+    service = SchedulerService(session_id=get_settings().scheduler_default_session_id)
     service.stop()
     
     return {"status": "stopped"}

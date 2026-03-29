@@ -277,8 +277,18 @@ async def debug_test_transaction(
     from app.models.schemas import TransactionCreate, TransactionSplit, TransactionType
     import httpx
     from app.core.config import get_settings
+    from app.api.dependencies import get_firefly_client
     
     settings = get_settings()
+    firefly = get_firefly_client(services.session_id)
+    if not await firefly.has_session_token():
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "No Firefly token configured for this session. "
+                "Use /api/v1/auth/firefly/token first."
+            ),
+        )
     
     # Build the exact payload
     payload = {
@@ -303,7 +313,7 @@ async def debug_test_transaction(
     async with httpx.AsyncClient(
         base_url=f"{settings.firefly_base_url.rstrip('/')}/api/v1",
         headers={
-            "Authorization": f"Bearer {settings.firefly_api_token.get_secret_value()}",
+            "Authorization": f"Bearer {await firefly.get_active_token()}",
             "Content-Type": "application/json",
             "Accept": "application/vnd.api+json",
         },

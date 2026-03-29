@@ -57,6 +57,7 @@ async def health_check(services: ServicesDep) -> HealthCheck:
         status=status,
         version=__version__,
         environment=settings.app_env,
+        session_id=services.session_id,
         services={
             "gmail": gmail_ok,
             "deepseek": deepseek_ok,

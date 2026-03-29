@@ -14,6 +14,7 @@ from app.clients.deepseek import DeepSeekClient
 from app.clients.gmail import GmailClient
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.db.repositories import KnownSenderRepository, SchedulerJobLogRepository
 from app.models.schemas import EmailFilter
 
@@ -33,14 +34,19 @@ class SenderLearningService:
         session: AsyncSession,
         gmail_client: GmailClient,
         deepseek_client: DeepSeekClient,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> None:
         self.session = session
         self.gmail = gmail_client
         self.deepseek = deepseek_client
         self.settings = get_settings()
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
         
-        self._sender_repo = KnownSenderRepository(session)
-        self._job_log_repo = SchedulerJobLogRepository(session)
+        self._sender_repo = KnownSenderRepository(session, session_id=self.session_id)
+        self._job_log_repo = SchedulerJobLogRepository(session, session_id=self.session_id)
     
     async def learn_from_recent_emails(
         self,

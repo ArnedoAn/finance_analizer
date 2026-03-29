@@ -7,13 +7,16 @@ Handles automatic email processing and sender learning jobs.
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.core.timezone import get_app_timezone
 
 logger = get_logger(__name__)
@@ -38,8 +41,13 @@ class SchedulerService:
     Uses APScheduler for CRON-based task scheduling.
     """
     
-    def __init__(self) -> None:
+    def __init__(self, session_id: str | None = None) -> None:
         self.settings = get_settings()
+        resolved_session_id = session_id or self.settings.scheduler_default_session_id
+        normalized_session_id = normalize_session_id(resolved_session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid scheduler session id: {resolved_session_id}")
+        self.session_id = normalized_session_id
         self.scheduler = get_scheduler()
         self._jobs_registered = False
     
@@ -65,6 +73,7 @@ class SchedulerService:
             "scheduler_job_registered",
             job="email_processing",
             cron=self.settings.scheduler_processing_cron,
+            session_id=self.session_id,
         )
         
         # Sender learning job
@@ -80,6 +89,7 @@ class SchedulerService:
             "scheduler_job_registered",
             job="sender_learning",
             cron=self.settings.scheduler_learning_cron,
+            session_id=self.session_id,
         )
         
         self._jobs_registered = True
@@ -92,13 +102,13 @@ class SchedulerService:
         if not self.scheduler.running:
             self.setup_jobs()
             self.scheduler.start()
-            logger.info("scheduler_started")
+            logger.info("scheduler_started", session_id=self.session_id)
     
     def stop(self) -> None:
         """Stop the scheduler."""
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
-            logger.info("scheduler_stopped")
+            logger.info("scheduler_stopped", session_id=self.session_id)
     
     def get_jobs_status(self) -> list[dict[str, Any]]:
         """Get status of all scheduled jobs."""
@@ -137,61 +147,62 @@ class SchedulerService:
         from app.models.schemas import BatchProcessRequest
         
         logger.info("scheduler_email_processing_starting")
-        
-        async with get_db_session() as session:
-            job_log_repo = SchedulerJobLogRepository(session)
-            job_log = await job_log_repo.create(
-                job_name="email_processing",
-                job_type="processing",
-            )
-            await session.commit()
-            
-            try:
-                gmail = get_gmail_client()
-                deepseek = get_deepseek_client()
-                firefly = get_firefly_client()
-                
-                processor = EmailProcessorService(
-                    session=session,
-                    gmail_client=gmail,
-                    deepseek_client=deepseek,
-                    firefly_client=firefly,
+        session_ids = await self._discover_active_session_ids()
+        totals = {"emails_processed": 0, "transactions_created": 0, "failed_sessions": 0}
+
+        for session_id in session_ids:
+            async with get_db_session() as session:
+                job_log_repo = SchedulerJobLogRepository(
+                    session,
+                    session_id=session_id,
                 )
-                
-                # Use known senders for filtering
-                result = await processor.process_batch(
-                    BatchProcessRequest(
-                        max_emails=self.settings.gmail_max_results,
-                        dry_run=self.settings.dry_run,
-                        use_known_senders=True,  # Filter by known senders
+                job_log = await job_log_repo.create(
+                    job_name="email_processing",
+                    job_type="processing",
+                )
+                await session.commit()
+
+                try:
+                    gmail = get_gmail_client(session_id)
+                    deepseek = get_deepseek_client()
+                    firefly = get_firefly_client(session_id)
+
+                    processor = EmailProcessorService(
+                        session=session,
+                        gmail_client=gmail,
+                        deepseek_client=deepseek,
+                        firefly_client=firefly,
+                        session_id=session_id,
                     )
-                )
-                
-                await job_log_repo.complete(
-                    job_log.id,
-                    emails_processed=result.total_emails,
-                    transactions_created=result.created,
-                    details={"skipped": result.skipped, "failed": result.failed},
-                )
-                await session.commit()
-                
-                logger.info(
-                    "scheduler_email_processing_completed",
-                    processed=result.total_emails,
-                    created=result.created,
-                )
-                
-                return {
-                    "status": "completed",
-                    "emails_processed": result.total_emails,
-                    "transactions_created": result.created,
-                }
-                
-            except Exception as e:
-                logger.error("scheduler_email_processing_failed", error=str(e))
-                await job_log_repo.fail(job_log.id, str(e))
-                await session.commit()
-                return {"status": "failed", "error": str(e)}
+
+                    result = await processor.process_batch(
+                        BatchProcessRequest(
+                            max_emails=self.settings.gmail_max_results,
+                            dry_run=self.settings.dry_run,
+                            use_known_senders=True,
+                        )
+                    )
+
+                    await job_log_repo.complete(
+                        job_log.id,
+                        emails_processed=result.total_emails,
+                        transactions_created=result.created,
+                        details={"skipped": result.skipped, "failed": result.failed},
+                    )
+                    await session.commit()
+                    totals["emails_processed"] += result.total_emails
+                    totals["transactions_created"] += result.created
+                except Exception as e:
+                    totals["failed_sessions"] += 1
+                    logger.error(
+                        "scheduler_email_processing_failed",
+                        error=str(e),
+                        session_id=session_id,
+                    )
+                    await job_log_repo.fail(job_log.id, str(e))
+                    await session.commit()
+
+        return {"status": "completed", **totals, "sessions_processed": len(session_ids)}
     
     async def _run_sender_learning(self) -> dict[str, Any]:
         """Execute sender learning job."""
@@ -200,37 +211,85 @@ class SchedulerService:
         from app.services.sender_learning import SenderLearningService
         
         logger.info("scheduler_sender_learning_starting")
-        
+        session_ids = await self._discover_active_session_ids()
+        totals = {"emails_analyzed": 0, "senders_learned": 0, "failed_sessions": 0}
+
+        for session_id in session_ids:
+            async with get_db_session() as session:
+                try:
+                    gmail = get_gmail_client(session_id)
+                    deepseek = get_deepseek_client()
+
+                    learning_service = SenderLearningService(
+                        session=session,
+                        gmail_client=gmail,
+                        deepseek_client=deepseek,
+                        session_id=session_id,
+                    )
+
+                    result = await learning_service.learn_from_recent_emails(
+                        email_count=self.settings.scheduler_learning_email_count,
+                        days_back=15,
+                    )
+                    totals["emails_analyzed"] += int(result.get("emails_analyzed", 0))
+                    totals["senders_learned"] += int(result.get("senders_learned", 0))
+                except Exception as e:
+                    totals["failed_sessions"] += 1
+                    logger.error(
+                        "scheduler_sender_learning_failed",
+                        error=str(e),
+                        session_id=session_id,
+                    )
+
+        return {"status": "completed", **totals, "sessions_processed": len(session_ids)}
+
+    def _discover_sessions_from_token_paths(self) -> set[str]:
+        """Discover session ids from persisted Gmail/Firefly token files."""
+        session_ids: set[str] = set()
+        token_specs: list[tuple[Path, str]] = [
+            (self.settings.google_token_path, "google_token_"),
+            (self.settings.firefly_token_path, "firefly_token_"),
+        ]
+        for base_path, prefix in token_specs:
+            if base_path.exists():
+                session_ids.add(DEFAULT_SESSION_ID)
+            for path in base_path.parent.glob(f"{prefix}*{base_path.suffix}"):
+                session_part = path.stem.replace(prefix, "", 1)
+                normalized = normalize_session_id(session_part)
+                if normalized:
+                    session_ids.add(normalized)
+        return session_ids
+
+    async def _discover_active_session_ids(self) -> list[str]:
+        """Collect active session IDs from persisted tokens and DB activity."""
+        from app.db.database import get_db_session
+
+        discovered = self._discover_sessions_from_token_paths()
+        discovered.add(self.session_id)
+
         async with get_db_session() as session:
-            try:
-                gmail = get_gmail_client()
-                deepseek = get_deepseek_client()
-                
-                learning_service = SenderLearningService(
-                    session=session,
-                    gmail_client=gmail,
-                    deepseek_client=deepseek,
-                )
-                
-                result = await learning_service.learn_from_recent_emails(
-                    email_count=self.settings.scheduler_learning_email_count,
-                    days_back=15,  # Look back 15 days
-                )
-                
-                logger.info(
-                    "scheduler_sender_learning_completed",
-                    emails_analyzed=result["emails_analyzed"],
-                    senders_learned=result["senders_learned"],
-                )
-                
-                return {
-                    "status": "completed",
-                    **result,
-                }
-                
-            except Exception as e:
-                logger.error("scheduler_sender_learning_failed", error=str(e))
-                return {"status": "failed", "error": str(e)}
+            query = text(
+                """
+                SELECT DISTINCT session_id FROM (
+                    SELECT session_id FROM processed_emails
+                    UNION ALL SELECT session_id FROM audit_logs
+                    UNION ALL SELECT session_id FROM processed_notifications
+                    UNION ALL SELECT session_id FROM transaction_fingerprints
+                    UNION ALL SELECT session_id FROM scheduler_job_logs
+                    UNION ALL SELECT session_id FROM account_cache
+                    UNION ALL SELECT session_id FROM category_cache
+                    UNION ALL SELECT session_id FROM tag_cache
+                    UNION ALL SELECT session_id FROM known_senders
+                ) WHERE session_id IS NOT NULL
+                """
+            )
+            rows = await session.execute(query)
+            for row in rows.fetchall():
+                normalized = normalize_session_id(row[0])
+                if normalized:
+                    discovered.add(normalized)
+
+        return sorted(discovered)
 
 
 # Helper to parse CRON expressions for documentation

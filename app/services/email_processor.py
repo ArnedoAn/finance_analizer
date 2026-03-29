@@ -26,6 +26,7 @@ from app.core.exceptions import (
     ProcessingError,
 )
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.db.repositories import (
     AuditLogRepository,
     KnownSenderRepository,
@@ -62,23 +63,31 @@ class EmailProcessorService:
         gmail_client: GmailClient,
         deepseek_client: DeepSeekClient,
         firefly_client: FireflyClient,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> None:
         self.session = session
         self.gmail = gmail_client
         self.deepseek = deepseek_client
         self.firefly = firefly_client
         self.settings = get_settings()
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
         
         # Repositories
-        self._processed_repo = ProcessedEmailRepository(session)
-        self._audit_repo = AuditLogRepository(session)
-        self._sender_repo = KnownSenderRepository(session)
-        self._fingerprint_repo = TransactionFingerprintRepository(session)
+        self._processed_repo = ProcessedEmailRepository(session, session_id=self.session_id)
+        self._audit_repo = AuditLogRepository(session, session_id=self.session_id)
+        self._sender_repo = KnownSenderRepository(session, session_id=self.session_id)
+        self._fingerprint_repo = TransactionFingerprintRepository(session, session_id=self.session_id)
         
         # Services
-        self._sync_service = SyncService(session, firefly_client)
+        self._sync_service = SyncService(session, firefly_client, session_id=self.session_id)
         self._transaction_service = TransactionService(
-            session, firefly_client, self._sync_service
+            session,
+            firefly_client,
+            self._sync_service,
+            session_id=self.session_id,
         )
     
     async def process_batch(
@@ -321,6 +330,7 @@ class EmailProcessorService:
         
         # Initialize audit log
         audit_data = AuditLogCreate(
+            session_id=self.session_id,
             email_message_id=email.message_id,
             email_internal_id=email.internal_id,
             email_subject=email.subject,

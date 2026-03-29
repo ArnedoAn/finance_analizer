@@ -18,6 +18,7 @@ from app.api.routes import api_router
 from app.core.config import get_settings
 from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger, setup_logging
+from app.core.session import DEFAULT_SESSION_ID
 from app.db.database import close_db, init_db
 from app.services.scheduler import SchedulerService
 
@@ -43,14 +44,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     if settings.google_token_path.exists():
         try:
-            gmail = get_gmail_client()
+            gmail = get_gmail_client(DEFAULT_SESSION_ID)
             await gmail.authenticate()
             logger.info("gmail_pre_authenticated")
         except Exception as e:
             logger.warning("gmail_pre_auth_failed", error=str(e))
     
     # Start scheduler if enabled
-    scheduler_service = SchedulerService()
+    scheduler_service = SchedulerService(
+        session_id=settings.scheduler_default_session_id,
+    )
     if settings.scheduler_enabled:
         scheduler_service.start()
         logger.info(

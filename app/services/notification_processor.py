@@ -24,6 +24,7 @@ from app.core.exceptions import (
     NotificationFilteredError,
 )
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.db.repositories import (
     AuditLogRepository,
     ProcessedNotificationRepository,
@@ -55,21 +56,39 @@ class NotificationProcessorService:
         session: AsyncSession,
         deepseek_client: DeepSeekClient,
         firefly_client: FireflyClient,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> None:
         self.session = session
         self.deepseek = deepseek_client
         self.firefly = firefly_client
         self.settings = get_settings()
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
         
         # Repositories
-        self._notification_repo = ProcessedNotificationRepository(session)
-        self._fingerprint_repo = TransactionFingerprintRepository(session)
-        self._audit_repo = AuditLogRepository(session)
+        self._notification_repo = ProcessedNotificationRepository(
+            session,
+            session_id=self.session_id,
+        )
+        self._fingerprint_repo = TransactionFingerprintRepository(
+            session,
+            session_id=self.session_id,
+        )
+        self._audit_repo = AuditLogRepository(session, session_id=self.session_id)
         
         # Services
-        self._sync_service = SyncService(session, firefly_client)
+        self._sync_service = SyncService(
+            session,
+            firefly_client,
+            session_id=self.session_id,
+        )
         self._transaction_service = TransactionService(
-            session, firefly_client, self._sync_service
+            session,
+            firefly_client,
+            self._sync_service,
+            session_id=self.session_id,
         )
     
     def is_known_app(self, app_package: str) -> bool:
@@ -136,6 +155,7 @@ class NotificationProcessorService:
         
         # Initialize audit log
         audit_data = AuditLogCreate(
+            session_id=self.session_id,
             email_message_id=notification_hash,
             email_internal_id=f"notif:{notification_hash[:16]}",
             email_subject=notification.title,

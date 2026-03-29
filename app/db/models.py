@@ -36,6 +36,7 @@ class ProcessedEmail(Base):
     __tablename__ = "processed_emails"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
     message_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     internal_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     email_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -44,7 +45,13 @@ class ProcessedEmail(Base):
     )
     
     __table_args__ = (
-        Index("ix_processed_emails_unique", "message_id", "internal_id", unique=True),
+        Index(
+            "ix_processed_emails_session_unique",
+            "session_id",
+            "message_id",
+            "internal_id",
+            unique=True,
+        ),
     )
     
     def __repr__(self) -> str:
@@ -62,6 +69,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
     
     # Email identification
     email_message_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
@@ -99,9 +107,14 @@ class AuditLog(Base):
     )
     
     __table_args__ = (
-        Index("ix_audit_logs_email", "email_message_id", "email_internal_id"),
-        Index("ix_audit_logs_date", "email_date"),
-        Index("ix_audit_logs_status_date", "status", "created_at"),
+        Index(
+            "ix_audit_logs_session_email",
+            "session_id",
+            "email_message_id",
+            "email_internal_id",
+        ),
+        Index("ix_audit_logs_session_date", "session_id", "email_date"),
+        Index("ix_audit_logs_session_status_date", "session_id", "status", "created_at"),
     )
     
     def __repr__(self) -> str:
@@ -118,7 +131,8 @@ class AccountCache(Base):
     __tablename__ = "account_cache"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
+    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     account_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
@@ -132,7 +146,19 @@ class AccountCache(Base):
     )
     
     __table_args__ = (
-        Index("ix_account_cache_name_type", "name", "account_type", unique=True),
+        Index(
+            "ix_account_cache_session_firefly",
+            "session_id",
+            "firefly_id",
+            unique=True,
+        ),
+        Index(
+            "ix_account_cache_session_name_type",
+            "session_id",
+            "name",
+            "account_type",
+            unique=True,
+        ),
     )
     
     def __repr__(self) -> str:
@@ -149,8 +175,24 @@ class CategoryCache(Base):
     __tablename__ = "category_cache"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
+    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    __table_args__ = (
+        Index(
+            "ix_category_cache_session_firefly",
+            "session_id",
+            "firefly_id",
+            unique=True,
+        ),
+        Index(
+            "ix_category_cache_session_name",
+            "session_id",
+            "name",
+            unique=True,
+        ),
+    )
+    
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=func.now()
@@ -173,8 +215,24 @@ class TagCache(Base):
     __tablename__ = "tag_cache"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    tag: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
+    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    tag: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    __table_args__ = (
+        Index(
+            "ix_tag_cache_session_firefly",
+            "session_id",
+            "firefly_id",
+            unique=True,
+        ),
+        Index(
+            "ix_tag_cache_session_tag",
+            "session_id",
+            "tag",
+            unique=True,
+        ),
+    )
+    
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=func.now()
@@ -195,7 +253,8 @@ class KnownSender(Base):
     __tablename__ = "known_senders"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    keyword: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
+    keyword: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     sender_name: Mapped[str] = mapped_column(String(255), nullable=False)
     sender_type: Mapped[str] = mapped_column(
         String(50), nullable=False, default="bank"
@@ -214,7 +273,8 @@ class KnownSender(Base):
     )
     
     __table_args__ = (
-        Index("ix_known_senders_active", "is_active", "keyword"),
+        Index("ix_known_senders_active", "session_id", "is_active", "keyword"),
+        Index("ix_known_senders_session_keyword", "session_id", "keyword", unique=True),
     )
     
     def __repr__(self) -> str:
@@ -232,13 +292,23 @@ class ProcessedNotification(Base):
     __tablename__ = "processed_notifications"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    notification_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
+    notification_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     source_app: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     sender: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     notification_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     processed_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=func.now()
+    )
+    
+    __table_args__ = (
+        Index(
+            "ix_processed_notifications_session_hash",
+            "session_id",
+            "notification_hash",
+            unique=True,
+        ),
     )
     
     def __repr__(self) -> str:
@@ -257,6 +327,7 @@ class TransactionFingerprint(Base):
     __tablename__ = "transaction_fingerprints"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
     fingerprint_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     amount: Mapped[str] = mapped_column(String(50), nullable=False)
     transaction_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -269,7 +340,7 @@ class TransactionFingerprint(Base):
     )
     
     __table_args__ = (
-        Index("ix_fingerprint_hash_date", "fingerprint_hash", "transaction_date"),
+        Index("ix_fingerprint_session_hash_date", "session_id", "fingerprint_hash", "transaction_date"),
     )
     
     def __repr__(self) -> str:
@@ -286,6 +357,7 @@ class SchedulerJobLog(Base):
     __tablename__ = "scheduler_job_logs"
     
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
     job_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     job_type: Mapped[str] = mapped_column(String(50), nullable=False)  # processing, learning
     status: Mapped[str] = mapped_column(String(50), nullable=False)  # started, completed, failed
@@ -301,7 +373,7 @@ class SchedulerJobLog(Base):
     details: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     
     __table_args__ = (
-        Index("ix_scheduler_job_logs_job_date", "job_name", "started_at"),
+        Index("ix_scheduler_job_logs_session_job_date", "session_id", "job_name", "started_at"),
     )
     
     def __repr__(self) -> str:

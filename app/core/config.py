@@ -54,6 +54,22 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, ge=1, le=65535, description="Server port")
     
     # =========================================================================
+    # Session Settings
+    # =========================================================================
+    session_cookie_max_age_seconds: int = Field(
+        default=2592000, ge=300, le=31536000,
+        description="Session cookie max age in seconds"
+    )
+    oauth_state_max_age_seconds: int = Field(
+        default=600, ge=60, le=3600,
+        description="OAuth state validity window in seconds"
+    )
+    scheduler_default_session_id: str = Field(
+        default="default",
+        description="Session ID used by automatic scheduler jobs",
+    )
+    
+    # =========================================================================
     # Database
     # =========================================================================
     database_url: str = Field(
@@ -108,6 +124,10 @@ class Settings(BaseSettings):
     # =========================================================================
     firefly_base_url: str = Field(..., description="Firefly III base URL")
     firefly_api_token: SecretStr = Field(..., description="Firefly III API token")
+    firefly_token_path: Path = Field(
+        default=Path("./credentials/firefly_token.json"),
+        description="Path to store session-scoped Firefly tokens",
+    )
     firefly_timeout: int = Field(default=30, ge=5, le=120, description="API timeout")
     firefly_max_retries: int = Field(default=3, ge=1, le=10, description="Max retries")
     firefly_default_asset_account: str = Field(
@@ -224,7 +244,12 @@ class Settings(BaseSettings):
         """Check if running in production."""
         return self.app_env == "production"
     
-    @field_validator("google_credentials_path", "google_token_path", mode="before")
+    @field_validator(
+        "google_credentials_path",
+        "google_token_path",
+        "firefly_token_path",
+        mode="before",
+    )
     @classmethod
     def validate_path(cls, v: str | Path) -> Path:
         """Convert string paths to Path objects."""

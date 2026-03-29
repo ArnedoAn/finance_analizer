@@ -13,6 +13,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.db.models import (
     AccountCache,
     AuditLog,
@@ -29,16 +30,25 @@ from app.models.schemas import AuditLogCreate, ProcessingStatus
 logger = get_logger(__name__)
 
 
+def _validate_session_id(session_id: str) -> str:
+    normalized = normalize_session_id(session_id)
+    if normalized is None:
+        raise ValueError(f"Invalid session id: {session_id}")
+    return normalized
+
+
 class ProcessedEmailRepository:
     """Repository for managing processed email records."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def exists(self, message_id: str, internal_id: str) -> bool:
         """Check if an email has been processed."""
         query = select(ProcessedEmail).where(
             and_(
+                ProcessedEmail.session_id == self.session_id,
                 ProcessedEmail.message_id == message_id,
                 ProcessedEmail.internal_id == internal_id,
             )
@@ -54,6 +64,7 @@ class ProcessedEmailRepository:
     ) -> ProcessedEmail:
         """Mark an email as processed."""
         record = ProcessedEmail(
+            session_id=self.session_id,
             message_id=message_id,
             internal_id=internal_id,
             email_date=email_date,
@@ -68,7 +79,9 @@ class ProcessedEmailRepository:
         since: datetime | None = None,
     ) -> set[str]:
         """Get set of processed email IDs."""
-        query = select(ProcessedEmail.internal_id)
+        query = select(ProcessedEmail.internal_id).where(
+            ProcessedEmail.session_id == self.session_id
+        )
         if since:
             query = query.where(ProcessedEmail.email_date >= since)
         
@@ -84,7 +97,7 @@ class ProcessedEmailRepository:
         Returns:
             Number of records deleted.
         """
-        query = delete(ProcessedEmail)
+        query = delete(ProcessedEmail).where(ProcessedEmail.session_id == self.session_id)
         result = await self.session.execute(query)
         await self.session.flush()
         
@@ -100,12 +113,14 @@ class ProcessedEmailRepository:
 class AuditLogRepository:
     """Repository for managing audit log entries."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def create(self, data: AuditLogCreate) -> AuditLog:
         """Create a new audit log entry."""
         audit_log = AuditLog(
+            session_id=data.session_id or self.session_id,
             email_message_id=data.email_message_id,
             email_internal_id=data.email_internal_id,
             email_subject=data.email_subject,
@@ -138,7 +153,9 @@ class AuditLogRepository:
         if error_message:
             values["error_message"] = error_message
         
-        query = update(AuditLog).where(AuditLog.id == audit_id).values(**values)
+        query = update(AuditLog).where(
+            and_(AuditLog.id == audit_id, AuditLog.session_id == self.session_id)
+        ).values(**values)
         await self.session.execute(query)
         await self.session.flush()
     
@@ -150,6 +167,7 @@ class AuditLogRepository:
         """Get audit log by email identifiers."""
         query = select(AuditLog).where(
             and_(
+                AuditLog.session_id == self.session_id,
                 AuditLog.email_message_id == message_id,
                 AuditLog.email_internal_id == internal_id,
             )
@@ -164,7 +182,12 @@ class AuditLogRepository:
         status: ProcessingStatus | None = None,
     ) -> Sequence[AuditLog]:
         """Get recent audit logs."""
-        query = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
+        query = (
+            select(AuditLog)
+            .where(AuditLog.session_id == self.session_id)
+            .order_by(AuditLog.created_at.desc())
+            .limit(limit)
+        )
         if status:
             query = query.where(AuditLog.status == status.value)
         
@@ -181,6 +204,8 @@ class AuditLogRepository:
         query = select(
             AuditLog.status,
             func.count(AuditLog.id).label("count"),
+        ).where(
+            AuditLog.session_id == self.session_id
         ).group_by(AuditLog.status)
         
         if since:
@@ -193,8 +218,9 @@ class AuditLogRepository:
 class AccountCacheRepository:
     """Repository for managing account cache entries."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def get_by_name(
         self,
@@ -204,6 +230,7 @@ class AccountCacheRepository:
         """Get account by name and type."""
         query = select(AccountCache).where(
             and_(
+                AccountCache.session_id == self.session_id,
                 AccountCache.name == name,
                 AccountCache.account_type == account_type,
             )
@@ -234,6 +261,7 @@ class AccountCacheRepository:
         
         # Get all accounts of this type
         query = select(AccountCache).where(
+            AccountCache.session_id == self.session_id,
             AccountCache.account_type == account_type
         )
         result = await self.session.execute(query)
@@ -261,7 +289,12 @@ class AccountCacheRepository:
     
     async def get_by_firefly_id(self, firefly_id: str) -> AccountCache | None:
         """Get account by Firefly ID."""
-        query = select(AccountCache).where(AccountCache.firefly_id == firefly_id)
+        query = select(AccountCache).where(
+            and_(
+                AccountCache.session_id == self.session_id,
+                AccountCache.firefly_id == firefly_id,
+            )
+        )
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
     
@@ -287,6 +320,7 @@ class AccountCacheRepository:
         
         # Create new
         account = AccountCache(
+            session_id=self.session_id,
             firefly_id=firefly_id,
             name=name,
             account_type=account_type,
@@ -299,7 +333,7 @@ class AccountCacheRepository:
     
     async def get_all(self, account_type: str | None = None) -> Sequence[AccountCache]:
         """Get all cached accounts."""
-        query = select(AccountCache)
+        query = select(AccountCache).where(AccountCache.session_id == self.session_id)
         if account_type:
             query = query.where(AccountCache.account_type == account_type)
         
@@ -327,18 +361,29 @@ class AccountCacheRepository:
 class CategoryCacheRepository:
     """Repository for managing category cache entries."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def get_by_name(self, name: str) -> CategoryCache | None:
         """Get category by name."""
-        query = select(CategoryCache).where(CategoryCache.name == name)
+        query = select(CategoryCache).where(
+            and_(
+                CategoryCache.session_id == self.session_id,
+                CategoryCache.name == name,
+            )
+        )
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
     
     async def get_by_firefly_id(self, firefly_id: str) -> CategoryCache | None:
         """Get category by Firefly ID."""
-        query = select(CategoryCache).where(CategoryCache.firefly_id == firefly_id)
+        query = select(CategoryCache).where(
+            and_(
+                CategoryCache.session_id == self.session_id,
+                CategoryCache.firefly_id == firefly_id,
+            )
+        )
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
     
@@ -356,6 +401,7 @@ class CategoryCacheRepository:
             return existing
         
         category = CategoryCache(
+            session_id=self.session_id,
             firefly_id=firefly_id,
             name=name,
         )
@@ -365,7 +411,7 @@ class CategoryCacheRepository:
     
     async def get_all(self) -> Sequence[CategoryCache]:
         """Get all cached categories."""
-        query = select(CategoryCache)
+        query = select(CategoryCache).where(CategoryCache.session_id == self.session_id)
         result = await self.session.execute(query)
         return result.scalars().all()
     
@@ -387,12 +433,18 @@ class CategoryCacheRepository:
 class TagCacheRepository:
     """Repository for managing tag cache entries."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def get_by_tag(self, tag: str) -> TagCache | None:
         """Get tag by name."""
-        query = select(TagCache).where(TagCache.tag == tag)
+        query = select(TagCache).where(
+            and_(
+                TagCache.session_id == self.session_id,
+                TagCache.tag == tag,
+            )
+        )
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
     
@@ -405,14 +457,18 @@ class TagCacheRepository:
             await self.session.flush()
             return existing
         
-        tag_record = TagCache(firefly_id=firefly_id, tag=tag)
+        tag_record = TagCache(
+            session_id=self.session_id,
+            firefly_id=firefly_id,
+            tag=tag,
+        )
         self.session.add(tag_record)
         await self.session.flush()
         return tag_record
     
     async def get_all(self) -> Sequence[TagCache]:
         """Get all cached tags."""
-        query = select(TagCache)
+        query = select(TagCache).where(TagCache.session_id == self.session_id)
         result = await self.session.execute(query)
         return result.scalars().all()
 
@@ -420,13 +476,17 @@ class TagCacheRepository:
 class KnownSenderRepository:
     """Repository for managing known financial email senders."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def get_by_keyword(self, keyword: str) -> KnownSender | None:
         """Get sender by keyword."""
         query = select(KnownSender).where(
-            KnownSender.keyword == keyword.lower()
+            and_(
+                KnownSender.session_id == self.session_id,
+                KnownSender.keyword == keyword.lower(),
+            )
         )
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
@@ -456,13 +516,23 @@ class KnownSenderRepository:
     
     async def get_all_active(self) -> Sequence[KnownSender]:
         """Get all active known senders."""
-        query = select(KnownSender).where(KnownSender.is_active == True)
+        query = select(KnownSender).where(
+            and_(
+                KnownSender.session_id == self.session_id,
+                KnownSender.is_active == True,
+            )
+        )
         result = await self.session.execute(query)
         return result.scalars().all()
     
     async def get_all_keywords(self) -> set[str]:
         """Get all active sender keywords as a set."""
-        query = select(KnownSender.keyword).where(KnownSender.is_active == True)
+        query = select(KnownSender.keyword).where(
+            and_(
+                KnownSender.session_id == self.session_id,
+                KnownSender.is_active == True,
+            )
+        )
         result = await self.session.execute(query)
         return {row[0].lower() for row in result.fetchall()}
     
@@ -476,6 +546,7 @@ class KnownSenderRepository:
     ) -> KnownSender:
         """Add a new known sender."""
         sender = KnownSender(
+            session_id=self.session_id,
             keyword=keyword.lower(),
             sender_name=sender_name,
             sender_type=sender_type,
@@ -490,7 +561,12 @@ class KnownSenderRepository:
         """Increment match count for a sender."""
         query = (
             update(KnownSender)
-            .where(KnownSender.keyword == keyword.lower())
+            .where(
+                and_(
+                    KnownSender.session_id == self.session_id,
+                    KnownSender.keyword == keyword.lower(),
+                )
+            )
             .values(
                 emails_matched=KnownSender.emails_matched + 1,
                 last_matched_at=datetime.utcnow(),
@@ -503,7 +579,12 @@ class KnownSenderRepository:
         """Deactivate a sender."""
         query = (
             update(KnownSender)
-            .where(KnownSender.keyword == keyword.lower())
+            .where(
+                and_(
+                    KnownSender.session_id == self.session_id,
+                    KnownSender.keyword == keyword.lower(),
+                )
+            )
             .values(is_active=False)
         )
         await self.session.execute(query)
@@ -512,7 +593,10 @@ class KnownSenderRepository:
     async def exists(self, keyword: str) -> bool:
         """Check if a sender keyword exists."""
         query = select(KnownSender).where(
-            KnownSender.keyword == keyword.lower()
+            and_(
+                KnownSender.session_id == self.session_id,
+                KnownSender.keyword == keyword.lower(),
+            )
         )
         result = await self.session.execute(query)
         return result.scalar_one_or_none() is not None
@@ -541,8 +625,9 @@ class KnownSenderRepository:
 class SchedulerJobLogRepository:
     """Repository for managing scheduler job logs."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def create(
         self,
@@ -551,6 +636,7 @@ class SchedulerJobLogRepository:
     ) -> SchedulerJobLog:
         """Create a new job log entry."""
         log = SchedulerJobLog(
+            session_id=self.session_id,
             job_name=job_name,
             job_type=job_type,
             status="started",
@@ -570,7 +656,12 @@ class SchedulerJobLogRepository:
         """Mark job as completed."""
         query = (
             update(SchedulerJobLog)
-            .where(SchedulerJobLog.id == log_id)
+            .where(
+                and_(
+                    SchedulerJobLog.id == log_id,
+                    SchedulerJobLog.session_id == self.session_id,
+                )
+            )
             .values(
                 status="completed",
                 completed_at=datetime.utcnow(),
@@ -591,7 +682,12 @@ class SchedulerJobLogRepository:
         """Mark job as failed."""
         query = (
             update(SchedulerJobLog)
-            .where(SchedulerJobLog.id == log_id)
+            .where(
+                and_(
+                    SchedulerJobLog.id == log_id,
+                    SchedulerJobLog.session_id == self.session_id,
+                )
+            )
             .values(
                 status="failed",
                 completed_at=datetime.utcnow(),
@@ -605,7 +701,12 @@ class SchedulerJobLogRepository:
         """Get the last run of a specific job."""
         query = (
             select(SchedulerJobLog)
-            .where(SchedulerJobLog.job_name == job_name)
+            .where(
+                and_(
+                    SchedulerJobLog.session_id == self.session_id,
+                    SchedulerJobLog.job_name == job_name,
+                )
+            )
             .order_by(SchedulerJobLog.started_at.desc())
             .limit(1)
         )
@@ -618,9 +719,12 @@ class SchedulerJobLogRepository:
         job_type: str | None = None,
     ) -> Sequence[SchedulerJobLog]:
         """Get recent job logs."""
-        query = select(SchedulerJobLog).order_by(
-            SchedulerJobLog.started_at.desc()
-        ).limit(limit)
+        query = (
+            select(SchedulerJobLog)
+            .where(SchedulerJobLog.session_id == self.session_id)
+            .order_by(SchedulerJobLog.started_at.desc())
+            .limit(limit)
+        )
         
         if job_type:
             query = query.where(SchedulerJobLog.job_type == job_type)
@@ -632,13 +736,17 @@ class SchedulerJobLogRepository:
 class ProcessedNotificationRepository:
     """Repository for managing processed notification records."""
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def exists(self, notification_hash: str) -> bool:
         """Check if a notification has been processed."""
         query = select(ProcessedNotification).where(
-            ProcessedNotification.notification_hash == notification_hash
+            and_(
+                ProcessedNotification.session_id == self.session_id,
+                ProcessedNotification.notification_hash == notification_hash,
+            )
         )
         result = await self.session.execute(query)
         return result.scalar_one_or_none() is not None
@@ -653,6 +761,7 @@ class ProcessedNotificationRepository:
     ) -> ProcessedNotification:
         """Mark a notification as processed."""
         record = ProcessedNotification(
+            session_id=self.session_id,
             notification_hash=notification_hash,
             source_app=source_app,
             sender=sender,
@@ -672,6 +781,7 @@ class ProcessedNotificationRepository:
         """Get recent processed notifications."""
         query = (
             select(ProcessedNotification)
+            .where(ProcessedNotification.session_id == self.session_id)
             .order_by(ProcessedNotification.processed_at.desc())
             .limit(limit)
         )
@@ -685,7 +795,9 @@ class ProcessedNotificationRepository:
         """Get count of processed notifications."""
         from sqlalchemy import func
         
-        query = select(func.count(ProcessedNotification.id))
+        query = select(func.count(ProcessedNotification.id)).where(
+            ProcessedNotification.session_id == self.session_id
+        )
         if source_app:
             query = query.where(ProcessedNotification.source_app == source_app)
         
@@ -702,8 +814,9 @@ class TransactionFingerprintRepository:
     same transaction arrives from both email and notification.
     """
     
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.session = session
+        self.session_id = _validate_session_id(session_id)
     
     async def find_duplicate(
         self,
@@ -727,6 +840,7 @@ class TransactionFingerprintRepository:
         
         query = select(TransactionFingerprint).where(
             and_(
+                TransactionFingerprint.session_id == self.session_id,
                 TransactionFingerprint.fingerprint_hash == fingerprint_hash,
                 TransactionFingerprint.transaction_date >= window_start,
                 TransactionFingerprint.transaction_date <= window_end,
@@ -748,6 +862,7 @@ class TransactionFingerprintRepository:
     ) -> TransactionFingerprint:
         """Create a new transaction fingerprint."""
         record = TransactionFingerprint(
+            session_id=self.session_id,
             fingerprint_hash=fingerprint_hash,
             amount=amount,
             transaction_date=transaction_date,

@@ -14,6 +14,7 @@ from app.clients.firefly import FireflyClient
 from app.core.config import get_settings
 from app.core.exceptions import FireflyDuplicateError, TransactionCreationError
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.models.schemas import (
     TransactionAnalysis,
     TransactionCreate,
@@ -37,11 +38,16 @@ class TransactionService:
         session: AsyncSession,
         firefly_client: FireflyClient,
         sync_service: SyncService,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> None:
         self.session = session
         self.firefly = firefly_client
         self.sync = sync_service
         self.settings = get_settings()
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
     
     async def create_from_analysis(
         self,

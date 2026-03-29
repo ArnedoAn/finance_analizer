@@ -13,6 +13,7 @@ from app.clients.firefly import FireflyClient
 from app.core.config import get_settings
 from app.core.exceptions import FireflyValidationError
 from app.core.logging import get_logger
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.db.repositories import (
     AccountCacheRepository,
     CategoryCacheRepository,
@@ -35,13 +36,18 @@ class SyncService:
         self,
         session: AsyncSession,
         firefly_client: FireflyClient,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> None:
         self.session = session
         self.firefly = firefly_client
         self.settings = get_settings()
-        self._account_repo = AccountCacheRepository(session)
-        self._category_repo = CategoryCacheRepository(session)
-        self._sender_repo = KnownSenderRepository(session)
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
+        self._account_repo = AccountCacheRepository(session, session_id=self.session_id)
+        self._category_repo = CategoryCacheRepository(session, session_id=self.session_id)
+        self._sender_repo = KnownSenderRepository(session, session_id=self.session_id)
     
     async def sync_accounts(self) -> int:
         """

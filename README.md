@@ -214,26 +214,99 @@ docker-compose -f docker-compose.dev.yml up
 
 ### Primera ejecución
 
+0. Obtener/crear sesión de usuario (recomendado):
+   ```bash
+   curl -i http://localhost:8000/api/v1/auth/url
+   ```
+   Usa el `X-Session-ID` retornado (o cookie `finance_session_id`) en llamadas siguientes.
+   También puedes usar `X-User-Id` y la API resolverá un `session_id` estable por usuario.
+   Si vienes desde Telegram, envía headers `X-Telegram-Session` o `X-Telegram-User-ID` (+ opcional `X-Telegram-Chat-ID`).
+
 1. Autenticar Gmail:
    ```bash
-   curl -X POST http://localhost:8000/api/v1/auth/gmail/init
+   curl -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/auth/url
    ```
-   (Se abrirá navegador para autorizar)
+   Abre `authorization_url` en el navegador. El callback enlaza OAuth a esa sesión.
 
-2. Sincronizar Firefly III:
+2. Configurar Firefly token para esa sesión:
    ```bash
-   curl -X POST http://localhost:8000/api/v1/sync/all
+   curl -X PUT \
+     -H "Content-Type: application/json" \
+     -H "X-Session-ID: <tu-session-id>" \
+     -d '{"token":"<firefly-token-del-usuario>"}' \
+     http://localhost:8000/api/v1/auth/firefly/token
    ```
 
-3. Procesar emails (dry-run primero):
+3. Sincronizar Firefly III:
    ```bash
-   curl -X POST http://localhost:8000/api/v1/processing/dry-run
+   curl -X POST -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/sync/all
    ```
 
-4. Procesar de verdad:
+4. Procesar emails (dry-run primero):
    ```bash
-   curl -X POST http://localhost:8000/api/v1/processing/batch
+   curl -X POST -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/processing/dry-run
    ```
+
+5. Procesar de verdad:
+   ```bash
+   curl -X POST -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/processing/batch
+   ```
+
+### Sesiones multiusuario
+
+- La API soporta múltiples usuarios concurrentes mediante `session_id` con enfoque Telegram-first.
+- Prioridad de resolución de sesión: `X-Telegram-Session` → `X-Telegram-User-ID`/`X-Telegram-Chat-ID` → `X-User-Id` → `X-Session-ID` → cookie.
+- OAuth de Gmail queda aislado por sesión (cada sesión guarda su propio token cifrado).
+- Firefly también queda aislado por sesión: cada sesión tiene su token propio vía `/api/v1/auth/firefly/token`.
+- Idempotencia/auditoría y cache (`processed_emails`, `audit_logs`, `processed_notifications`, `transaction_fingerprints`, `scheduler_job_logs`, `account_cache`, `category_cache`, `tag_cache`, `known_senders`) están segmentadas por sesión.
+- El scheduler automático procesa todas las sesiones activas detectadas (DB + tokens), y `SCHEDULER_DEFAULT_SESSION_ID` se usa como sesión semilla/fallback.
+
+Ejemplo de frontend con `X-User-Id`:
+```bash
+curl -X GET "https://financeapi.toothless.codes/api/v1/auth/status" \
+  -H "X-User-Id: 123456789"
+```
+
+### Flujo recomendado para bot de Telegram
+
+1. El bot recibe el token Firefly del usuario.
+2. El bot llama a:
+   ```bash
+   POST /api/v1/auth/telegram/firefly
+   {
+     "telegram_user_id": "<telegram-user-id>",
+     "telegram_chat_id": "<telegram-chat-id-opcional>",
+     "token": "<firefly-token-usuario>"
+   }
+   ```
+3. La API responde con `session_id` (estable para ese user/chat).
+4. En todas las llamadas futuras del bot para ese usuario, enviar:
+   - `X-Telegram-Session: <session_id>` (recomendado), o
+   - `X-Telegram-User-ID` y `X-Telegram-Chat-ID`.
+5. Luego usar endpoints normales (`/sync/*`, `/processing/*`, `/auth/url`, etc.).
+
+Ejemplo de request desde bot:
+```bash
+curl -X POST http://localhost:8000/api/v1/processing/batch \
+  -H "X-Telegram-Session: <session-id>" \
+  -H "Content-Type: application/json" \
+  -d '{"max_emails": 20, "dry_run": false}'
+```
+
+Notas:
+- Si dos usuarios usan el mismo Firefly server, no se mezclan: cada token queda en su sesión.
+- Si un mismo usuario de Telegram usa dos chats distintos y envías ambos IDs, cada chat tendrá sesión separada.
+- Si quieres una sola sesión por usuario sin importar chat, envía solo `telegram_user_id`.
+
+### ¿Cómo funciona multi-sesión para Gmail?
+
+- Gmail también es por sesión (`google_token_<session_id>.json` cifrado).
+- Para conectar Gmail de ese usuario, llama `/api/v1/auth/url` usando la misma sesión Telegram:
+  ```bash
+  curl -H "X-Telegram-Session: <session-id>" http://localhost:8000/api/v1/auth/url
+  ```
+- El `state` OAuth incluye y firma el `session_id`; en callback se recupera esa misma sesión.
+- Resultado: Firefly + Gmail + auditoría quedan alineados bajo el mismo `session_id` del usuario Telegram.
 
 ## 🔌 API Endpoints
 
@@ -241,6 +314,11 @@ docker-compose -f docker-compose.dev.yml up
 
 | Método | Endpoint | Descripción |
 |--------|----------|-------------|
+| GET | `/api/v1/auth/url` | Obtener URL OAuth Gmail para la sesión actual |
+| POST | `/api/v1/auth/telegram/firefly` | Registrar token Firefly desde Telegram (crea/resuelve sesión) |
+| PUT | `/api/v1/auth/firefly/token` | Configurar token Firefly para la sesión actual |
+| DELETE | `/api/v1/auth/firefly/token` | Eliminar token Firefly de la sesión actual |
+| GET | `/api/v1/auth/firefly/status` | Estado Firefly en la sesión actual |
 | GET | `/api/v1/health` | Estado de todos los servicios |
 | GET | `/api/v1/health/live` | Liveness probe |
 | GET | `/api/v1/health/ready` | Readiness probe |
@@ -330,10 +408,12 @@ pre-commit run --all-files
 ### Gmail OAuth Error
 - Verificar que `credentials/google_credentials.json` existe
 - Verificar que Gmail API está habilitada en Google Cloud
-- Eliminar `credentials/google_token.json` y re-autenticar
+- Eliminar `credentials/google_token*.json` y re-autenticar
+- Verificar que estás reutilizando el mismo `X-Session-ID` entre `/auth/url` y el resto de requests
 
 ### Firefly Connection Error
 - Verificar `FIREFLY_BASE_URL` (incluir puerto)
+- Verificar que el token está configurado en la sesión correcta (`/api/v1/auth/firefly/token`)
 - Verificar que el token tiene permisos correctos
 - Probar: `curl -H "Authorization: Bearer TOKEN" URL/api/v1/about`
 

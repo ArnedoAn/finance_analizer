@@ -5,6 +5,7 @@ Handles all communication with Firefly III personal finance manager.
 Provides CRUD operations for accounts, categories, and transactions.
 """
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -24,6 +25,8 @@ from app.core.exceptions import (
     FireflyValidationError,
 )
 from app.core.logging import get_logger
+from app.core.security import get_token_encryption
+from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.models.schemas import (
     AccountCreate,
     AccountResponse,
@@ -46,19 +49,144 @@ class FireflyClient:
     and transactions in Firefly III.
     """
     
-    def __init__(self) -> None:
+    def __init__(self, session_id: str = DEFAULT_SESSION_ID) -> None:
         self.settings = get_settings()
+        normalized_session_id = normalize_session_id(session_id)
+        if normalized_session_id is None:
+            raise ValueError(f"Invalid session id: {session_id}")
+        self.session_id = normalized_session_id
+        self._token_path = self._resolve_token_path(normalized_session_id)
+        self._token: str | None = None
+        self._token_source: str | None = None
+        self._token_loaded = False
         self._client: httpx.AsyncClient | None = None
         self._base_url = self.settings.firefly_base_url.rstrip("/")
+
+    def _resolve_token_path(self, session_id: str) -> Path:
+        """
+        Resolve token path for a session.
+
+        Uses the legacy env token for default session unless a session token
+        was explicitly stored.
+        """
+        base = self.settings.firefly_token_path
+        if session_id == DEFAULT_SESSION_ID:
+            return base
+        return base.with_name(f"{base.stem}_{session_id}{base.suffix}")
+
+    async def _load_session_token(self) -> str | None:
+        """Load session-scoped Firefly token from encrypted storage."""
+        token_path = self._token_path
+        if not token_path.exists():
+            return None
+        try:
+            encryption = get_token_encryption()
+            encrypted_data = token_path.read_text()
+            token_data = encryption.decrypt_dict(encrypted_data)
+            token = token_data.get("token")
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+            return None
+        except Exception as e:
+            logger.warning(
+                "firefly_failed_load_session_token",
+                session_id=self.session_id,
+                error=str(e),
+            )
+            return None
+
+    async def _save_session_token(self, token: str) -> None:
+        """Persist a session-scoped Firefly token in encrypted storage."""
+        token_path = self._token_path
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        encryption = get_token_encryption()
+        encrypted = encryption.encrypt_dict({"token": token})
+        token_path.write_text(encrypted)
+
+    async def _delete_session_token(self) -> None:
+        """Delete session-scoped Firefly token from disk."""
+        token_path = self._token_path
+        if token_path.exists():
+            token_path.unlink()
+
+    async def set_session_token(self, token: str) -> None:
+        """Set and persist token for this session."""
+        normalized = token.strip()
+        if not normalized:
+            raise FireflyAuthenticationError("Firefly token cannot be empty")
+        await self._save_session_token(normalized)
+        self._token = normalized
+        self._token_source = "session"
+        self._token_loaded = True
+        await self.close()
+        logger.info("firefly_session_token_updated", session_id=self.session_id)
+
+    async def clear_session_token(self) -> None:
+        """Clear persisted token for this session and reset runtime client."""
+        await self._delete_session_token()
+        self._token = None
+        self._token_source = None
+        self._token_loaded = True
+        await self.close()
+        logger.info("firefly_session_token_cleared", session_id=self.session_id)
+
+    async def has_session_token(self) -> bool:
+        """Check whether this session has a usable Firefly token."""
+        token = await self._resolve_token()
+        return token is not None
+
+    async def get_token_source(self) -> str | None:
+        """Return token source: session, default_env, or None."""
+        await self._resolve_token()
+        return self._token_source
+
+    async def get_active_token(self) -> str:
+        """Return the active token or raise if missing."""
+        token = await self._resolve_token()
+        if token is None:
+            raise FireflyAuthenticationError(
+                "No Firefly token configured for this session",
+                details={
+                    "session_id": self.session_id,
+                    "action": "set_firefly_token",
+                },
+            )
+        return token
+
+    async def _resolve_token(self) -> str | None:
+        """Resolve token using session storage with env fallback for default."""
+        if self._token_loaded:
+            return self._token
+
+        token = await self._load_session_token()
+        if token:
+            self._token = token
+            self._token_source = "session"
+            self._token_loaded = True
+            return token
+
+        if self.session_id == DEFAULT_SESSION_ID:
+            fallback = self.settings.firefly_api_token.get_secret_value().strip()
+            self._token = fallback if fallback else None
+            self._token_source = "default_env" if self._token else None
+            self._token_loaded = True
+            return self._token
+
+        self._token = None
+        self._token_source = None
+        self._token_loaded = True
+        return None
     
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
+        token = await self.get_active_token()
+
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=f"{self._base_url}/api/v1",
                 timeout=httpx.Timeout(self.settings.firefly_timeout),
                 headers={
-                    "Authorization": f"Bearer {self.settings.firefly_api_token.get_secret_value()}",
+                    "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                     "Accept": "application/vnd.api+json",
                 },

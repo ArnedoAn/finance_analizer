@@ -271,6 +271,11 @@ def _ensure_session_columns(sync_conn: object) -> None:
 
     # Session-aware cache indexes and constraints.
     if "account_cache" in table_names:
+        # Drop legacy global uniqueness (single-tenant schema).
+        if dialect_name == "postgresql":
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE account_cache DROP CONSTRAINT IF EXISTS account_cache_firefly_id_key"
+            )
         sync_conn.exec_driver_sql("DROP INDEX IF EXISTS ix_account_cache_name_type")
         sync_conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_account_cache_session_firefly "
@@ -282,6 +287,13 @@ def _ensure_session_columns(sync_conn: object) -> None:
         )
 
     if "category_cache" in table_names:
+        if dialect_name == "postgresql":
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE category_cache DROP CONSTRAINT IF EXISTS category_cache_firefly_id_key"
+            )
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE category_cache DROP CONSTRAINT IF EXISTS category_cache_name_key"
+            )
         sync_conn.exec_driver_sql("DROP INDEX IF EXISTS ix_category_cache_name")
         sync_conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_category_cache_session_firefly "
@@ -293,6 +305,13 @@ def _ensure_session_columns(sync_conn: object) -> None:
         )
 
     if "tag_cache" in table_names:
+        if dialect_name == "postgresql":
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE tag_cache DROP CONSTRAINT IF EXISTS tag_cache_firefly_id_key"
+            )
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE tag_cache DROP CONSTRAINT IF EXISTS tag_cache_tag_key"
+            )
         sync_conn.exec_driver_sql("DROP INDEX IF EXISTS ix_tag_cache_tag")
         sync_conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_tag_cache_session_firefly "
@@ -304,6 +323,10 @@ def _ensure_session_columns(sync_conn: object) -> None:
         )
 
     if "known_senders" in table_names:
+        if dialect_name == "postgresql":
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE known_senders DROP CONSTRAINT IF EXISTS known_senders_keyword_key"
+            )
         sync_conn.exec_driver_sql("DROP INDEX IF EXISTS ix_known_senders_active")
         sync_conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_known_senders_active "

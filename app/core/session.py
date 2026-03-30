@@ -93,6 +93,23 @@ def build_user_session_id(user_id: str | None) -> str | None:
     return f"usr_{digest}"
 
 
+def resolve_webhook_session_id(user_id: str | None, fallback_session_id: str) -> str:
+    """
+    Resolve session for notification/SMS webhooks when the client only sends JSON.
+
+    If ``user_id`` is present and valid, returns the same deterministic id as
+    ``X-User-Id`` / ``build_user_session_id``. Otherwise uses the request
+    session (headers/cookie/Telegram) from ``fallback_session_id``.
+    """
+    derived = build_user_session_id(user_id)
+    if derived is not None:
+        return derived
+    normalized = normalize_session_id(fallback_session_id)
+    if normalized is not None:
+        return normalized
+    return fallback_session_id
+
+
 def resolve_or_create_session_id(
     header_session_id: str | None,
     cookie_session_id: str | None,

@@ -11,9 +11,9 @@ Defines all data models for the application including:
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 # =============================================================================
@@ -542,6 +542,8 @@ class NotificationPayload(BaseModel):
     Incoming webhook payload from phone notification app.
     
     Maps the template variables from the phone app's webhook configuration.
+    For multi-user without custom headers, set ``user_id`` (same value as
+    ``X-User-Id``) so Firefly/tokens are scoped to that user.
     """
     
     model_config = ConfigDict(frozen=True)
@@ -557,6 +559,27 @@ class NotificationPayload(BaseModel):
     date: str = Field(default="", description="Notification date")
     category: str = Field(default="", description="Notification category")
     device: str = Field(default="", description="Device that received the notification")
+    user_id: str | None = Field(
+        default=None,
+        max_length=128,
+        validation_alias=AliasChoices("user_id", "userId"),
+        description="External user id; same semantics as X-User-Id for session resolution",
+    )
+    source_channel: Literal["notification", "sms"] = Field(
+        default="notification",
+        validation_alias=AliasChoices("source_channel", "sourceChannel"),
+        description="Tag in Firefly (notification vs SMS)",
+    )
+    
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def _normalize_user_id(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return v
     
     @property
     def content(self) -> str:

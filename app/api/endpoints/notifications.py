@@ -5,14 +5,22 @@ Receives push notifications/SMS from phone apps and processes them
 as financial transactions.
 """
 
-import asyncio
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import ServicesDep
+from app.api.dependencies import (
+    ServicesDep,
+    async_session_factory,
+    get_db_session,
+    get_deepseek_client,
+    get_firefly_client,
+    SessionDep,
+)
 from app.core.logging import get_logger
+from app.core.session import resolve_webhook_session_id
+from app.services.notification_processor import NotificationProcessorService
 from app.models.schemas import (
     NotificationPayload,
     NotificationProcessingResult,
@@ -35,49 +43,65 @@ router = APIRouter()
 async def webhook_receive(
     payload: NotificationPayload,
     background_tasks: BackgroundTasks,
-    services: ServicesDep,
+    session_ctx: SessionDep,
 ) -> NotificationWebhookResponse:
     """
     Webhook endpoint for phone notification app.
     
     Accepts the notification, returns 202 immediately,
     and processes in the background.
+
+    Multi-user: include ``user_id`` in the JSON body (same value as ``X-User-Id``)
+    so the webhook uses that user's Firefly/tokens when the app cannot send headers.
     """
+    target_session_id = resolve_webhook_session_id(
+        payload.user_id,
+        session_ctx.session_id,
+    )
     notification_hash = payload.notification_hash
-    
+
     logger.info(
         "webhook_received",
         hash=notification_hash[:12],
         app=payload.app,
         title=payload.title[:50] if payload.title else "N/A",
+        session_id=target_session_id[:16],
+        source_channel=payload.source_channel,
     )
-    
-    # Quick idempotency check before queuing
-    already_processed = await services.notification_processor._notification_repo.exists(
-        notification_hash
-    )
-    if already_processed:
-        return NotificationWebhookResponse(
-            accepted=False,
-            notification_hash=notification_hash,
-            message="Notification already processed",
+
+    async with async_session_factory() as db:
+        firefly = get_firefly_client(target_session_id)
+        deepseek = get_deepseek_client()
+        processor = NotificationProcessorService(
+            db,
+            deepseek,
+            firefly,
+            session_id=target_session_id,
         )
-    
-    # Quick known-app check
-    if not services.notification_processor.is_known_app(payload.app):
-        return NotificationWebhookResponse(
-            accepted=False,
-            notification_hash=notification_hash,
-            message=f"Unknown app: {payload.app}",
+
+        already_processed = await processor._notification_repo.exists(
+            notification_hash
         )
-    
-    # Process in background
+        if already_processed:
+            return NotificationWebhookResponse(
+                accepted=False,
+                notification_hash=notification_hash,
+                message="Notification already processed",
+            )
+
+        if not processor.is_known_app(payload.app):
+            return NotificationWebhookResponse(
+                accepted=False,
+                notification_hash=notification_hash,
+                message=f"Unknown app: {payload.app}",
+            )
+
     background_tasks.add_task(
         _process_notification_background,
-        services.notification_processor,
-        payload,
+        target_session_id,
+        payload.model_dump(mode="json"),
     )
-    
+
     return NotificationWebhookResponse(
         accepted=True,
         notification_hash=notification_hash,
@@ -86,12 +110,26 @@ async def webhook_receive(
 
 
 async def _process_notification_background(
-    processor: Any,
-    payload: NotificationPayload,
+    session_id: str,
+    payload_dict: dict[str, Any],
 ) -> None:
-    """Background task to process a notification."""
+    """Background task to process a notification with a fresh DB session."""
     try:
-        result = await processor.process_notification(payload)
+        payload = NotificationPayload.model_validate(payload_dict)
+    except Exception as e:
+        logger.error("webhook_background_invalid_payload", error=str(e))
+        return
+    try:
+        async with async_session_factory() as db:
+            deepseek = get_deepseek_client()
+            firefly = get_firefly_client(session_id)
+            processor = NotificationProcessorService(
+                db,
+                deepseek,
+                firefly,
+                session_id=session_id,
+            )
+            result = await processor.process_notification(payload)
         logger.info(
             "webhook_background_completed",
             hash=payload.notification_hash[:12],
@@ -114,15 +152,25 @@ async def _process_notification_background(
 )
 async def process_sync(
     payload: NotificationPayload,
-    services: ServicesDep,
+    session_ctx: SessionDep,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
     dry_run: Annotated[bool, Query(description="Preview mode")] = False,
 ) -> NotificationProcessingResult:
     """Process a notification synchronously and return the result."""
+    target_session_id = resolve_webhook_session_id(
+        payload.user_id,
+        session_ctx.session_id,
+    )
     try:
-        result = await services.notification_processor.process_notification(
-            payload, dry_run=dry_run
+        firefly = get_firefly_client(target_session_id)
+        deepseek = get_deepseek_client()
+        processor = NotificationProcessorService(
+            db,
+            deepseek,
+            firefly,
+            session_id=target_session_id,
         )
-        return result
+        return await processor.process_notification(payload, dry_run=dry_run)
     except Exception as e:
         raise HTTPException(
             status_code=500,

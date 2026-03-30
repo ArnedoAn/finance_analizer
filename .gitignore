@@ -107,3 +107,4 @@ Thumbs.db
 
 # Alembic
 alembic/versions/*.pyc
+docs/processing_async_polling.md

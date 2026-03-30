@@ -126,6 +126,19 @@ class TestNotificationPayload:
         payload = NotificationPayload(**sample_notification_data)
         with pytest.raises(Exception):
             payload.message = "changed"
+    
+    def test_user_id_and_aliases(self, sample_notification_data: dict) -> None:
+        data = {**sample_notification_data, "user_id": " 12345 "}
+        p = NotificationPayload(**data)
+        assert p.user_id == "12345"
+        p2 = NotificationPayload(**{**sample_notification_data, "userId": "999"})
+        assert p2.user_id == "999"
+    
+    def test_source_channel_alias(self, sample_notification_data: dict) -> None:
+        p = NotificationPayload(
+            **{**sample_notification_data, "sourceChannel": "sms"}
+        )
+        assert p.source_channel == "sms"
 
 
 # =============================================================================

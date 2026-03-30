@@ -115,12 +115,14 @@ class NotificationProcessorService:
         start_time = time.time()
         dry_run = dry_run or self.settings.dry_run
         notification_hash = notification.notification_hash
+        tx_source_channel = notification.source_channel
         
         logger.info(
             "processing_notification",
             hash=notification_hash[:12],
             app=notification.app,
             title=notification.title[:50] if notification.title else "N/A",
+            source_channel=tx_source_channel,
         )
         
         # Step 1: Idempotency check
@@ -267,7 +269,7 @@ class NotificationProcessorService:
                 external_id=f"notif:{notification_hash}",
                 dry_run=dry_run,
                 transaction_datetime=notification_date,
-                source_channel="notification",
+                source_channel=tx_source_channel,
                 source_app=notification.app,
             )
             
@@ -282,7 +284,7 @@ class NotificationProcessorService:
                     fingerprint_hash=fingerprint_hash,
                     amount=str(analysis.amount),
                     transaction_date=analysis.date,
-                    source_channel="notification",
+                    source_channel=tx_source_channel,
                     source_id=notification_hash,
                     description=analysis.description,
                     firefly_transaction_id=transaction_id,

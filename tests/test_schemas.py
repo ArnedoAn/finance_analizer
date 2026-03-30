@@ -21,6 +21,7 @@ from app.core.session import (
     normalize_telegram_id,
     parse_oauth_state,
     resolve_or_create_session_id,
+    resolve_webhook_session_id,
 )
 
 
@@ -234,6 +235,13 @@ class TestSessionUtilities:
         assert sid is not None
         assert sid.startswith("usr_")
         assert len(sid) == 44
+
+    def test_resolve_webhook_session_id(self):
+        assert resolve_webhook_session_id("abc-user", "ignored") == build_user_session_id(
+            "abc-user"
+        )
+        assert resolve_webhook_session_id(None, "my-session-id-12") == "my-session-id-12"
+        assert resolve_webhook_session_id("   ", "fallback1234") == "fallback1234"
 
     def test_build_telegram_session_id_user_only(self):
         sid = build_telegram_session_id("123456789")

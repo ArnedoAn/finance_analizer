@@ -62,7 +62,9 @@ services:
       - FIREFLY_BASE_URL=${FIREFLY_BASE_URL}
       - FIREFLY_API_TOKEN=${FIREFLY_API_TOKEN}
       - FIREFLY_DEFAULT_ASSET_ACCOUNT=${FIREFLY_DEFAULT_ASSET_ACCOUNT:-Bancolombia}
-      
+
+      # Public DNS / OAuth callback origin
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
       # Gmail
       - GMAIL_REDIRECT_URI=${GMAIL_REDIRECT_URI}
       - GMAIL_SUBJECT_FILTERS=${GMAIL_SUBJECT_FILTERS:-Factura,Pago,Recibo,Compra,Confirmación,Transferencia,Cargo,Abono}

@@ -10,7 +10,6 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
 
 import structlog
 from structlog.types import EventDict, Processor
@@ -135,20 +134,3 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
         Configured structlog BoundLogger instance.
     """
     return structlog.get_logger(name)
-
-
-class LogContext:
-    """Context manager for adding temporary context to logs."""
-    
-    def __init__(self, **kwargs: Any) -> None:
-        self.context = kwargs
-        self._tokens: list[Any] = []
-    
-    def __enter__(self) -> "LogContext":
-        for key, value in self.context.items():
-            token = structlog.contextvars.bind_contextvars(**{key: value})
-            self._tokens.append(token)
-        return self
-    
-    def __exit__(self, *args: Any) -> None:
-        structlog.contextvars.unbind_contextvars(*self.context.keys())

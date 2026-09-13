@@ -25,7 +25,6 @@ from app.models.schemas import (
     NotificationPayload,
     NotificationProcessingResult,
     NotificationWebhookResponse,
-    ProcessingStatus,
 )
 
 logger = get_logger(__name__)
@@ -68,33 +67,6 @@ async def webhook_receive(
         session_id=target_session_id[:16],
         source_channel=payload.source_channel,
     )
-
-    async with async_session_factory() as db:
-        firefly = get_firefly_client(target_session_id)
-        deepseek = get_deepseek_client()
-        processor = NotificationProcessorService(
-            db,
-            deepseek,
-            firefly,
-            session_id=target_session_id,
-        )
-
-        already_processed = await processor._notification_repo.exists(
-            notification_hash
-        )
-        if already_processed:
-            return NotificationWebhookResponse(
-                accepted=False,
-                notification_hash=notification_hash,
-                message="Notification already processed",
-            )
-
-        if not processor.is_known_app(payload.app):
-            return NotificationWebhookResponse(
-                accepted=False,
-                notification_hash=notification_hash,
-                message=f"Unknown app: {payload.app}",
-            )
 
     background_tasks.add_task(
         _process_notification_background,

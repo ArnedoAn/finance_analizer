@@ -291,16 +291,8 @@ class SenderLearningService:
         include_inactive: bool = False,
     ) -> list[dict[str, Any]]:
         """Get all known senders."""
-        if include_inactive:
-            from sqlalchemy import select
-            from app.db.models import KnownSender
-            
-            query = select(KnownSender)
-            result = await self.session.execute(query)
-            senders = result.scalars().all()
-        else:
-            senders = await self._sender_repo.get_all_active()
-        
+        senders = await self._sender_repo.get_all(include_inactive=include_inactive)
+
         return [
             {
                 "id": s.id,

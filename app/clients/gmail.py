@@ -8,7 +8,6 @@ Uses the Google API Python client with async wrappers.
 import asyncio
 import base64
 import hashlib
-import json
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from functools import partial
@@ -101,23 +100,19 @@ class GmailClient:
             
             if not creds:
                 # No credentials at all, need to authenticate
-                logger.info("gmail_starting_oauth_flow")
-                creds = await self._run_oauth_flow()
-                await self._save_credentials(creds)
+                raise self._no_credentials_error()
             elif not creds.valid:
                 if creds.expired and creds.refresh_token:
                     # Token expired but we have refresh token
                     logger.info("gmail_refreshing_token")
                     await self._run_sync(creds.refresh, Request())
                     await self._save_credentials(creds)
-                elif creds.token:
+                elif not creds.token:
+                    # No valid token and can't refresh
+                    raise self._no_credentials_error()
+                else:
                     # Token might still work, let's try it
                     logger.info("gmail_trying_existing_token")
-                else:
-                    # No valid token and can't refresh
-                    logger.info("gmail_starting_oauth_flow")
-                    creds = await self._run_oauth_flow()
-                    await self._save_credentials(creds)
             
             self._credentials = creds
             self._service = await self._run_sync(
@@ -204,9 +199,9 @@ class GmailClient:
             )
             raise
     
-    async def _run_oauth_flow(self) -> Credentials:
-        """Run the OAuth 2.0 authorization flow (requires manual URL/callback)."""
-        raise GmailAuthenticationError(
+    @staticmethod
+    def _no_credentials_error() -> GmailAuthenticationError:
+        return GmailAuthenticationError(
             "No valid credentials. Use /api/v1/auth/url to get authorization URL, "
             "then complete the flow via /api/v1/auth/callback",
             details={"action": "visit_auth_url"},
@@ -676,14 +671,10 @@ class GmailClient:
         Returns:
             List of parsed email messages.
         """
-        self._ensure_authenticated()
-        exclude_ids = exclude_ids or set()
-        
         if not sender_keywords:
             logger.warning("gmail_no_sender_keywords")
             return []
-        
-        # Build default filter if not provided
+
         if filter_config is None:
             filter_config = EmailFilter(
                 max_results=self.settings.gmail_max_results,
@@ -691,55 +682,9 @@ class GmailClient:
                     days=self.settings.email_lookback_days
                 ),
             )
-        
-        # Override senders with keywords
+
         filter_config.senders = list(sender_keywords)
-        
-        try:
-            query = self._build_query(filter_config)
-            logger.info(
-                "gmail_fetching_by_senders",
-                query=query,
-                keyword_count=len(sender_keywords),
-            )
-            
-            # Fetch message list
-            result = await self._run_sync(
-                self._service.users().messages().list(
-                    userId="me",
-                    q=query,
-                    maxResults=filter_config.max_results,
-                ).execute
-            )
-            
-            messages = result.get("messages", [])
-            logger.info("gmail_found_by_senders", count=len(messages))
-            
-            # Filter out already processed
-            if exclude_ids:
-                messages = [m for m in messages if m["id"] not in exclude_ids]
-            
-            # Fetch full message details
-            email_messages: list[EmailMessage] = []
-            
-            for msg_info in messages:
-                try:
-                    email = await self._fetch_message_details(msg_info["id"])
-                    if email:
-                        email_messages.append(email)
-                except GmailParseError as e:
-                    logger.warning(
-                        "gmail_parse_error",
-                        message_id=msg_info["id"],
-                        error=str(e),
-                    )
-                    continue
-            
-            return email_messages
-            
-        except Exception as e:
-            logger.error("gmail_fetch_by_senders_failed", error=str(e))
-            raise GmailFetchError(
-                "Failed to fetch emails by senders",
-                original_error=e,
-            ) from e
+        return await self.fetch_emails(
+            filter_config=filter_config,
+            exclude_ids=exclude_ids,
+        )

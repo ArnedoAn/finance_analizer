@@ -23,6 +23,7 @@ from app.db.database import close_db, init_db
 from app.services.scheduler import SchedulerService
 
 logger = get_logger(__name__)
+settings = get_settings()
 
 
 @asynccontextmanager
@@ -41,7 +42,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("database_initialized")
     
     # Pre-authenticate Gmail if credentials exist
-    settings = get_settings()
     if settings.google_token_path.exists():
         try:
             gmail = get_gmail_client(DEFAULT_SESSION_ID)
@@ -72,116 +72,102 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("application_stopped")
 
 
-def create_application() -> FastAPI:
-    """
-    Create and configure the FastAPI application.
+app = FastAPI(
+    title="Finance Analyzer",
+    description="""
+    Automated Financial Transaction Processing System
     
-    Returns:
-        Configured FastAPI instance.
-    """
-    settings = get_settings()
+    This API automates the creation of transactions in Firefly III
+    from Gmail emails using AI-powered semantic analysis.
     
-    app = FastAPI(
-        title="Finance Analyzer",
-        description="""
-        Automated Financial Transaction Processing System
-        
-        This API automates the creation of transactions in Firefly III
-        from Gmail emails using AI-powered semantic analysis.
-        
-        ## Features
-        
-        - **Gmail Integration**: OAuth 2.0 authenticated email fetching
-        - **AI Analysis**: DeepSeek-powered transaction extraction
-        - **Firefly III Sync**: Automatic account, category, and transaction creation
-        - **Audit Trail**: Complete logging of all processing activities
-        - **Idempotency**: Duplicate email detection and prevention
-        
-        ## Workflow
-        
-        1. Fetch emails matching financial patterns from Gmail
-        2. Analyze each email with DeepSeek AI to extract transaction data
-        3. Resolve/create accounts and categories in Firefly III
-        4. Create the transaction with all metadata
-        5. Log the result for audit purposes
-        """,
-        version=__version__,
-        # Enable docs also in production
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
-        lifespan=lifespan,
-    )
+    ## Features
     
-    # CORS middleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"] if settings.debug else [],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    - **Gmail Integration**: OAuth 2.0 authenticated email fetching
+    - **AI Analysis**: DeepSeek-powered transaction extraction
+    - **Firefly III Sync**: Automatic account, category, and transaction creation
+    - **Audit Trail**: Complete logging of all processing activities
+    - **Idempotency**: Duplicate email detection and prevention
     
-    # Global exception handler
-    @app.exception_handler(FinanceAnalyzerError)
-    async def finance_analyzer_exception_handler(
-        request: Request,
-        exc: FinanceAnalyzerError,
-    ) -> JSONResponse:
-        """Handle application-specific exceptions."""
-        logger.error(
-            "application_error",
-            error_type=type(exc).__name__,
-            message=exc.message,
-            details=exc.details,
-        )
-        return JSONResponse(
-            status_code=500,
-            content=exc.to_dict(),
-        )
+    ## Workflow
     
-    @app.exception_handler(Exception)
-    async def general_exception_handler(
-        request: Request,
-        exc: Exception,
-    ) -> JSONResponse:
-        """Handle unexpected exceptions."""
-        logger.exception("unexpected_error", error=str(exc))
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "InternalServerError",
-                "message": "An unexpected error occurred",
-                "details": {"error": str(exc)} if settings.debug else {},
-            },
-        )
-    
-    # Include API routes
-    app.include_router(api_router, prefix="/api/v1")
-    
-    # Root endpoint
-    @app.get("/", tags=["Root"])
-    async def root() -> dict:
-        """Root endpoint with API information."""
-        return {
-            "name": "Finance Analyzer",
-            "version": __version__,
-            "docs": "/docs",
-            "api": "/api/v1",
-            "health": "/api/v1/health",
-        }
-    
-    return app
+    1. Fetch emails matching financial patterns from Gmail
+    2. Analyze each email with DeepSeek AI to extract transaction data
+    3. Resolve/create accounts and categories in Firefly III
+    4. Create the transaction with all metadata
+    5. Log the result for audit purposes
+    """,
+    version=__version__,
+    # Enable docs also in production
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if settings.debug else [],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# Create application instance
-app = create_application()
+@app.exception_handler(FinanceAnalyzerError)
+async def finance_analyzer_exception_handler(
+    request: Request,
+    exc: FinanceAnalyzerError,
+) -> JSONResponse:
+    """Handle application-specific exceptions."""
+    logger.error(
+        "application_error",
+        error_type=type(exc).__name__,
+        message=exc.message,
+        details=exc.details,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=exc.to_dict(),
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    """Handle unexpected exceptions."""
+    logger.exception("unexpected_error", error=str(exc))
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "InternalServerError",
+            "message": "An unexpected error occurred",
+            "details": {"error": str(exc)} if settings.debug else {},
+        },
+    )
+
+
+# Include API routes
+app.include_router(api_router, prefix="/api/v1")
+
+
+# Root endpoint
+@app.get("/", tags=["Root"])
+async def root() -> dict:
+    """Root endpoint with API information."""
+    return {
+        "name": "Finance Analyzer",
+        "version": __version__,
+        "docs": "/docs",
+        "api": "/api/v1",
+        "health": "/api/v1/health",
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    
-    settings = get_settings()
     
     uvicorn.run(
         "app.main:app",

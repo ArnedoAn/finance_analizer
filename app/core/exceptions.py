@@ -122,54 +122,6 @@ class ProcessingError(FinanceAnalyzerError):
     pass
 
 
-class DuplicateEmailError(ProcessingError):
-    """Raised when an email has already been processed."""
-    pass
-
-
-class ValidationError(ProcessingError):
-    """Raised when data validation fails."""
-    pass
-
-
 class TransactionCreationError(ProcessingError):
     """Raised when transaction creation fails."""
-    pass
-
-
-# =============================================================================
-# Notification Exceptions
-# =============================================================================
-
-class NotificationError(FinanceAnalyzerError):
-    """Base exception for notification/webhook errors."""
-    pass
-
-
-class DuplicateNotificationError(NotificationError):
-    """Raised when a notification has already been processed."""
-    pass
-
-
-class NotificationFilteredError(NotificationError):
-    """Raised when a notification is filtered out (not financial)."""
-    pass
-
-
-# =============================================================================
-# Database Exceptions
-# =============================================================================
-
-class DatabaseError(FinanceAnalyzerError):
-    """Base exception for database errors."""
-    pass
-
-
-class RecordNotFoundError(DatabaseError):
-    """Raised when a database record is not found."""
-    pass
-
-
-class RecordExistsError(DatabaseError):
-    """Raised when attempting to create a duplicate record."""
     pass

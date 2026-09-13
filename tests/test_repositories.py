@@ -190,6 +190,23 @@ class TestAccountCacheRepository:
         result2 = await repo.get_by_name("My Bank", "expense")
         assert result2 is None
 
+    async def test_get_by_partial_name(self, db_session):
+        """Partial match works both ways: name contains search, search contains name."""
+        repo = AccountCacheRepository(db_session)
+
+        await repo.upsert("1", "Lulo Bank", "asset", "COP")
+        await db_session.commit()
+
+        forward = await repo.get_by_partial_name("Lulo", "asset")
+        assert forward is not None and forward.name == "Lulo Bank"
+
+        reverse = await repo.get_by_partial_name(
+            "Tarjeta débito 7556 Lulo bank", "asset"
+        )
+        assert reverse is not None and reverse.name == "Lulo Bank"
+
+        assert await repo.get_by_partial_name("Nequi", "asset") is None
+
 
 @pytest.mark.asyncio
 class TestCategoryCacheRepository:

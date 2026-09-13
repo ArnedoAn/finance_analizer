@@ -212,6 +212,13 @@ docker-compose up -d
 docker-compose -f docker-compose.dev.yml up
 ```
 
+### DNS público y OAuth de Gmail (deploy)
+
+- Define `PUBLIC_BASE_URL` (ej. `https://finance.example.com`, sin slash final) en `.env` / `.env.production`. El contenedor deriva el callback OAuth como `${PUBLIC_BASE_URL}/api/v1/auth/callback` al arrancar — no requiere rebuild de imagen.
+- Registra EXACTAMENTE esa misma URL en Google Cloud Console → APIs & Services → Credentials → OAuth client → Authorized redirect URIs. Un carácter distinto (esquema, host, puerto, path, trailing slash) provoca `redirect_uri_mismatch`.
+- `GMAIL_REDIRECT_URI` permanece como override opcional: solo úsalo si el callback real debe diferir de `PUBLIC_BASE_URL` (ej. proxy con path distinto).
+- Tras cambiar dominio: actualiza `PUBLIC_BASE_URL`, reinicia el contenedor y re-registra la nueva URL en Google Cloud Console. **No** hace falta rebuild ni reautenticación de tokens existentes.
+
 ### Primera ejecución
 
 0. Obtener/crear sesión de usuario (recomendado):
@@ -263,7 +270,7 @@ docker-compose -f docker-compose.dev.yml up
 
 Ejemplo de frontend con `X-User-Id`:
 ```bash
-curl -X GET "https://financeapi.toothless.codes/api/v1/auth/status" \
+curl -X GET "${PUBLIC_BASE_URL}/api/v1/auth/status" \
   -H "X-User-Id: 123456789"
 ```
 

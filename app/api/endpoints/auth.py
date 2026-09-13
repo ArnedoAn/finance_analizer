@@ -246,54 +246,6 @@ async def auth_status(services: ServicesDep) -> AuthStatus:
         )
 
 
-@router.post(
-    "/gmail/init",
-    response_model=AuthStatus,
-    summary="Initialize Gmail Authentication",
-    description="Start Gmail OAuth 2.0 authentication flow.",
-)
-async def init_gmail_auth(services: ServicesDep) -> AuthStatus:
-    """
-    Initialize Gmail OAuth authentication.
-    
-    This will:
-    1. Check for existing valid credentials
-    2. Refresh expired credentials if possible
-    3. Start new OAuth flow if needed (opens browser)
-    
-    Returns:
-        Authentication status after flow completion.
-        
-    Note:
-        This endpoint will block until the OAuth flow completes.
-        The user must authorize in their browser.
-    """
-    try:
-        success = await services.gmail.authenticate()
-        
-        if success:
-            return AuthStatus(
-                gmail_authenticated=True,
-                message="Gmail authentication successful",
-            )
-        else:
-            return AuthStatus(
-                gmail_authenticated=False,
-                message="Gmail authentication failed",
-            )
-            
-    except GmailAuthenticationError as e:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Gmail authentication failed: {e.message}",
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Authentication error: {str(e)}",
-        )
-
-
 @router.get(
     "/firefly/status",
     summary="Firefly III Connection Status",

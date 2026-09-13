@@ -32,6 +32,7 @@ from app.core.exceptions import (
     DeepSeekRateLimitError,
 )
 from app.core.logging import get_logger
+from app.core.timezone import parse_datetime
 from app.models.schemas import TransactionAnalysis, TransactionType
 
 logger = get_logger(__name__)
@@ -413,66 +414,14 @@ class DeepSeekClient:
         source_app: str = "",
     ) -> TransactionAnalysis | None:
         """Parse notification API response. Returns None if not financial."""
-        try:
-            choices = response.get("choices", [])
-            if not choices:
-                raise DeepSeekParseError("Empty response from DeepSeek")
-            
-            content = choices[0].get("message", {}).get("content", "")
-            data = json.loads(content)
-            
-            # Check if AI determined this is a financial notification
-            if not data.get("is_financial", False):
-                logger.info(
-                    "notification_not_financial",
-                    app=source_app,
-                )
-                return None
-            
-            currency = data.get("currency", default_currency).upper()
-            amount = self._parse_amount(data.get("amount", 0))
-            
-            # COP scale correction (same as email)
-            if currency == "COP" and amount < Decimal("100"):
-                original_amount = amount
-                amount = amount * Decimal("1000")
-                logger.warning(
-                    "deepseek_notification_amount_corrected",
-                    original_amount=float(original_amount),
-                    corrected_amount=float(amount),
-                    currency=currency,
-                )
-            
-            return TransactionAnalysis(
-                amount=amount,
-                currency=currency,
-                date=self._parse_date(data.get("date")),
-                description=data.get("description", "Transacción sin descripción"),
-                merchant=data.get("merchant", ""),
-                suggested_category=data.get("suggested_category", "Sin Categoría"),
-                suggested_account_name=data.get("suggested_account_name", ""),
-                transaction_type=self._parse_transaction_type(
-                    data.get("transaction_type", "withdrawal")
-                ),
-                confidence_score=float(data.get("confidence_score", 0.5)),
-                raw_extracted=data,
-                email_sender=source_app,
-            )
-        except json.JSONDecodeError as e:
-            logger.error("deepseek_notification_json_parse_failed", error=str(e))
-            raise DeepSeekParseError(
-                "Failed to parse notification JSON response",
-                details={"content": content[:200]},
-                original_error=e,
-            ) from e
-        except Exception as e:
-            if isinstance(e, DeepSeekParseError):
-                raise
-            logger.error("deepseek_notification_parse_failed", error=str(e))
-            raise DeepSeekParseError(
-                "Failed to parse DeepSeek notification response",
-                original_error=e,
-            ) from e
+        data = self._extract_json_response(response)
+
+        # Check if AI determined this is a financial notification
+        if not data.get("is_financial", False):
+            logger.info("notification_not_financial", app=source_app)
+            return None
+
+        return self._build_analysis(data, default_currency, source_app)
     
     def _build_compact_message(
         self,
@@ -497,59 +446,16 @@ class DeepSeekClient:
         
         return "\n".join(parts)
     
-    def _parse_transaction_response(
-        self,
-        response: dict[str, Any],
-        default_currency: str,
-        email_sender: str = "",
-    ) -> TransactionAnalysis:
-        """Parse API response into TransactionAnalysis."""
+    @staticmethod
+    def _extract_json_response(response: dict[str, Any]) -> dict[str, Any]:
+        """Extract the JSON object content from a chat completion response."""
+        choices = response.get("choices", [])
+        if not choices:
+            raise DeepSeekParseError("Empty response from DeepSeek")
+
+        content = choices[0].get("message", {}).get("content", "")
         try:
-            # Extract content from response
-            choices = response.get("choices", [])
-            if not choices:
-                raise DeepSeekParseError("Empty response from DeepSeek")
-            
-            content = choices[0].get("message", {}).get("content", "")
-            
-            # Parse JSON directly (JSON mode ensures valid JSON)
-            data = json.loads(content)
-            
-            # Parse currency and amount
-            currency = data.get("currency", default_currency).upper()
-            amount = self._parse_amount(data.get("amount", 0))
-            
-            # Corrección para pesos colombianos: si la cantidad es menor a 100 COP,
-            # probablemente está en la escala incorrecta (centavos en lugar de pesos)
-            # Multiplicar por 1000 para corregir
-            if currency == "COP" and amount < Decimal("100"):
-                original_amount = amount
-                amount = amount * Decimal("1000")
-                logger.warning(
-                    "deepseek_amount_corrected",
-                    original_amount=float(original_amount),
-                    corrected_amount=float(amount),
-                    currency=currency,
-                    reason="Amount < 100 COP, likely scale error"
-                )
-            
-            # Build TransactionAnalysis with validation and defaults
-            return TransactionAnalysis(
-                amount=amount,
-                currency=currency,
-                date=self._parse_date(data.get("date")),
-                description=data.get("description", "Transacción sin descripción"),
-                merchant=data.get("merchant", ""),
-                suggested_category=data.get("suggested_category", "Sin Categoría"),
-                suggested_account_name=data.get("suggested_account_name", ""),
-                transaction_type=self._parse_transaction_type(
-                    data.get("transaction_type", "withdrawal")
-                ),
-                confidence_score=float(data.get("confidence_score", 0.5)),
-                raw_extracted=data,
-                email_sender=email_sender,
-            )
-            
+            return json.loads(content)
         except json.JSONDecodeError as e:
             logger.error("deepseek_json_parse_failed", error=str(e), content=content[:200])
             raise DeepSeekParseError(
@@ -557,12 +463,55 @@ class DeepSeekClient:
                 details={"content": content[:200]},
                 original_error=e,
             ) from e
-        except Exception as e:
-            logger.error("deepseek_parse_failed", error=str(e))
-            raise DeepSeekParseError(
-                "Failed to parse DeepSeek response",
-                original_error=e,
-            ) from e
+
+    def _build_analysis(
+        self,
+        data: dict[str, Any],
+        default_currency: str,
+        email_sender: str = "",
+    ) -> TransactionAnalysis:
+        """Build a validated TransactionAnalysis from parsed AI response data."""
+        currency = data.get("currency", default_currency).upper()
+        amount = self._parse_amount(data.get("amount", 0))
+
+        # COP scale correction: amounts under 100 are likely centavos, not pesos.
+        if currency == "COP" and amount < Decimal("100"):
+            original_amount = amount
+            amount = amount * Decimal("1000")
+            logger.warning(
+                "deepseek_amount_corrected",
+                original_amount=float(original_amount),
+                corrected_amount=float(amount),
+                currency=currency,
+                reason="Amount < 100 COP, likely scale error",
+            )
+
+        return TransactionAnalysis(
+            amount=amount,
+            currency=currency,
+            date=self._parse_date(data.get("date")),
+            description=data.get("description", "Transacción sin descripción"),
+            merchant=data.get("merchant", ""),
+            suggested_category=data.get("suggested_category", "Sin Categoría"),
+            suggested_account_name=data.get("suggested_account_name", ""),
+            transaction_type=self._parse_transaction_type(
+                data.get("transaction_type", "withdrawal")
+            ),
+            confidence_score=float(data.get("confidence_score", 0.5)),
+            raw_extracted=data,
+            email_sender=email_sender,
+        )
+
+    def _parse_transaction_response(
+        self,
+        response: dict[str, Any],
+        default_currency: str,
+        email_sender: str = "",
+    ) -> TransactionAnalysis:
+        """Parse API response into TransactionAnalysis."""
+        return self._build_analysis(
+            self._extract_json_response(response), default_currency, email_sender
+        )
     
     async def analyze_senders_for_learning(
         self,
@@ -653,29 +602,12 @@ class DeepSeekClient:
         return Decimal("0")
     
     def _parse_date(self, value: Any) -> datetime:
-        """Parse date from various formats."""
+        """Parse date from various formats; defaults to now when unparseable."""
         if isinstance(value, datetime):
             return value
-        
-        if isinstance(value, str):
-            # Try common formats
-            formats = [
-                "%Y-%m-%d",
-                "%Y/%m/%d",
-                "%d-%m-%Y",
-                "%d/%m/%Y",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%dT%H:%M:%SZ",
-            ]
-            
-            for fmt in formats:
-                try:
-                    return datetime.strptime(value, fmt)
-                except ValueError:
-                    continue
-        
-        # Default to today
-        return datetime.utcnow()
+
+        parsed = parse_datetime(value) if isinstance(value, str) else None
+        return parsed or datetime.utcnow()
     
     def _parse_transaction_type(self, value: str) -> TransactionType:
         """Parse transaction type from string."""

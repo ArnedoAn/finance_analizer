@@ -152,7 +152,6 @@ class TestProcessingStatus:
     
     def test_status_values(self):
         """Test all status values exist."""
-        assert ProcessingStatus.PENDING.value == "pending"
         assert ProcessingStatus.PROCESSING.value == "processing"
         assert ProcessingStatus.ANALYZED.value == "analyzed"
         assert ProcessingStatus.CREATED.value == "created"

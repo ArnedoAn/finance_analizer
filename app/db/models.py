@@ -205,43 +205,6 @@ class CategoryCache(Base):
         return f"<CategoryCache(id={self.id}, name={self.name})>"
 
 
-class TagCache(Base):
-    """
-    Local cache of Firefly III tags.
-    
-    Optional feature for enhanced categorization.
-    """
-    
-    __tablename__ = "tag_cache"
-    
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    session_id: Mapped[str] = mapped_column(String(64), nullable=False, default="default", index=True)
-    firefly_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    tag: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    __table_args__ = (
-        Index(
-            "ix_tag_cache_session_firefly",
-            "session_id",
-            "firefly_id",
-            unique=True,
-        ),
-        Index(
-            "ix_tag_cache_session_tag",
-            "session_id",
-            "tag",
-            unique=True,
-        ),
-    )
-    
-    
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=func.now()
-    )
-    
-    def __repr__(self) -> str:
-        return f"<TagCache(id={self.id}, tag={self.tag})>"
-
-
 class KnownSender(Base):
     """
     Dictionary of known financial email senders.

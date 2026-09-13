@@ -30,6 +30,7 @@ from app.core.session import (
 from app.db.database import get_db, get_db_session as db_session_context
 from app.services.email_processor import EmailProcessorService
 from app.services.notification_processor import NotificationProcessorService
+from app.services.sender_learning import SenderLearningService
 from app.services.sync_service import SyncService
 from app.services.transaction_service import TransactionService
 
@@ -106,15 +107,6 @@ def get_request_session_context(
 SessionDep = Annotated[RequestSessionContext, Depends(get_request_session_context)]
 
 
-def get_session_id(session: SessionDep) -> str:
-    """Extract session ID from the request session context."""
-    return session.session_id
-
-
-# Type alias for session_id dependency injection
-SessionIdDep = Annotated[str, Depends(get_session_id)]
-
-
 def get_gmail_client(session_id: str = DEFAULT_SESSION_ID) -> GmailClient:
     """Get a Gmail client singleton scoped by session_id."""
     client = _gmail_clients.get(session_id)
@@ -127,6 +119,19 @@ def get_gmail_client(session_id: str = DEFAULT_SESSION_ID) -> GmailClient:
 def get_request_gmail_client(session: SessionDep) -> GmailClient:
     """FastAPI dependency that returns the session-scoped Gmail client."""
     return get_gmail_client(session.session_id)
+
+
+async def get_sender_learning_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    session: SessionDep,
+) -> SenderLearningService:
+    """FastAPI dependency that returns a sender learning service for the session."""
+    return SenderLearningService(
+        db,
+        get_gmail_client(session.session_id),
+        get_deepseek_client(),
+        session_id=session.session_id,
+    )
 
 
 def get_deepseek_client() -> DeepSeekClient:
@@ -144,11 +149,6 @@ def get_firefly_client(session_id: str = DEFAULT_SESSION_ID) -> FireflyClient:
         client = FireflyClient(session_id=session_id)
         _firefly_clients[session_id] = client
     return client
-
-
-def get_request_firefly_client(session: SessionDep) -> FireflyClient:
-    """FastAPI dependency that returns the session-scoped Firefly client."""
-    return get_firefly_client(session.session_id)
 
 
 async def cleanup_clients() -> None:
@@ -233,6 +233,10 @@ async def get_services(
 
 # Type alias for dependency injection
 ServicesDep = Annotated[Services, Depends(get_services)]
+
+SenderLearningDep = Annotated[
+    SenderLearningService, Depends(get_sender_learning_service)
+]
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:

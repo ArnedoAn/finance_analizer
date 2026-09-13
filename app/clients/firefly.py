@@ -29,13 +29,9 @@ from app.core.security import get_token_encryption
 from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
 from app.models.schemas import (
     AccountCreate,
-    AccountResponse,
     AccountType,
     CategoryCreate,
-    CategoryResponse,
     TransactionCreate,
-    TransactionResponse,
-    TransactionType,
 )
 
 logger = get_logger(__name__)
@@ -385,26 +381,7 @@ class FireflyClient:
             payload=payload,
         )
         
-        try:
-            response = await self._request("POST", "/accounts", json=payload)
-        except FireflyValidationError as e:
-            # Log full error details for debugging
-            logger.error(
-                "firefly_account_validation_failed",
-                name=account.name,
-                type=account.type.value,
-                error_message=e.message,
-                error_details=e.details,
-            )
-            raise
-        except Exception as e:
-            logger.error(
-                "firefly_account_creation_error",
-                name=account.name,
-                type=account.type.value,
-                error=str(e),
-            )
-            raise
+        response = await self._request("POST", "/accounts", json=payload)
         
         data = response.get("data", {})
         attrs = data.get("attributes", {})
@@ -459,7 +436,7 @@ class FireflyClient:
             name=name,
             type=account_type,
             currency_code=currency_code,
-            notes=f"Auto-created by Finance Analyzer",
+            notes="Auto-created by Finance Analyzer",
         ))
     
     # =========================================================================
@@ -541,63 +518,8 @@ class FireflyClient:
         
         return await self.create_category(CategoryCreate(
             name=name,
-            notes=f"Auto-created by Finance Analyzer",
+            notes="Auto-created by Finance Analyzer",
         ))
-    
-    # =========================================================================
-    # Tag Operations
-    # =========================================================================
-    
-    async def get_tags(self) -> list[dict[str, Any]]:
-        """Get all tags."""
-        tags = []
-        page = 1
-        
-        while True:
-            response = await self._request(
-                "GET", "/tags", params={"page": page}
-            )
-            
-            data = response.get("data", [])
-            if not data:
-                break
-            
-            for item in data:
-                attrs = item.get("attributes", {})
-                tags.append({
-                    "id": item.get("id"),
-                    "tag": attrs.get("tag"),
-                })
-            
-            meta = response.get("meta", {})
-            pagination = meta.get("pagination", {})
-            if page >= pagination.get("total_pages", 1):
-                break
-            page += 1
-        
-        return tags
-    
-    async def create_tag(self, tag: str) -> dict[str, Any]:
-        """Create a new tag."""
-        response = await self._request("POST", "/tags", json={"tag": tag})
-        
-        data = response.get("data", {})
-        attrs = data.get("attributes", {})
-        
-        return {
-            "id": data.get("id"),
-            "tag": attrs.get("tag"),
-        }
-    
-    async def get_or_create_tag(self, tag: str) -> dict[str, Any]:
-        """Get tag or create if not exists."""
-        tags = await self.get_tags()
-        
-        for t in tags:
-            if t["tag"].lower() == tag.lower():
-                return t
-        
-        return await self.create_tag(tag)
     
     # =========================================================================
     # Transaction Operations

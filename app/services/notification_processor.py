@@ -18,13 +18,12 @@ from app.clients.firefly import FireflyClient
 from app.core.config import get_settings
 from app.core.exceptions import (
     DeepSeekError,
-    DuplicateNotificationError,
     FireflyDuplicateError,
     FireflyError,
-    NotificationFilteredError,
 )
 from app.core.logging import get_logger
 from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
+from app.core.timezone import parse_datetime
 from app.db.repositories import (
     AuditLogRepository,
     ProcessedNotificationRepository,
@@ -95,6 +94,37 @@ class NotificationProcessorService:
         """Check if the app is a known financial app."""
         known_apps = self.settings.webhook_known_apps_list
         return app_package in known_apps
+
+    async def _mark_processed(
+        self,
+        notification: NotificationPayload,
+        notification_hash: str,
+        notification_date: datetime,
+    ) -> None:
+        """Record a notification as processed."""
+        await self._notification_repo.mark_processed(
+            notification_hash=notification_hash,
+            source_app=notification.app,
+            sender=notification.sender,
+            title=notification.title,
+            notification_date=notification_date,
+        )
+
+    async def _record_audit(
+        self,
+        audit_data: AuditLogCreate,
+        start_time: float,
+        status: ProcessingStatus,
+        error_message: str | None = None,
+        error_details: dict[str, Any] | None = None,
+    ) -> None:
+        """Fill and persist the audit log entry, then commit."""
+        audit_data.status = status
+        audit_data.error_message = error_message
+        audit_data.error_details = error_details or None
+        audit_data.processing_time_ms = int((time.time() - start_time) * 1000)
+        await self._audit_repo.create(audit_data)
+        await self.session.commit()
     
     async def process_notification(
         self,
@@ -187,27 +217,18 @@ class NotificationProcessorService:
                 # AI determined this is not a financial notification
                 final_status = ProcessingStatus.SKIPPED
                 error_message = "Not a financial notification (AI filtered)"
-                
-                await self._notification_repo.mark_processed(
-                    notification_hash=notification_hash,
-                    source_app=notification.app,
-                    sender=notification.sender,
-                    title=notification.title,
-                    notification_date=notification_date,
+                await self._mark_processed(
+                    notification, notification_hash, notification_date
                 )
-                
-                audit_data.status = final_status
-                audit_data.error_message = error_message
-                audit_data.processing_time_ms = int((time.time() - start_time) * 1000)
-                await self._audit_repo.create(audit_data)
-                await self.session.commit()
-                
+                await self._record_audit(
+                    audit_data, start_time, final_status, error_message
+                )
                 return NotificationProcessingResult(
                     notification_hash=notification_hash,
                     source_app=notification.app,
                     status=final_status,
                     error_message=error_message,
-                    processing_time_ms=int((time.time() - start_time) * 1000),
+                    processing_time_ms=audit_data.processing_time_ms,
                 )
             
             audit_data.analysis_result = analysis.model_dump(mode="json")
@@ -240,27 +261,19 @@ class NotificationProcessorService:
                     f"(original: {existing_fingerprint.source_channel})"
                 )
                 
-                await self._notification_repo.mark_processed(
-                    notification_hash=notification_hash,
-                    source_app=notification.app,
-                    sender=notification.sender,
-                    title=notification.title,
-                    notification_date=notification_date,
+                await self._mark_processed(
+                    notification, notification_hash, notification_date
                 )
-                
-                audit_data.status = final_status
-                audit_data.error_message = error_message
-                audit_data.processing_time_ms = int((time.time() - start_time) * 1000)
-                await self._audit_repo.create(audit_data)
-                await self.session.commit()
-                
+                await self._record_audit(
+                    audit_data, start_time, final_status, error_message
+                )
                 return NotificationProcessingResult(
                     notification_hash=notification_hash,
                     source_app=notification.app,
                     status=final_status,
                     analysis=analysis,
                     error_message=error_message,
-                    processing_time_ms=int((time.time() - start_time) * 1000),
+                    processing_time_ms=audit_data.processing_time_ms,
                 )
             
             # Step 5: Create transaction
@@ -290,12 +303,8 @@ class NotificationProcessorService:
                     firefly_transaction_id=transaction_id,
                 )
                 
-                await self._notification_repo.mark_processed(
-                    notification_hash=notification_hash,
-                    source_app=notification.app,
-                    sender=notification.sender,
-                    title=notification.title,
-                    notification_date=notification_date,
+                await self._mark_processed(
+                    notification, notification_hash, notification_date
                 )
             
         except FireflyDuplicateError as e:
@@ -306,13 +315,8 @@ class NotificationProcessorService:
             final_status = ProcessingStatus.SKIPPED
             error_message = "Duplicate transaction detected by Firefly"
             error_details = e.details
-            
-            await self._notification_repo.mark_processed(
-                notification_hash=notification_hash,
-                source_app=notification.app,
-                sender=notification.sender,
-                title=notification.title,
-                notification_date=notification_date,
+            await self._mark_processed(
+                notification, notification_hash, notification_date
             )
             
         except DeepSeekError as e:
@@ -341,16 +345,10 @@ class NotificationProcessorService:
             )
             error_message = str(e)
         
-        # Record audit log
-        processing_time = int((time.time() - start_time) * 1000)
-        audit_data.status = final_status
-        audit_data.error_message = error_message
-        audit_data.error_details = error_details or None
-        audit_data.processing_time_ms = processing_time
-        
-        await self._audit_repo.create(audit_data)
-        await self.session.commit()
-        
+        await self._record_audit(
+            audit_data, start_time, final_status, error_message, error_details
+        )
+
         return NotificationProcessingResult(
             notification_hash=notification_hash,
             source_app=notification.app,
@@ -359,7 +357,7 @@ class NotificationProcessorService:
             transaction_id=transaction_id,
             error_message=error_message,
             error_details=error_details,
-            processing_time_ms=processing_time,
+            processing_time_ms=audit_data.processing_time_ms,
         )
     
     async def _analyze_notification(
@@ -414,24 +412,10 @@ class NotificationProcessorService:
         }
     
     def _parse_notification_date(self, notification: NotificationPayload) -> datetime:
-        """Parse date from notification payload."""
-        # Try timestamp first, then date field
+        """Parse date from notification payload; defaults to now when unparseable."""
         for date_str in (notification.timestamp, notification.date):
-            if not date_str:
-                continue
-            for fmt in (
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%d %H:%M",
-                "%Y-%m-%d",
-                "%d/%m/%Y %H:%M:%S",
-                "%d/%m/%Y",
-            ):
-                try:
-                    return datetime.strptime(date_str, fmt)
-                except ValueError:
-                    continue
-        
-        # Fallback to now
+            parsed = parse_datetime(date_str)
+            if parsed is not None:
+                return parsed
+
         return datetime.utcnow()

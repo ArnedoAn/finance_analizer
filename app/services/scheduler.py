@@ -5,8 +5,6 @@ Manages CRON-based scheduled tasks using APScheduler.
 Handles automatic email processing and sender learning jobs.
 """
 
-import asyncio
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -278,7 +276,6 @@ class SchedulerService:
                     UNION ALL SELECT session_id FROM scheduler_job_logs
                     UNION ALL SELECT session_id FROM account_cache
                     UNION ALL SELECT session_id FROM category_cache
-                    UNION ALL SELECT session_id FROM tag_cache
                     UNION ALL SELECT session_id FROM known_senders
                 ) WHERE session_id IS NOT NULL
                 """
@@ -295,25 +292,14 @@ class SchedulerService:
 # Helper to parse CRON expressions for documentation
 def describe_cron(cron_expression: str) -> str:
     """Get human-readable description of a CRON expression."""
-    parts = cron_expression.split()
-    if len(parts) != 5:
+    if len(cron_expression.split()) != 5:
         return cron_expression
-    
-    minute, hour, day, month, weekday = parts
-    
-    descriptions = []
-    
-    # Common patterns
-    if cron_expression == "0 */6 * * *":
-        return "Every 6 hours"
-    if cron_expression == "0 0 */5 * *":
-        return "Every 5 days at midnight"
-    if cron_expression == "0 0 * * *":
-        return "Daily at midnight"
-    if cron_expression == "0 0 1,15 * *":
-        return "On the 1st and 15th of each month at midnight"
-    if cron_expression == "0 0 * * 0":
-        return "Every Sunday at midnight"
-    
-    # Fallback
-    return f"CRON: {cron_expression}"
+
+    descriptions = {
+        "0 */6 * * *": "Every 6 hours",
+        "0 0 */5 * *": "Every 5 days at midnight",
+        "0 0 * * *": "Daily at midnight",
+        "0 0 1,15 * *": "On the 1st and 15th of each month at midnight",
+        "0 0 * * 0": "Every Sunday at midnight",
+    }
+    return descriptions.get(cron_expression, f"CRON: {cron_expression}")

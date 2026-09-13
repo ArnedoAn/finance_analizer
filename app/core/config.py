@@ -9,24 +9,33 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# OAuth callback path appended to PUBLIC_BASE_URL when deriving the Gmail
+# redirect URI. Keep in sync with the FastAPI router mount point in
+# `app/api/routes.py` and the Google Cloud Console redirect URI registration.
+_GMAIL_CALLBACK_PATH = "/api/v1/auth/callback"
+
+# Fallback used when neither PUBLIC_BASE_URL nor GMAIL_REDIRECT_URI is set
+# (e.g. local development with no explicit configuration).
+_DEFAULT_GMAIL_REDIRECT_URI = f"http://localhost:8000{_GMAIL_CALLBACK_PATH}"
 
 
 class Settings(BaseSettings):
     """
     Application settings loaded from environment variables.
-    
+
     All sensitive values use SecretStr to prevent accidental exposure in logs.
     """
-    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
     )
-    
+
     # =========================================================================
     # Application Settings
     # =========================================================================
@@ -46,13 +55,13 @@ class Settings(BaseSettings):
     log_backup_count: int = Field(
         default=5, description="Number of backup log files to keep"
     )
-    
+
     # =========================================================================
     # Server Settings
     # =========================================================================
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8000, ge=1, le=65535, description="Server port")
-    
+
     # =========================================================================
     # Session Settings
     # =========================================================================
@@ -68,7 +77,7 @@ class Settings(BaseSettings):
         default="default",
         description="Session ID used by automatic scheduler jobs",
     )
-    
+
     # =========================================================================
     # Database
     # =========================================================================
@@ -76,7 +85,7 @@ class Settings(BaseSettings):
         default="sqlite+aiosqlite:///./data/finance_analyzer.db",
         description="Database connection URL"
     )
-    
+
     # =========================================================================
     # Google / Gmail API
     # =========================================================================
@@ -91,9 +100,20 @@ class Settings(BaseSettings):
     token_encryption_key: SecretStr = Field(
         ..., description="Encryption key for OAuth tokens"
     )
+    public_base_url: str | None = Field(
+        default=None,
+        description=(
+            "Public HTTPS origin that fronts this service. Used to derive the "
+            "Gmail OAuth redirect URI at container startup when "
+            "GMAIL_REDIRECT_URI is not explicitly set."
+        ),
+    )
     gmail_redirect_uri: str = Field(
-        default="http://localhost:8000/api/v1/auth/callback",
-        description="OAuth redirect URI (must match Google Console)"
+        default="",
+        description=(
+            "OAuth redirect URI (must match Google Cloud Console). "
+            "Empty value is treated as unset and resolved via PUBLIC_BASE_URL."
+        ),
     )
     gmail_subject_filters: str = Field(
         default="Factura,Pago,Recibo,Compra,Confirmación,Transferencia,Cargo,Abono",
@@ -106,7 +126,7 @@ class Settings(BaseSettings):
         default=True,
         description="Whether to include subject filters in Gmail queries"
     )
-    
+
     # =========================================================================
     # DeepSeek AI
     # =========================================================================
@@ -117,8 +137,7 @@ class Settings(BaseSettings):
     )
     deepseek_model: str = Field(default="deepseek-chat", description="DeepSeek model")
     deepseek_timeout: int = Field(default=60, ge=10, le=300, description="API timeout")
-    deepseek_max_retries: int = Field(default=3, ge=1, le=10, description="Max retries")
-    
+
     # =========================================================================
     # Firefly III
     # =========================================================================
@@ -129,7 +148,6 @@ class Settings(BaseSettings):
         description="Path to store session-scoped Firefly tokens",
     )
     firefly_timeout: int = Field(default=30, ge=5, le=120, description="API timeout")
-    firefly_max_retries: int = Field(default=3, ge=1, le=10, description="Max retries")
     firefly_default_asset_account: str = Field(
         default="Bancolombia", description="Default asset account for withdrawals"
     )
@@ -139,21 +157,21 @@ class Settings(BaseSettings):
     firefly_default_revenue_account: str = Field(
         default="Ingresos Generales", description="Default revenue account for unknown income sources"
     )
-    
+
     # =========================================================================
     # Currency Settings
     # =========================================================================
     default_currency: str = Field(
         default="COP", description="Default currency code (ISO 4217)"
     )
-    
+
     # =========================================================================
     # Timezone Settings
     # =========================================================================
     timezone: str = Field(
         default="America/Bogota", description="Application timezone (IANA timezone name)"
     )
-    
+
     # =========================================================================
     # Processing Options
     # =========================================================================
@@ -173,7 +191,7 @@ class Settings(BaseSettings):
         default=False,
         description="TEST MODE: Clear processed emails table before processing (for testing only)"
     )
-    
+
     # =========================================================================
     # Webhook / Notification Settings
     # =========================================================================
@@ -185,19 +203,12 @@ class Settings(BaseSettings):
         default=2, ge=1, le=24,
         description="Time window (hours) for cross-channel transaction deduplication"
     )
-    
+
     @property
     def webhook_known_apps_list(self) -> list[str]:
         """Parse comma-separated known apps into list."""
         return [a.strip() for a in self.webhook_known_apps.split(",") if a.strip()]
-    
-    # =========================================================================
-    # Retry Configuration
-    # =========================================================================
-    retry_max_attempts: int = Field(default=3, ge=1, le=10)
-    retry_wait_seconds: int = Field(default=2, ge=1, le=60)
-    retry_max_wait_seconds: int = Field(default=30, ge=5, le=300)
-    
+
     # =========================================================================
     # Scheduler Configuration (CRON)
     # =========================================================================
@@ -216,7 +227,7 @@ class Settings(BaseSettings):
         default=100, ge=10, le=500,
         description="Number of emails to analyze for learning"
     )
-    
+
     # =========================================================================
     # Token Optimization
     # =========================================================================
@@ -238,12 +249,12 @@ class Settings(BaseSettings):
     def gmail_subjects_list(self) -> list[str]:
         """Parse comma-separated subjects into list."""
         return [s.strip() for s in self.gmail_subject_filters.split(",") if s.strip()]
-    
+
     @property
     def is_production(self) -> bool:
         """Check if running in production."""
         return self.app_env == "production"
-    
+
     @field_validator(
         "google_credentials_path",
         "google_token_path",
@@ -255,12 +266,35 @@ class Settings(BaseSettings):
         """Convert string paths to Path objects."""
         return Path(v) if isinstance(v, str) else v
 
+    @model_validator(mode="after")
+    def resolve_gmail_redirect_uri(self) -> "Settings":
+        """Resolve GMAIL_REDIRECT_URI at startup.
+
+        Precedence:
+          1. Non-empty explicit ``GMAIL_REDIRECT_URI`` (treats whitespace and
+             empty strings as absent).
+          2. ``PUBLIC_BASE_URL`` + ``/api/v1/auth/callback`` (trailing slash
+             stripped from the base).
+          3. Localhost default for dev environments without a public domain.
+        """
+        explicit = self.gmail_redirect_uri.strip()
+        if explicit:
+            self.gmail_redirect_uri = explicit
+            return self
+
+        base = (self.public_base_url or "").strip()
+        if base:
+            self.gmail_redirect_uri = f"{base.rstrip('/')}{_GMAIL_CALLBACK_PATH}"
+        else:
+            self.gmail_redirect_uri = _DEFAULT_GMAIL_REDIRECT_URI
+        return self
+
 
 @lru_cache
 def get_settings() -> Settings:
     """
     Get cached settings instance.
-    
+
     Uses lru_cache to ensure settings are only loaded once.
     """
     return Settings()

@@ -9,8 +9,7 @@ from datetime import datetime, timedelta
 import uuid
 from typing import Sequence
 
-from sqlalchemy import and_, delete, select, update
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import String, and_, delete, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -24,7 +23,6 @@ from app.db.models import (
     ProcessedEmail,
     ProcessedNotification,
     SchedulerJobLog,
-    TagCache,
     TransactionFingerprint,
 )
 from app.models.schemas import AuditLogCreate, ProcessingStatus
@@ -247,47 +245,38 @@ class AccountCacheRepository:
     ) -> AccountCache | None:
         """
         Get account by partial name match (case-insensitive).
-        
-        Useful when AI extracts account names like "Lulo" that should
-        match "Lulo Bank" in the cache.
-        
-        Args:
-            partial_name: Partial name to search for.
-            account_type: Account type to filter by.
-            
-        Returns:
-            First matching account or None.
+
+        Matches when the account name contains the search term
+        ("Lulo" → "Lulo Bank") or the search term contains the name
+        ("Tarjeta débito 7556 Lulo bank" → "Lulo").
         """
-        # Normalize the search term
-        search_lower = partial_name.lower().strip()
-        
-        # Get all accounts of this type
-        query = select(AccountCache).where(
-            AccountCache.session_id == self.session_id,
-            AccountCache.account_type == account_type
+        search = partial_name.lower().strip()
+        if not search:
+            return None
+
+        name_lower = func.lower(AccountCache.name)
+        reverse_pattern = (
+            literal("%", String)
+            .concat(name_lower)
+            .concat(literal("%", String))
+        )
+        query = (
+            select(AccountCache)
+            .where(
+                and_(
+                    AccountCache.session_id == self.session_id,
+                    AccountCache.account_type == account_type,
+                    or_(
+                        name_lower.contains(search),
+                        literal(search, String).like(reverse_pattern),
+                    ),
+                )
+            )
+            .order_by(AccountCache.id)
+            .limit(1)
         )
         result = await self.session.execute(query)
-        accounts = result.scalars().all()
-        
-        # Try different matching strategies
-        for account in accounts:
-            account_lower = account.name.lower()
-            
-            # Exact match (already tried, but just in case)
-            if account_lower == search_lower:
-                return account
-            
-            # Search term is contained in account name
-            # e.g., "Lulo" matches "Lulo Bank"
-            if search_lower in account_lower:
-                return account
-            
-            # Account name is contained in search term
-            # e.g., "Tarjeta débito 7556 Lulo bank" should match "Lulo"
-            if account_lower in search_lower:
-                return account
-        
-        return None
+        return result.scalar_one_or_none()
     
     async def get_by_firefly_id(self, firefly_id: str) -> AccountCache | None:
         """Get account by Firefly ID."""
@@ -432,49 +421,6 @@ class CategoryCacheRepository:
         return count
 
 
-class TagCacheRepository:
-    """Repository for managing tag cache entries."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def get_by_tag(self, tag: str) -> TagCache | None:
-        """Get tag by name."""
-        query = select(TagCache).where(
-            and_(
-                TagCache.session_id == self.session_id,
-                TagCache.tag == tag,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def upsert(self, firefly_id: str, tag: str) -> TagCache:
-        """Insert or update tag cache entry."""
-        existing = await self.get_by_tag(tag)
-        
-        if existing:
-            existing.firefly_id = firefly_id
-            await self.session.flush()
-            return existing
-        
-        tag_record = TagCache(
-            session_id=self.session_id,
-            firefly_id=firefly_id,
-            tag=tag,
-        )
-        self.session.add(tag_record)
-        await self.session.flush()
-        return tag_record
-    
-    async def get_all(self) -> Sequence[TagCache]:
-        """Get all cached tags."""
-        query = select(TagCache).where(TagCache.session_id == self.session_id)
-        result = await self.session.execute(query)
-        return result.scalars().all()
-
-
 class KnownSenderRepository:
     """Repository for managing known financial email senders."""
     
@@ -504,16 +450,18 @@ class KnownSenderRepository:
         email_lower = email.lower()
         
         # Get all active senders and check if their keyword is in the email
-        senders = await self.get_all_active()
+        senders = await self.get_all()
         for sender in senders:
             if sender.keyword in email_lower:
                 return sender
         
         return None
-    
-    async def get_all_active(self) -> Sequence[KnownSender]:
-        """Get all active known senders."""
-        query = select(KnownSender).where(KnownSender.is_active == True)
+
+    async def get_all(self, include_inactive: bool = False) -> Sequence[KnownSender]:
+        """Get known senders. Keywords are globally unique (shared across sessions)."""
+        query = select(KnownSender)
+        if not include_inactive:
+            query = query.where(KnownSender.is_active == True)
         result = await self.session.execute(query)
         return result.scalars().all()
     
@@ -571,26 +519,6 @@ class KnownSenderRepository:
         query = select(KnownSender).where(KnownSender.keyword == keyword.lower())
         result = await self.session.execute(query)
         return result.scalar_one_or_none() is not None
-    
-    async def bulk_add(
-        self,
-        senders: list[dict],
-        is_auto_learned: bool = False,
-    ) -> int:
-        """Bulk add senders, skipping existing ones."""
-        count = 0
-        for sender in senders:
-            keyword = sender["keyword"].lower()
-            if not await self.exists(keyword):
-                await self.add_sender(
-                    keyword=keyword,
-                    sender_name=sender["sender_name"],
-                    sender_type=sender.get("sender_type", "unknown"),
-                    is_auto_learned=is_auto_learned,
-                    confidence_score=sender.get("confidence_score", 80.0),
-                )
-                count += 1
-        return count
 
 
 class SchedulerJobLogRepository:

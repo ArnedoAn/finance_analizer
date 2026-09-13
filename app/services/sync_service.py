@@ -156,19 +156,19 @@ class SyncService:
                         "type": cached.account_type,
                     }
             
-            # If suggested_name didn't match, try using email sender to find bank
+            # If suggested_name didn't match, use the email sender's bank name
+            account_name_to_create = suggested_name
             if analysis.email_sender:
                 known_sender = await self._sender_repo.find_by_email(analysis.email_sender)
                 if known_sender and known_sender.sender_type == "bank":
-                    # Use the sender name to find the account
                     bank_name = known_sender.sender_name
+                    account_name_to_create = bank_name
                     logger.info(
                         "source_account_from_email_sender",
                         email_sender=analysis.email_sender[:50],
                         bank_name=bank_name,
                     )
-                    
-                    # Try to find account by bank name
+
                     cached = await self._account_repo.get_by_name(
                         bank_name, account_type.value
                     )
@@ -183,8 +183,7 @@ class SyncService:
                             "name": cached.name,
                             "type": cached.account_type,
                         }
-                    
-                    # Try partial match with bank name
+
                     cached = await self._account_repo.get_by_partial_name(
                         bank_name, account_type.value
                     )
@@ -199,62 +198,7 @@ class SyncService:
                             "name": cached.name,
                             "type": cached.account_type,
                         }
-                    
-                    # Account not found - try to create it if auto-create is enabled
-                    if self.settings.auto_create_accounts:
-                        logger.info(
-                            "source_account_attempting_creation",
-                            bank_name=bank_name,
-                            account_type=account_type.value,
-                        )
-                        try:
-                            account = await self.firefly.get_or_create_account(
-                                name=bank_name,
-                                account_type=account_type,
-                                currency_code=analysis.currency,
-                            )
-                            # Update cache
-                            await self._account_repo.upsert(
-                                firefly_id=account["id"],
-                                name=account["name"],
-                                account_type=account["type"],
-                                currency_code=account.get("currency_code", analysis.currency),
-                            )
-                            logger.info(
-                                "source_account_created",
-                                bank_name=bank_name,
-                                account_id=account["id"],
-                                account_name=account["name"],
-                            )
-                            return account
-                        except FireflyValidationError as e:
-                            logger.error(
-                                "source_account_creation_validation_failed",
-                                bank_name=bank_name,
-                                error_message=e.message,
-                                error_details=e.details,
-                            )
-                            # Continue to fallback
-                        except Exception as e:
-                            logger.error(
-                                "source_account_creation_failed",
-                                bank_name=bank_name,
-                                error=str(e),
-                                error_type=type(e).__name__,
-                            )
-                            # Continue to fallback
-            
-            # Determine account name to try creating (prefer bank_name from sender, then suggested_name)
-            account_name_to_create = None
-            if analysis.email_sender:
-                known_sender = await self._sender_repo.find_by_email(analysis.email_sender)
-                if known_sender and known_sender.sender_type == "bank":
-                    account_name_to_create = known_sender.sender_name
-                elif suggested_name:
-                    account_name_to_create = suggested_name
-            elif suggested_name:
-                account_name_to_create = suggested_name
-            
+
             # Try to create the account if we have a name and auto-create is enabled
             if account_name_to_create and self.settings.auto_create_accounts:
                 logger.info(
@@ -317,15 +261,15 @@ class SyncService:
                 }
             
             # Fetch from Firefly to ensure we have the account
-            account = await self.firefly.get_account_by_name(default_name, account_type)
-            if account:
+            fetched = await self.firefly.get_account_by_name(default_name, account_type)
+            if fetched:
                 await self._account_repo.upsert(
-                    firefly_id=account["id"],
-                    name=account["name"],
-                    account_type=account["type"],
-                    currency_code=account.get("currency_code", analysis.currency),
+                    firefly_id=fetched["id"],
+                    name=fetched["name"],
+                    account_type=fetched["type"],
+                    currency_code=fetched.get("currency_code", analysis.currency),
                 )
-                return account
+                return fetched
             
             raise ValueError(
                 f"Default asset account '{default_name}' not found in Firefly III. "

@@ -19,7 +19,6 @@ from app.clients.gmail import GmailClient
 from app.core.config import get_settings
 from app.core.exceptions import (
     DeepSeekError,
-    DuplicateEmailError,
     FireflyDuplicateError,
     FireflyError,
     GmailError,

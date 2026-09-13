@@ -32,12 +32,10 @@ class AccountType(str, Enum):
     ASSET = "asset"           # Bank accounts, wallets
     EXPENSE = "expense"       # Merchants, payees
     REVENUE = "revenue"       # Income sources
-    LIABILITY = "liability"   # Loans, credit cards
 
 
 class ProcessingStatus(str, Enum):
     """Email processing status."""
-    PENDING = "pending"
     PROCESSING = "processing"
     ANALYZED = "analyzed"
     CREATED = "created"
@@ -106,10 +104,6 @@ class EmailFilter(BaseModel):
         ge=1,
         le=500,
         description="Maximum emails to fetch"
-    )
-    exclude_processed: bool = Field(
-        default=True,
-        description="Exclude already processed emails"
     )
 
 
@@ -196,15 +190,6 @@ class TransactionAnalysis(BaseModel):
         return v
 
 
-class AnalysisRequest(BaseModel):
-    """Request model for AI analysis."""
-    
-    email_content: str = Field(..., description="Email content to analyze")
-    email_subject: str = Field(default="", description="Email subject for context")
-    email_sender: str = Field(default="", description="Sender for context")
-    preferred_currency: str = Field(default="USD", description="Default currency")
-
-
 # =============================================================================
 # Firefly III Models
 # =============================================================================
@@ -224,35 +209,11 @@ class AccountCreate(BaseModel):
     )
 
 
-class AccountResponse(BaseModel):
-    """Response model for Firefly III account."""
-    
-    model_config = ConfigDict(from_attributes=True)
-    
-    id: str
-    name: str
-    type: AccountType
-    currency_code: str
-    active: bool
-    current_balance: Decimal = Field(default=Decimal("0"))
-
-
 class CategoryCreate(BaseModel):
     """Model for creating a Firefly III category."""
     
     name: str = Field(..., min_length=1, max_length=255)
     notes: str | None = Field(default=None, max_length=65535)
-
-
-class CategoryResponse(BaseModel):
-    """Response model for Firefly III category."""
-    
-    model_config = ConfigDict(from_attributes=True)
-    
-    id: str
-    name: str
-    spent: list[dict[str, Any]] = Field(default_factory=list)
-    earned: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TransactionSplit(BaseModel):
@@ -286,23 +247,6 @@ class TransactionCreate(BaseModel):
     apply_rules: bool = Field(default=True)
     fire_webhooks: bool = Field(default=True)
     transactions: list[TransactionSplit] = Field(..., min_length=1)
-
-
-class TransactionResponse(BaseModel):
-    """Response model for Firefly III transaction."""
-    
-    model_config = ConfigDict(from_attributes=True)
-    
-    id: str
-    transaction_journal_id: str
-    type: TransactionType
-    date: datetime
-    amount: Decimal
-    description: str
-    source_name: str | None = None
-    destination_name: str | None = None
-    category_name: str | None = None
-    tags: list[str] = Field(default_factory=list)
 
 
 # =============================================================================
@@ -343,26 +287,6 @@ class AuditLogCreate(BaseModel):
     error_details: dict[str, Any] | None = Field(default=None)
     processing_time_ms: int = Field(default=0)
     dry_run: bool = Field(default=False)
-
-
-class AuditLogResponse(BaseModel):
-    """Response model for audit log entry."""
-    
-    model_config = ConfigDict(from_attributes=True)
-    
-    id: int
-    email_message_id: str
-    email_internal_id: str
-    email_subject: str
-    email_sender: str
-    email_date: datetime
-    status: ProcessingStatus
-    firefly_transaction_id: str | None
-    error_message: str | None
-    processing_time_ms: int
-    dry_run: bool
-    created_at: datetime
-    updated_at: datetime
 
 
 # =============================================================================
@@ -427,15 +351,6 @@ class ProcessingJobStatusResponse(BaseModel):
     error_message: str | None = None
 
 
-class ErrorResponse(BaseModel):
-    """Standard error response."""
-    
-    error: str
-    message: str
-    details: dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-
 # =============================================================================
 # Known Senders Models
 # =============================================================================
@@ -493,15 +408,6 @@ class KnownSenderBulkCreate(BaseModel):
 # =============================================================================
 # Scheduler Models
 # =============================================================================
-
-class SchedulerJobStatus(BaseModel):
-    """Status of a scheduler job."""
-    
-    id: str
-    name: str
-    next_run: datetime | None
-    trigger: str
-
 
 class SchedulerJobLogResponse(BaseModel):
     """Response model for scheduler job log."""

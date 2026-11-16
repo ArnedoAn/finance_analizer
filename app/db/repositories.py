@@ -52,7 +52,9 @@ class InboxRepository:
         query = select(InboxItem).where(InboxItem.id == item_id).with_for_update(skip_locked=True)
         row = await self.session.scalar(query)
         if row is None:
-            await self.session.rollback()
+            # Commit, not rollback: rollback expires every loaded instance and later attribute
+            # access outside the async context raises MissingGreenlet (sessions use expire_on_commit=False).
+            await self.session.commit()
             return None
         result = await self.session.execute(update(InboxItem).where(InboxItem.id == item_id, InboxItem.status.in_(statuses), or_(InboxItem.claim_until.is_(None), InboxItem.claim_until < now_utc())).values(claim_token=token, claim_until=now_utc() + timedelta(minutes=10)).execution_options(synchronize_session=False))
         await self.session.commit()

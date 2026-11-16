@@ -1,300 +1,77 @@
-"""
-Application Configuration Module
-
-Centralized configuration management using Pydantic Settings.
-All sensitive values are loaded from environment variables.
-"""
-
+"""Single-owner settings; environment names are uppercase field names."""
 from functools import lru_cache
-from pathlib import Path
-from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# OAuth callback path appended to PUBLIC_BASE_URL when deriving the Gmail
-# redirect URI. Keep in sync with the FastAPI router mount point in
-# `app/api/routes.py` and the Google Cloud Console redirect URI registration.
-_GMAIL_CALLBACK_PATH = "/api/v1/auth/callback"
 
-# Fallback used when neither PUBLIC_BASE_URL nor GMAIL_REDIRECT_URI is set
-# (e.g. local development with no explicit configuration).
-_DEFAULT_GMAIL_REDIRECT_URI = f"http://localhost:8000{_GMAIL_CALLBACK_PATH}"
+class MailAccount(BaseModel):
+    name: str
+    provider: str = "custom"
+    host: str = ""
+    port: int = 993
+    username: str
+    password: SecretStr
+    folder: str = "INBOX"
+    ssl: bool = True
+
+    @model_validator(mode="after")
+    def resolve_host(self):
+        if not self.host:
+            self.host = {"gmail": "imap.gmail.com", "yahoo": "imap.mail.yahoo.com", "icloud": "imap.mail.me.com"}.get(self.provider, "")
+        if not self.host or not self.name or not self.username:
+            raise ValueError("Mail account requires name, username and host (or known provider)")
+        return self
 
 
 class Settings(BaseSettings):
-    """
-    Application settings loaded from environment variables.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+    finance_api_key: SecretStr = Field(min_length=1)
+    app_name: str = "finance-analyzer"
+    app_env: str = "development"
+    debug: bool = False
+    log_level: str = "INFO"
+    log_dir: str = "logs"
+    log_file: str = "finance_analyzer.log"
+    log_max_bytes: int = 10485760
+    log_backup_count: int = 3
+    database_url: str = "sqlite+aiosqlite:///./data/finance_v2.db"
+    timezone: str = "America/Bogota"
+    firefly_base_url: str = ""
+    firefly_api_token: SecretStr = SecretStr("")
+    firefly_default_asset_account: str = "Efectivo"
+    manual_default_account: str = "Efectivo"
+    firefly_cache_ttl_minutes: int = Field(default=360, ge=0)
+    auto_create_categories: bool = False
+    account_map: dict[str, str] = Field(default_factory=dict)
+    mail_accounts: list[MailAccount] = Field(default_factory=list)
+    email_lookback_days: int = Field(default=7, ge=0)
+    email_max_body_chars: int = Field(default=12000, gt=0)
+    llm_base_url: str = "https://opencode.ai/inference/go/openai/v1"
+    llm_api_key: SecretStr = SecretStr("")
+    llm_models: str = "deepseek-v4.1-flash,hy3,mimo-v2.6-flash"
+    llm_user_agent: str = "finance-analyzer/2.0"
+    llm_fallback_base_url: str = "https://api.deepseek.com/v1"
+    llm_fallback_api_key: SecretStr = SecretStr("")
+    llm_fallback_model: str = "deepseek-chat"
+    dedup_window_minutes: int = Field(default=60, ge=0)
+    max_attempts: int = Field(default=8, gt=0)
+    cycle_cron: str = "0 * * * *"
+    sender_learning_cron: str = "0 3 1,15 * *"
+    scheduler_enabled: bool = True
 
-    All sensitive values use SecretStr to prevent accidental exposure in logs.
-    """
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
-    )
-
-    # =========================================================================
-    # Application Settings
-    # =========================================================================
-    app_name: str = Field(default="finance-analyzer", description="Application name")
-    app_env: Literal["development", "staging", "production"] = Field(
-        default="development", description="Environment"
-    )
-    debug: bool = Field(default=False, description="Debug mode")
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
-        default="INFO", description="Logging level"
-    )
-    log_dir: str = Field(default="./logs", description="Directory for log files")
-    log_file: str = Field(default="finance_analyzer.log", description="Log file name")
-    log_max_bytes: int = Field(
-        default=10485760, description="Max log file size in bytes (default 10MB)"
-    )
-    log_backup_count: int = Field(
-        default=5, description="Number of backup log files to keep"
-    )
-
-    # =========================================================================
-    # Server Settings
-    # =========================================================================
-    host: str = Field(default="0.0.0.0", description="Server host")
-    port: int = Field(default=8000, ge=1, le=65535, description="Server port")
-
-    # =========================================================================
-    # Session Settings
-    # =========================================================================
-    session_cookie_max_age_seconds: int = Field(
-        default=2592000, ge=300, le=31536000,
-        description="Session cookie max age in seconds"
-    )
-    oauth_state_max_age_seconds: int = Field(
-        default=600, ge=60, le=3600,
-        description="OAuth state validity window in seconds"
-    )
-    scheduler_default_session_id: str = Field(
-        default="default",
-        description="Session ID used by automatic scheduler jobs",
-    )
-
-    # =========================================================================
-    # Database
-    # =========================================================================
-    database_url: str = Field(
-        default="sqlite+aiosqlite:///./data/finance_analyzer.db",
-        description="Database connection URL"
-    )
-
-    # =========================================================================
-    # Google / Gmail API
-    # =========================================================================
-    google_credentials_path: Path = Field(
-        default=Path("./credentials/google_credentials.json"),
-        description="Path to Google OAuth credentials JSON"
-    )
-    google_token_path: Path = Field(
-        default=Path("./credentials/google_token.json"),
-        description="Path to store OAuth token"
-    )
-    token_encryption_key: SecretStr = Field(
-        ..., description="Encryption key for OAuth tokens"
-    )
-    public_base_url: str | None = Field(
-        default=None,
-        description=(
-            "Public HTTPS origin that fronts this service. Used to derive the "
-            "Gmail OAuth redirect URI at container startup when "
-            "GMAIL_REDIRECT_URI is not explicitly set."
-        ),
-    )
-    gmail_redirect_uri: str = Field(
-        default="",
-        description=(
-            "OAuth redirect URI (must match Google Cloud Console). "
-            "Empty value is treated as unset and resolved via PUBLIC_BASE_URL."
-        ),
-    )
-    gmail_subject_filters: str = Field(
-        default="Factura,Pago,Recibo,Compra,Confirmación,Transferencia,Cargo,Abono",
-        description="Comma-separated email subject filters"
-    )
-    gmail_max_results: int = Field(
-        default=50, ge=1, le=500, description="Max emails per batch"
-    )
-    gmail_use_subject_filters: bool = Field(
-        default=True,
-        description="Whether to include subject filters in Gmail queries"
-    )
-
-    # =========================================================================
-    # DeepSeek AI
-    # =========================================================================
-    deepseek_api_key: SecretStr = Field(..., description="DeepSeek API key")
-    deepseek_api_url: str = Field(
-        default="https://api.deepseek.com/v1/chat/completions",
-        description="DeepSeek API endpoint"
-    )
-    deepseek_model: str = Field(default="deepseek-chat", description="DeepSeek model")
-    deepseek_timeout: int = Field(default=60, ge=10, le=300, description="API timeout")
-
-    # =========================================================================
-    # Firefly III
-    # =========================================================================
-    firefly_base_url: str = Field(..., description="Firefly III base URL")
-    firefly_api_token: SecretStr = Field(..., description="Firefly III API token")
-    firefly_token_path: Path = Field(
-        default=Path("./credentials/firefly_token.json"),
-        description="Path to store session-scoped Firefly tokens",
-    )
-    firefly_timeout: int = Field(default=30, ge=5, le=120, description="API timeout")
-    firefly_default_asset_account: str = Field(
-        default="Bancolombia", description="Default asset account for withdrawals"
-    )
-    firefly_default_expense_account: str = Field(
-        default="Gastos Generales", description="Default expense account for unknown merchants"
-    )
-    firefly_default_revenue_account: str = Field(
-        default="Ingresos Generales", description="Default revenue account for unknown income sources"
-    )
-
-    # =========================================================================
-    # Currency Settings
-    # =========================================================================
-    default_currency: str = Field(
-        default="COP", description="Default currency code (ISO 4217)"
-    )
-
-    # =========================================================================
-    # Timezone Settings
-    # =========================================================================
-    timezone: str = Field(
-        default="America/Bogota", description="Application timezone (IANA timezone name)"
-    )
-
-    # =========================================================================
-    # Processing Options
-    # =========================================================================
-    dry_run: bool = Field(
-        default=False, description="Dry run mode (analyze without creating)"
-    )
-    auto_create_accounts: bool = Field(
-        default=True, description="Auto-create accounts if not exist"
-    )
-    auto_create_categories: bool = Field(
-        default=True, description="Auto-create categories if not exist"
-    )
-    email_lookback_days: int = Field(
-        default=7, ge=1, le=365, description="Days to look back for emails"
-    )
-    test_mode_clear_processed: bool = Field(
-        default=False,
-        description="TEST MODE: Clear processed emails table before processing (for testing only)"
-    )
-
-    # =========================================================================
-    # Webhook / Notification Settings
-    # =========================================================================
-    webhook_known_apps: str = Field(
-        default="com.nequi.MobileApp,ar.com.bancar.uala",
-        description="Comma-separated list of known financial app package names"
-    )
-    webhook_fingerprint_window_hours: int = Field(
-        default=2, ge=1, le=24,
-        description="Time window (hours) for cross-channel transaction deduplication"
-    )
-
-    @property
-    def webhook_known_apps_list(self) -> list[str]:
-        """Parse comma-separated known apps into list."""
-        return [a.strip() for a in self.webhook_known_apps.split(",") if a.strip()]
-
-    # =========================================================================
-    # Scheduler Configuration (CRON)
-    # =========================================================================
-    scheduler_enabled: bool = Field(
-        default=True, description="Enable scheduled tasks"
-    )
-    scheduler_processing_cron: str = Field(
-        default="0 * * * *",  # Every hour
-        description="CRON expression for email processing job"
-    )
-    scheduler_learning_cron: str = Field(
-        default="0 0 1,15 * *",  # 1st and 15th of each month
-        description="CRON expression for sender learning job"
-    )
-    scheduler_learning_email_count: int = Field(
-        default=100, ge=10, le=500,
-        description="Number of emails to analyze for learning"
-    )
-
-    # =========================================================================
-    # Token Optimization
-    # =========================================================================
-    deepseek_max_email_chars: int = Field(
-        default=2000, ge=500, le=10000,
-        description="Max characters to send to AI (token reduction)"
-    )
-    deepseek_strip_html: bool = Field(
-        default=True, description="Strip HTML tags from emails"
-    )
-    deepseek_strip_signatures: bool = Field(
-        default=True, description="Strip email signatures"
-    )
-    deepseek_strip_footers: bool = Field(
-        default=True, description="Strip legal/marketing footers"
-    )
-
-    @property
-    def gmail_subjects_list(self) -> list[str]:
-        """Parse comma-separated subjects into list."""
-        return [s.strip() for s in self.gmail_subject_filters.split(",") if s.strip()]
+    @model_validator(mode="after")
+    def unique_mail_names(self):
+        names = [account.name for account in self.mail_accounts]
+        if len(names) != len(set(names)):
+            raise ValueError("MAIL_ACCOUNTS names must be unique")
+        return self
 
     @property
     def is_production(self) -> bool:
-        """Check if running in production."""
         return self.app_env == "production"
-
-    @field_validator(
-        "google_credentials_path",
-        "google_token_path",
-        "firefly_token_path",
-        mode="before",
-    )
-    @classmethod
-    def validate_path(cls, v: str | Path) -> Path:
-        """Convert string paths to Path objects."""
-        return Path(v) if isinstance(v, str) else v
-
-    @model_validator(mode="after")
-    def resolve_gmail_redirect_uri(self) -> "Settings":
-        """Resolve GMAIL_REDIRECT_URI at startup.
-
-        Precedence:
-          1. Non-empty explicit ``GMAIL_REDIRECT_URI`` (treats whitespace and
-             empty strings as absent).
-          2. ``PUBLIC_BASE_URL`` + ``/api/v1/auth/callback`` (trailing slash
-             stripped from the base).
-          3. Localhost default for dev environments without a public domain.
-        """
-        explicit = self.gmail_redirect_uri.strip()
-        if explicit:
-            self.gmail_redirect_uri = explicit
-            return self
-
-        base = (self.public_base_url or "").strip()
-        if base:
-            self.gmail_redirect_uri = f"{base.rstrip('/')}{_GMAIL_CALLBACK_PATH}"
-        else:
-            self.gmail_redirect_uri = _DEFAULT_GMAIL_REDIRECT_URI
-        return self
 
 
 @lru_cache
 def get_settings() -> Settings:
-    """
-    Get cached settings instance.
-
-    Uses lru_cache to ensure settings are only loaded once.
-    """
     return Settings()

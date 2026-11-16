@@ -1,178 +1,53 @@
-"""
-Finance Analyzer - Main Application
-
-FastAPI application for automated financial transaction processing.
-Processes emails from Gmail, analyzes with AI, and creates transactions in Firefly III.
-"""
-
+"""FastAPI lifecycle with durable inbox processing and scheduled retries."""
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import __version__
-from app.api.dependencies import cleanup_clients, get_gmail_client
-from app.api.routes import api_router
+from app.api import routes
+from app.api.dependencies import cleanup_clients
 from app.core.config import get_settings
 from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger, setup_logging
-from app.core.session import DEFAULT_SESSION_ID
-from app.db.database import close_db, init_db
+from app.db.database import close_db, get_db_session, init_db
+from app.db.repositories import KnownSenderRepository
 from app.services.scheduler import SchedulerService
 
 logger = get_logger(__name__)
-settings = get_settings()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """
-    Application lifespan manager.
-    
-    Handles startup and shutdown events.
-    """
-    # Startup
+async def lifespan(app: FastAPI):
+    settings = get_settings()
     setup_logging()
-    logger.info("application_starting", version=__version__)
-    
-    # Initialize database
     await init_db()
-    logger.info("database_initialized")
-    
-    # Pre-authenticate Gmail if credentials exist
-    if settings.google_token_path.exists():
-        try:
-            gmail = get_gmail_client(DEFAULT_SESSION_ID)
-            await gmail.authenticate()
-            logger.info("gmail_pre_authenticated")
-        except Exception as e:
-            logger.warning("gmail_pre_auth_failed", error=str(e))
-    
-    # Start scheduler if enabled
-    scheduler_service = SchedulerService(
-        session_id=settings.scheduler_default_session_id,
-    )
+    async with get_db_session() as db:
+        await KnownSenderRepository(db).seed()
+    scheduler = SchedulerService(routes.run_cycle, routes.learn_senders, settings=settings)
+    routes._scheduler = scheduler
     if settings.scheduler_enabled:
-        scheduler_service.start()
-        logger.info(
-            "scheduler_started",
-            processing_cron=settings.scheduler_processing_cron,
-            learning_cron=settings.scheduler_learning_cron,
-        )
-    
-    yield
-    
-    # Shutdown
-    logger.info("application_shutting_down")
-    scheduler_service.stop()
-    await cleanup_clients()
-    await close_db()
-    logger.info("application_stopped")
+        scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown()
+        routes._scheduler = None
+        await cleanup_clients()
+        await close_db()
 
 
-app = FastAPI(
-    title="Finance Analyzer",
-    description="""
-    Automated Financial Transaction Processing System
-    
-    This API automates the creation of transactions in Firefly III
-    from Gmail emails using AI-powered semantic analysis.
-    
-    ## Features
-    
-    - **Gmail Integration**: OAuth 2.0 authenticated email fetching
-    - **AI Analysis**: DeepSeek-powered transaction extraction
-    - **Firefly III Sync**: Automatic account, category, and transaction creation
-    - **Audit Trail**: Complete logging of all processing activities
-    - **Idempotency**: Duplicate email detection and prevention
-    
-    ## Workflow
-    
-    1. Fetch emails matching financial patterns from Gmail
-    2. Analyze each email with DeepSeek AI to extract transaction data
-    3. Resolve/create accounts and categories in Firefly III
-    4. Create the transaction with all metadata
-    5. Log the result for audit purposes
-    """,
-    version=__version__,
-    # Enable docs also in production
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    lifespan=lifespan,
-)
+def create_application() -> FastAPI:
+    # Fail closed at startup/import if the owner's API key is absent.
+    get_settings()
+    application = FastAPI(title="Finance Analyzer", version="2.0.0", lifespan=lifespan)
+    application.include_router(routes.router, prefix="/api/v1")
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if settings.debug else [],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    @application.exception_handler(FinanceAnalyzerError)
+    async def domain_error(request: Request, exc: FinanceAnalyzerError):
+        logger.warning("upstream_failure", error_type=type(exc).__name__)
+        return JSONResponse(status_code=502, content={"detail": "External service unavailable"})
+
+    return application
 
 
-@app.exception_handler(FinanceAnalyzerError)
-async def finance_analyzer_exception_handler(
-    request: Request,
-    exc: FinanceAnalyzerError,
-) -> JSONResponse:
-    """Handle application-specific exceptions."""
-    logger.error(
-        "application_error",
-        error_type=type(exc).__name__,
-        message=exc.message,
-        details=exc.details,
-    )
-    return JSONResponse(
-        status_code=500,
-        content=exc.to_dict(),
-    )
-
-
-@app.exception_handler(Exception)
-async def general_exception_handler(
-    request: Request,
-    exc: Exception,
-) -> JSONResponse:
-    """Handle unexpected exceptions."""
-    logger.exception("unexpected_error", error=str(exc))
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "InternalServerError",
-            "message": "An unexpected error occurred",
-            "details": {"error": str(exc)} if settings.debug else {},
-        },
-    )
-
-
-# Include API routes
-app.include_router(api_router, prefix="/api/v1")
-
-
-# Root endpoint
-@app.get("/", tags=["Root"])
-async def root() -> dict:
-    """Root endpoint with API information."""
-    return {
-        "name": "Finance Analyzer",
-        "version": __version__,
-        "docs": "/docs",
-        "api": "/api/v1",
-        "health": "/api/v1/health",
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    uvicorn.run(
-        "app.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug,
-        log_level=settings.log_level.lower(),
-    )
+app = create_application()

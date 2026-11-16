@@ -13,7 +13,28 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/finance-analyzer
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FINANCE_API_KEY: test-key
+      SCHEDULER_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python and dependencies
+        run: |
+          uv python install 3.12
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+      - name: Ruff
+        run: uv run --no-project ruff check app tests
+      - name: Tests
+        run: uv run --no-project pytest
+
   build-and-push:
+    needs: quality
     runs-on: ubuntu-latest
     permissions:
       contents: read

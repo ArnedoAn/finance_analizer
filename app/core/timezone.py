@@ -1,41 +1,30 @@
-"""
-Timezone Utilities Module
-
-Provides timezone-aware datetime functions for the application.
-Default timezone is set to Colombia (America/Bogota).
-"""
-
-from datetime import datetime
+"""Aware time handling: phone-local timestamps are America/Bogota."""
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
-from app.core.config import get_settings
-
-# Datetime formats seen in AI responses and phone notification payloads.
-_DATETIME_FORMATS = (
-    "%Y-%m-%d",
-    "%Y/%m/%d",
-    "%d-%m-%Y",
-    "%d/%m/%Y",
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%dT%H:%M:%SZ",
-    "%Y-%m-%d %H:%M",
-    "%d/%m/%Y %H:%M:%S",
-)
+BOGOTA = ZoneInfo("America/Bogota")
 
 
 def get_app_timezone() -> ZoneInfo:
-    """Get the application timezone from settings."""
-    return ZoneInfo(get_settings().timezone)
+    return BOGOTA
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
 
 
 def parse_datetime(value: str | None) -> datetime | None:
-    """Parse a datetime string from a known set of formats. None if unparseable."""
     if not value:
         return None
-    for fmt in _DATETIME_FORMATS:
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return None
+    try:
+        if value.strip().isdigit():
+            return datetime.fromtimestamp(int(value) / 1000, UTC)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=BOGOTA) if parsed.tzinfo is None else parsed
+    except (ValueError, OverflowError, OSError):
+        for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(value, fmt).replace(tzinfo=BOGOTA)
+            except ValueError:
+                continue
+        return None

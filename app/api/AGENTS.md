@@ -1,0 +1,3 @@
+# API endpoints v2
+
+Mount under /api/v1. X-API-Key required except health/live and health/ready. No session/user headers, OAuth routes or legacy job polling. See README for the complete endpoint contract. Share get_db dependency so offline tests override it. Commit webhook inbox before background processing, opening a fresh session for background work. Ignore extra webhook fields (including user_id), prefer big_text/message/text, and never retain unknown-source bodies. Lists omit raw_text; detail includes it. Public probes must not expose secrets.

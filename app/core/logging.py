@@ -38,12 +38,12 @@ def drop_color_message_key(
 def setup_logging() -> None:
     """
     Configure structured logging for the application.
-    
+
     Sets up structlog with appropriate processors for development
     and production environments.
     """
     settings = get_settings()
-    
+
     # Common processors for all environments
     shared_processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
@@ -56,7 +56,7 @@ def setup_logging() -> None:
         add_app_context,
         drop_color_message_key,
     ]
-    
+
     if settings.is_production:
         # Production: JSON output for log aggregation
         shared_processors.append(structlog.processors.format_exc_info)
@@ -64,7 +64,7 @@ def setup_logging() -> None:
     else:
         # Development: Colored console output
         renderer = structlog.dev.ConsoleRenderer(colors=True)
-    
+
     structlog.configure(
         processors=shared_processors + [
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
@@ -73,10 +73,10 @@ def setup_logging() -> None:
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
-    
+
     # Configure standard library logging
     log_level = getattr(logging, settings.log_level)
-    
+
     formatter = structlog.stdlib.ProcessorFormatter(
         foreign_pre_chain=shared_processors,
         processors=[
@@ -84,16 +84,16 @@ def setup_logging() -> None:
             renderer,
         ],
     )
-    
+
     # Console handler (colored for dev, plain for prod)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
-    
+
     # File handler (JSON format for easy parsing)
     log_dir = Path(settings.log_dir)
     log_file = log_dir / settings.log_file
     log_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Create JSON formatter for file output
     file_formatter = structlog.stdlib.ProcessorFormatter(
         foreign_pre_chain=shared_processors,
@@ -102,7 +102,7 @@ def setup_logging() -> None:
             structlog.processors.JSONRenderer(),
         ],
     )
-    
+
     file_handler = RotatingFileHandler(
         log_file,
         maxBytes=settings.log_max_bytes,
@@ -110,26 +110,26 @@ def setup_logging() -> None:
         encoding="utf-8",
     )
     file_handler.setFormatter(file_formatter)
-    
+
     # Root logger configuration
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
     root_logger.setLevel(log_level)
-    
+
     # Suppress noisy loggers
-    for logger_name in ["httpx", "httpcore", "urllib3", "googleapiclient"]:
+    for logger_name in ["httpx", "httpcore", "urllib3"]:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """
     Get a structured logger instance.
-    
+
     Args:
         name: Optional logger name. Defaults to caller's module.
-        
+
     Returns:
         Configured structlog BoundLogger instance.
     """

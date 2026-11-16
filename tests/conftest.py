@@ -1,105 +1,69 @@
-"""
-Test configuration and fixtures.
-"""
+"""Isolated v2 fixtures: no local .env, network, scheduler, or persistent DB."""
 
-import asyncio
-from collections.abc import AsyncGenerator, Generator
-from typing import Any
+import os
+from collections.abc import AsyncGenerator
 
 import pytest
 import pytest_asyncio
-from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
-from app.db.database import Base
-from app.main import app
+os.environ["FINANCE_API_KEY"] = "test-key"
+os.environ["SCHEDULER_ENABLED"] = "false"
 
-
-# Test database URL
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-
-@pytest.fixture(scope="session")
-def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
-    """Create event loop for async tests."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+from app.core.config import Settings, get_settings  # noqa: E402
+from app.db.models import Base  # noqa: E402
 
 
-@pytest_asyncio.fixture
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Create test database session."""
-    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-    
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    session_factory = async_sessionmaker(
-        bind=engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
+@pytest.fixture(autouse=True)
+def settings():
+    """Never load developer secrets from .env or retain cached test settings."""
+    get_settings.cache_clear()
+    config = Settings(
+        finance_api_key="test-key",
+        database_url="sqlite+aiosqlite:///:memory:",
+        scheduler_enabled=False,
+        firefly_base_url="",
+        firefly_api_token="",
+        llm_api_key="",
+        mail_accounts=[],
+        _env_file=None,
     )
-    
-    async with session_factory() as session:
-        yield session
-    
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    
-    await engine.dispose()
+    yield config
+    get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
-async def client() -> AsyncGenerator[AsyncClient, None]:
-    """Create test HTTP client."""
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        yield ac
+async def db() -> AsyncGenerator[AsyncSession, None]:
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:", poolclass=StaticPool
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            yield session
+    finally:
+        await engine.dispose()
 
 
-@pytest.fixture
-def sample_email_data() -> dict[str, Any]:
-    """Sample email data for testing."""
-    return {
-        "message_id": "<test-123@gmail.com>",
-        "internal_id": "abc123",
-        "thread_id": "thread123",
-        "subject": "Confirmación de pago - Amazon",
-        "sender": "noreply@amazon.com",
-        "recipient": "user@gmail.com",
-        "date": "2024-01-15T10:30:00Z",
-        "body_text": """
-        Hola,
-        
-        Tu pago de $45.99 USD ha sido procesado exitosamente.
-        
-        Detalles de la compra:
-        - Producto: Echo Dot
-        - Monto: $45.99 USD
-        - Fecha: 15 de enero de 2024
-        - Método: Tarjeta VISA ****1234
-        
-        Gracias por tu compra.
-        
-        Amazon
-        """,
-        "body_html": "",
-        "snippet": "Tu pago de $45.99 USD ha sido procesado",
-        "labels": ["INBOX"],
-    }
+@pytest_asyncio.fixture
+async def client(db, settings) -> AsyncGenerator[AsyncClient, None]:
+    from app.api.dependencies import get_db
+    from app.main import app
 
+    async def isolated_db():
+        yield db
 
-@pytest.fixture
-def sample_analysis_data() -> dict[str, Any]:
-    """Sample analysis data for testing."""
-    return {
-        "amount": "45.99",
-        "currency": "USD",
-        "date": "2024-01-15",
-        "description": "Compra Echo Dot en Amazon",
-        "merchant": "Amazon",
-        "suggested_category": "Compras",
-        "suggested_account_name": "Tarjeta VISA",
-        "transaction_type": "withdrawal",
-        "confidence_score": 0.95,
-    }
+    app.dependency_overrides[get_db] = isolated_db
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        # ASGITransport deliberately does not start lifespan/external clients.
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            yield http
+    finally:
+        app.dependency_overrides.clear()

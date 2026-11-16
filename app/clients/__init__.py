@@ -1,7 +1,7 @@
-"""External clients module exports."""
+"""Read-only mail, structured LLM inference, and the owner's Firefly ledger."""
 
-from app.clients.gmail import GmailClient
-from app.clients.deepseek import DeepSeekClient
 from app.clients.firefly import FireflyClient
+from app.clients.imap import IMAPClient
+from app.clients.llm import LLMClient
 
-__all__ = ["GmailClient", "DeepSeekClient", "FireflyClient"]
+__all__ = ["FireflyClient", "IMAPClient", "LLMClient"]

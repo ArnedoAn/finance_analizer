@@ -1,7 +1,6 @@
-"""Services module exports."""
+"""Single-owner inbox processing services."""
 
-from app.services.email_processor import EmailProcessorService
-from app.services.sync_service import SyncService
-from app.services.transaction_service import TransactionService
+from app.services.processor import Processor
+from app.services.scheduler import SchedulerService
 
-__all__ = ["EmailProcessorService", "SyncService", "TransactionService"]
+__all__ = ["Processor", "SchedulerService"]

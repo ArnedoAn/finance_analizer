@@ -1,902 +1,155 @@
-"""
-Database Repositories
+"""Repository-only access; callers own transaction commits."""
+from datetime import timedelta
 
-Data access layer with async CRUD operations for all database models.
-Follows repository pattern for clean separation of concerns.
-"""
-
-from datetime import datetime, timedelta
-import uuid
-from typing import Sequence
-
-from sqlalchemy import String, and_, delete, func, literal, or_, select, update
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.logging import get_logger
-from app.core.session import DEFAULT_SESSION_ID, normalize_session_id
-from app.db.models import (
-    AccountCache,
-    AuditLog,
-    CategoryCache,
-    KnownSender,
-    ProcessingJob,
-    ProcessedEmail,
-    ProcessedNotification,
-    SchedulerJobLog,
-    TransactionFingerprint,
-)
-from app.models.schemas import AuditLogCreate, ProcessingStatus
-
-logger = get_logger(__name__)
+from app.core.timezone import now_utc
+from app.db.models import InboxItem, KnownSender, MailAccountState
 
 
-def _validate_session_id(session_id: str) -> str:
-    normalized = normalize_session_id(session_id)
-    if normalized is None:
-        raise ValueError(f"Invalid session id: {session_id}")
-    return normalized
-
-
-class ProcessedEmailRepository:
-    """Repository for managing processed email records."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
+class InboxRepository:
+    def __init__(self, session: AsyncSession):
         self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def exists(self, message_id: str, internal_id: str) -> bool:
-        """Check if an email has been processed."""
-        query = select(ProcessedEmail).where(
-            and_(
-                ProcessedEmail.session_id == self.session_id,
-                ProcessedEmail.message_id == message_id,
-                ProcessedEmail.internal_id == internal_id,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none() is not None
-    
-    async def mark_processed(
-        self,
-        message_id: str,
-        internal_id: str,
-        email_date: datetime,
-    ) -> ProcessedEmail:
-        """Mark an email as processed."""
-        record = ProcessedEmail(
-            session_id=self.session_id,
-            message_id=message_id,
-            internal_id=internal_id,
-            email_date=email_date,
-        )
-        self.session.add(record)
+
+    async def add(self, **kwargs) -> InboxItem:
+        row = InboxItem(**kwargs)
+        self.session.add(row)
+        await self.save()
+        return row
+
+    async def save(self):
         await self.session.flush()
-        logger.debug("email_marked_processed", message_id=message_id[:20])
-        return record
-    
-    async def get_processed_ids(
-        self,
-        since: datetime | None = None,
-    ) -> set[str]:
-        """Get set of processed email IDs."""
-        query = select(ProcessedEmail.internal_id).where(
-            ProcessedEmail.session_id == self.session_id
-        )
-        if since:
-            query = query.where(ProcessedEmail.email_date >= since)
-        
-        result = await self.session.execute(query)
-        return {row[0] for row in result.fetchall()}
-    
-    async def clear_all(self) -> int:
-        """
-        Clear all processed email records.
-        
-        WARNING: This is for testing only. Use with caution.
-        
-        Returns:
-            Number of records deleted.
-        """
-        query = delete(ProcessedEmail).where(ProcessedEmail.session_id == self.session_id)
-        result = await self.session.execute(query)
-        await self.session.flush()
-        
-        count = result.rowcount
-        logger.warning(
-            "processed_emails_cleared",
-            count=count,
-            reason="test_mode_clear_processed enabled",
-        )
-        return count
 
+    async def get(self, item_id: int) -> InboxItem | None:
+        return await self.session.get(InboxItem, item_id, populate_existing=True)
 
-class AuditLogRepository:
-    """Repository for managing audit log entries."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def create(self, data: AuditLogCreate) -> AuditLog:
-        """Create a new audit log entry."""
-        audit_log = AuditLog(
-            session_id=data.session_id or self.session_id,
-            email_message_id=data.email_message_id,
-            email_internal_id=data.email_internal_id,
-            email_subject=data.email_subject,
-            email_sender=data.email_sender,
-            email_date=data.email_date,
-            status=data.status.value,
-            analysis_result=data.analysis_result,
-            firefly_transaction_id=data.firefly_transaction_id,
-            error_message=data.error_message,
-            error_details=data.error_details,
-            processing_time_ms=data.processing_time_ms,
-            dry_run=data.dry_run,
-        )
-        self.session.add(audit_log)
-        await self.session.flush()
-        logger.debug("audit_log_created", id=audit_log.id, status=data.status.value)
-        return audit_log
-    
-    async def update_status(
-        self,
-        audit_id: int,
-        status: ProcessingStatus,
-        transaction_id: str | None = None,
-        error_message: str | None = None,
-    ) -> None:
-        """Update audit log status."""
-        values = {"status": status.value, "updated_at": datetime.utcnow()}
-        if transaction_id:
-            values["firefly_transaction_id"] = transaction_id
-        if error_message:
-            values["error_message"] = error_message
-        
-        query = update(AuditLog).where(
-            and_(AuditLog.id == audit_id, AuditLog.session_id == self.session_id)
-        ).values(**values)
-        await self.session.execute(query)
-        await self.session.flush()
-    
-    async def get_by_email(
-        self,
-        message_id: str,
-        internal_id: str,
-    ) -> AuditLog | None:
-        """Get audit log by email identifiers."""
-        query = select(AuditLog).where(
-            and_(
-                AuditLog.session_id == self.session_id,
-                AuditLog.email_message_id == message_id,
-                AuditLog.email_internal_id == internal_id,
-            )
-        ).order_by(AuditLog.created_at.desc())
-        
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def get_recent(
-        self,
-        limit: int = 100,
-        status: ProcessingStatus | None = None,
-    ) -> Sequence[AuditLog]:
-        """Get recent audit logs."""
-        query = (
-            select(AuditLog)
-            .where(AuditLog.session_id == self.session_id)
-            .order_by(AuditLog.created_at.desc())
-            .limit(limit)
-        )
-        if status:
-            query = query.where(AuditLog.status == status.value)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
-    
-    async def get_statistics(
-        self,
-        since: datetime | None = None,
-    ) -> dict[str, int]:
-        """Get processing statistics."""
-        from sqlalchemy import func
-        
-        query = select(
-            AuditLog.status,
-            func.count(AuditLog.id).label("count"),
-        ).where(
-            AuditLog.session_id == self.session_id
-        ).group_by(AuditLog.status)
-        
-        if since:
-            query = query.where(AuditLog.created_at >= since)
-        
-        result = await self.session.execute(query)
-        return {row[0]: row[1] for row in result.fetchall()}
+    async def by_ref(self, ref: str) -> InboxItem | None:
+        return await self.session.scalar(select(InboxItem).where(InboxItem.source_ref == ref))
 
+    async def list(self, status=None, source=None, method=None, limit=50):
+        query = select(InboxItem)
+        for key, value in (("status", status), ("source", source), ("method", method)):
+            if value:
+                query = query.where(getattr(InboxItem, key) == value)
+        return list((await self.session.scalars(query.order_by(InboxItem.id.desc()).limit(limit))).all())
 
-class AccountCacheRepository:
-    """Repository for managing account cache entries."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def get_by_name(
-        self,
-        name: str,
-        account_type: str,
-    ) -> AccountCache | None:
-        """Get account by name and type."""
-        query = select(AccountCache).where(
-            and_(
-                AccountCache.session_id == self.session_id,
-                AccountCache.name == name,
-                AccountCache.account_type == account_type,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def get_by_partial_name(
-        self,
-        partial_name: str,
-        account_type: str,
-    ) -> AccountCache | None:
-        """
-        Get account by partial name match (case-insensitive).
+    async def count(self, status=None, source=None, method=None):
+        query = select(func.count()).select_from(InboxItem)
+        for key, value in (("status", status), ("source", source), ("method", method)):
+            if value:
+                query = query.where(getattr(InboxItem, key) == value)
+        return await self.session.scalar(query)
 
-        Matches when the account name contains the search term
-        ("Lulo" → "Lulo Bank") or the search term contains the name
-        ("Tarjeta débito 7556 Lulo bank" → "Lulo").
-        """
-        search = partial_name.lower().strip()
-        if not search:
+    async def due(self):
+        query = select(InboxItem).where(InboxItem.status == "pending", or_(InboxItem.next_attempt_at.is_(None), InboxItem.next_attempt_at <= now_utc())).order_by(InboxItem.id)
+        return list((await self.session.scalars(query)).all())
+
+    async def find_duplicate(self, item: InboxItem, window_minutes: int):
+        if item.source not in {"email", "notification", "sms"}:
             return None
+        opposite = ["notification", "sms"] if item.source == "email" else ["email"]
+        window = timedelta(minutes=window_minutes)
+        query = select(InboxItem).where(InboxItem.status == "created", InboxItem.id != item.id, InboxItem.source.in_(opposite), InboxItem.asset_account == item.asset_account, InboxItem.amount == item.amount, InboxItem.currency == item.currency, InboxItem.transaction_type == item.transaction_type, InboxItem.occurred_at >= item.occurred_at - window, InboxItem.occurred_at <= item.occurred_at + window).order_by(InboxItem.id).limit(1)
+        return await self.session.scalar(query)
 
-        name_lower = func.lower(AccountCache.name)
-        reverse_pattern = (
-            literal("%", String)
-            .concat(name_lower)
-            .concat(literal("%", String))
-        )
-        query = (
-            select(AccountCache)
-            .where(
-                and_(
-                    AccountCache.session_id == self.session_id,
-                    AccountCache.account_type == account_type,
-                    or_(
-                        name_lower.contains(search),
-                        literal(search, String).like(reverse_pattern),
-                    ),
-                )
-            )
-            .order_by(AccountCache.id)
-            .limit(1)
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def get_by_firefly_id(self, firefly_id: str) -> AccountCache | None:
-        """Get account by Firefly ID."""
-        query = select(AccountCache).where(
-            and_(
-                AccountCache.session_id == self.session_id,
-                AccountCache.firefly_id == firefly_id,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def upsert(
-        self,
-        firefly_id: str,
-        name: str,
-        account_type: str,
-        currency_code: str = "USD",
-        active: bool = True,
-    ) -> AccountCache:
-        """Insert or update account cache entry."""
-        # Try to get existing
-        existing = await self.get_by_firefly_id(firefly_id)
-        
-        if existing:
-            existing.name = name
-            existing.account_type = account_type
-            existing.currency_code = currency_code
-            existing.active = active
-            await self.session.flush()
-            return existing
-        
-        # Create new
-        account = AccountCache(
-            session_id=self.session_id,
-            firefly_id=firefly_id,
-            name=name,
-            account_type=account_type,
-            currency_code=currency_code,
-            active=active,
-        )
-        self.session.add(account)
-        await self.session.flush()
-        return account
-    
-    async def get_all(self, account_type: str | None = None) -> Sequence[AccountCache]:
-        """Get all cached accounts."""
-        query = select(AccountCache).where(AccountCache.session_id == self.session_id)
-        if account_type:
-            query = query.where(AccountCache.account_type == account_type)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
-    
-    async def sync_from_firefly(
-        self,
-        accounts: list[dict],
-    ) -> int:
-        """Sync account cache from Firefly III accounts list."""
+    async def requeue(self, item_id=None, failed_only=False, **kwargs):
+        if item_id is None:
+            item_id = kwargs.get("id")
+        query = select(InboxItem)
+        if item_id is not None:
+            query = query.where(InboxItem.id == item_id)
+        else:
+            query = query.where(InboxItem.status == "failed")
         count = 0
-        for acc in accounts:
-            await self.upsert(
-                firefly_id=acc["id"],
-                name=acc["name"],
-                account_type=acc["type"],
-                currency_code=acc.get("currency_code", "USD"),
-                active=acc.get("active", True),
-            )
+        for row in (await self.session.scalars(query)).all():
+            if row.status not in {"pending", "failed"}:
+                continue
+            row.status, row.attempts, row.next_attempt_at, row.last_error = "pending", 0, None, None
             count += 1
+        await self.save()
         return count
 
+    async def statistics(self):
+        result = {}
+        for key in ("status", "source", "method"):
+            field = getattr(InboxItem, key)
+            pairs = (await self.session.execute(select(field, func.count()).group_by(field))).all()
+            result[f"by_{key}"] = {name or "unprocessed": count for name, count in pairs}
+        result["pending"] = result["by_status"].get("pending", 0)
+        result["failed"] = result["by_status"].get("failed", 0)
+        result["last_run"] = await self.session.scalar(select(func.max(InboxItem.updated_at)).where(InboxItem.method.is_not(None)))
+        return result
 
-class CategoryCacheRepository:
-    """Repository for managing category cache entries."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
+
+class MailStateRepository:
+    def __init__(self, session: AsyncSession):
         self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def get_by_name(self, name: str) -> CategoryCache | None:
-        """Get category by name."""
-        query = select(CategoryCache).where(
-            and_(
-                CategoryCache.session_id == self.session_id,
-                CategoryCache.name == name,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def get_by_firefly_id(self, firefly_id: str) -> CategoryCache | None:
-        """Get category by Firefly ID."""
-        query = select(CategoryCache).where(
-            and_(
-                CategoryCache.session_id == self.session_id,
-                CategoryCache.firefly_id == firefly_id,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def upsert(
-        self,
-        firefly_id: str,
-        name: str,
-    ) -> CategoryCache:
-        """Insert or update category cache entry."""
-        existing = await self.get_by_firefly_id(firefly_id)
-        
-        if existing:
-            existing.name = name
-            await self.session.flush()
-            return existing
-        
-        category = CategoryCache(
-            session_id=self.session_id,
-            firefly_id=firefly_id,
-            name=name,
-        )
-        self.session.add(category)
+
+    async def get(self, name):
+        row = await self.session.get(MailAccountState, name)
+        if row is None:
+            row = MailAccountState(name=name, last_uid=0)
+            self.session.add(row)
+            await self.save()
+        return row
+
+    async def all(self):
+        return list((await self.session.scalars(select(MailAccountState))).all())
+
+    async def save(self):
         await self.session.flush()
-        return category
-    
-    async def get_all(self) -> Sequence[CategoryCache]:
-        """Get all cached categories."""
-        query = select(CategoryCache).where(CategoryCache.session_id == self.session_id)
-        result = await self.session.execute(query)
-        return result.scalars().all()
-    
-    async def sync_from_firefly(
-        self,
-        categories: list[dict],
-    ) -> int:
-        """Sync category cache from Firefly III categories list."""
-        count = 0
-        for cat in categories:
-            await self.upsert(
-                firefly_id=cat["id"],
-                name=cat["name"],
-            )
-            count += 1
-        return count
+
+
+SEED_SENDERS = {
+    "bancolombia": "Bancolombia", "nequi": "Nequi", "daviplata": "Daviplata",
+    "davivienda": "Davivienda", "lulobank.com": "Lulo Bank", "lulo": "Lulo Bank",
+    "nu.com.co": "Nu", "bancofalabella": "Falabella", "bbva": "BBVA",
+    "bancodebogota": "Banco de Bogotá", "com.bancolombia.personas.superapp": "Bancolombia",
+    "com.nequi.mobileapp": "Nequi", "com.lulobank.lulo": "Lulo Bank",
+    "com.davivienda.daviplataapp": "Daviplata", "com.nu.production": "Nu",
+    "com.davivienda.daviviendaapp": "Davivienda",
+    "87400": "Bancolombia", "890099": "Nequi",
+}
 
 
 class KnownSenderRepository:
-    """Repository for managing known financial email senders."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
+    def __init__(self, session: AsyncSession):
         self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def get_by_keyword(self, keyword: str) -> KnownSender | None:
-        """Get sender by keyword."""
-        query = select(KnownSender).where(KnownSender.keyword == keyword.lower())
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def find_by_email(self, email: str) -> KnownSender | None:
-        """
-        Find a known sender by matching keywords in the email address.
-        
-        Args:
-            email: Email address (e.g., "notificaciones@lulobank.com")
-            
-        Returns:
-            KnownSender if a match is found, None otherwise.
-        """
-        if not email:
-            return None
-        
-        email_lower = email.lower()
-        
-        # Get all active senders and check if their keyword is in the email
-        senders = await self.get_all()
-        for sender in senders:
-            if sender.keyword in email_lower:
-                return sender
-        
-        return None
 
-    async def get_all(self, include_inactive: bool = False) -> Sequence[KnownSender]:
-        """Get known senders. Keywords are globally unique (shared across sessions)."""
-        query = select(KnownSender)
+    async def all(self, include_inactive=False):
+        query = select(KnownSender).order_by(KnownSender.keyword)
         if not include_inactive:
-            query = query.where(KnownSender.is_active == True)
-        result = await self.session.execute(query)
-        return result.scalars().all()
-    
-    async def get_all_keywords(self) -> set[str]:
-        """Get all active sender keywords as a set."""
-        query = select(KnownSender.keyword).where(KnownSender.is_active == True)
-        result = await self.session.execute(query)
-        return {row[0].lower() for row in result.fetchall()}
-    
-    async def add_sender(
-        self,
-        keyword: str,
-        sender_name: str,
-        sender_type: str = "bank",
-        is_auto_learned: bool = False,
-        confidence_score: float = 100.0,
-    ) -> KnownSender:
-        """Add a new known sender."""
-        sender = KnownSender(
-            keyword=keyword.lower(),
-            sender_name=sender_name,
-            sender_type=sender_type,
-            is_auto_learned=is_auto_learned,
-            confidence_score=confidence_score,
-        )
-        self.session.add(sender)
+            query = query.where(KnownSender.active.is_(True))
+        return list((await self.session.scalars(query)).all())
+
+    async def add(self, keyword, name="", source="manual"):
+        keyword = keyword.strip().lower()
+        row = await self.session.scalar(select(KnownSender).where(KnownSender.keyword == keyword))
+        if row is None:
+            row = KnownSender(keyword=keyword, name=name, source=source, active=True)
+            self.session.add(row)
+        else:
+            row.active = True
+            if name:
+                row.name = name
         await self.session.flush()
-        return sender
-    
-    async def update_match_count(self, keyword: str) -> None:
-        """Increment match count for a sender."""
-        query = (
-            update(KnownSender)
-            .where(KnownSender.keyword == keyword.lower())
-            .values(
-                emails_matched=KnownSender.emails_matched + 1,
-                last_matched_at=datetime.utcnow(),
-            )
-        )
-        await self.session.execute(query)
+        return row
+
+    async def delete(self, keyword):
+        row = await self.session.scalar(select(KnownSender).where(KnownSender.keyword == keyword.lower()))
+        if row is None:
+            return False
+        await self.session.delete(row)
         await self.session.flush()
-    
-    async def deactivate_sender(self, keyword: str) -> None:
-        """Deactivate a sender."""
-        query = (
-            update(KnownSender)
-            .where(KnownSender.keyword == keyword.lower())
-            .values(is_active=False)
-        )
-        await self.session.execute(query)
-        await self.session.flush()
-    
-    async def exists(self, keyword: str) -> bool:
-        """Check if a sender keyword exists."""
-        query = select(KnownSender).where(KnownSender.keyword == keyword.lower())
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none() is not None
+        return True
 
+    async def matches(self, sender):
+        return any(row.keyword in sender.lower() for row in await self.all())
 
-class SchedulerJobLogRepository:
-    """Repository for managing scheduler job logs."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def create(
-        self,
-        job_name: str,
-        job_type: str,
-    ) -> SchedulerJobLog:
-        """Create a new job log entry."""
-        log = SchedulerJobLog(
-            session_id=self.session_id,
-            job_name=job_name,
-            job_type=job_type,
-            status="started",
-        )
-        self.session.add(log)
-        await self.session.flush()
-        return log
-    
-    async def complete(
-        self,
-        log_id: int,
-        emails_processed: int = 0,
-        transactions_created: int = 0,
-        senders_learned: int = 0,
-        details: dict | None = None,
-    ) -> None:
-        """Mark job as completed."""
-        query = (
-            update(SchedulerJobLog)
-            .where(
-                and_(
-                    SchedulerJobLog.id == log_id,
-                    SchedulerJobLog.session_id == self.session_id,
-                )
-            )
-            .values(
-                status="completed",
-                completed_at=datetime.utcnow(),
-                emails_processed=emails_processed,
-                transactions_created=transactions_created,
-                senders_learned=senders_learned,
-                details=details,
-            )
-        )
-        await self.session.execute(query)
-        await self.session.flush()
-    
-    async def fail(
-        self,
-        log_id: int,
-        error_message: str,
-    ) -> None:
-        """Mark job as failed."""
-        query = (
-            update(SchedulerJobLog)
-            .where(
-                and_(
-                    SchedulerJobLog.id == log_id,
-                    SchedulerJobLog.session_id == self.session_id,
-                )
-            )
-            .values(
-                status="failed",
-                completed_at=datetime.utcnow(),
-                error_message=error_message,
-            )
-        )
-        await self.session.execute(query)
-        await self.session.flush()
-    
-    async def get_last_run(self, job_name: str) -> SchedulerJobLog | None:
-        """Get the last run of a specific job."""
-        query = (
-            select(SchedulerJobLog)
-            .where(
-                and_(
-                    SchedulerJobLog.session_id == self.session_id,
-                    SchedulerJobLog.job_name == job_name,
-                )
-            )
-            .order_by(SchedulerJobLog.started_at.desc())
-            .limit(1)
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def get_recent(
-        self,
-        limit: int = 50,
-        job_type: str | None = None,
-    ) -> Sequence[SchedulerJobLog]:
-        """Get recent job logs."""
-        query = (
-            select(SchedulerJobLog)
-            .where(SchedulerJobLog.session_id == self.session_id)
-            .order_by(SchedulerJobLog.started_at.desc())
-            .limit(limit)
-        )
-        
-        if job_type:
-            query = query.where(SchedulerJobLog.job_type == job_type)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
-
-
-class ProcessedNotificationRepository:
-    """Repository for managing processed notification records."""
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def exists(self, notification_hash: str) -> bool:
-        """Check if a notification has been processed."""
-        query = select(ProcessedNotification).where(
-            and_(
-                ProcessedNotification.session_id == self.session_id,
-                ProcessedNotification.notification_hash == notification_hash,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none() is not None
-    
-    async def mark_processed(
-        self,
-        notification_hash: str,
-        source_app: str,
-        sender: str,
-        title: str,
-        notification_date: datetime,
-    ) -> ProcessedNotification:
-        """Mark a notification as processed."""
-        record = ProcessedNotification(
-            session_id=self.session_id,
-            notification_hash=notification_hash,
-            source_app=source_app,
-            sender=sender,
-            title=title,
-            notification_date=notification_date,
-        )
-        self.session.add(record)
-        await self.session.flush()
-        logger.debug("notification_marked_processed", hash=notification_hash[:12])
-        return record
-    
-    async def get_recent(
-        self,
-        limit: int = 100,
-        source_app: str | None = None,
-    ) -> Sequence[ProcessedNotification]:
-        """Get recent processed notifications."""
-        query = (
-            select(ProcessedNotification)
-            .where(ProcessedNotification.session_id == self.session_id)
-            .order_by(ProcessedNotification.processed_at.desc())
-            .limit(limit)
-        )
-        if source_app:
-            query = query.where(ProcessedNotification.source_app == source_app)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
-    
-    async def get_count(self, source_app: str | None = None) -> int:
-        """Get count of processed notifications."""
-        from sqlalchemy import func
-        
-        query = select(func.count(ProcessedNotification.id)).where(
-            ProcessedNotification.session_id == self.session_id
-        )
-        if source_app:
-            query = query.where(ProcessedNotification.source_app == source_app)
-        
-        result = await self.session.execute(query)
-        return result.scalar_one()
-
-
-class ProcessingJobRepository:
-    """Repository for async processing jobs."""
-
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-
-    async def create(self, request_payload: dict | None = None) -> ProcessingJob:
-        """Create a queued processing job."""
-        job = ProcessingJob(
-            id=uuid.uuid4().hex,
-            session_id=self.session_id,
-            status="queued",
-            request_payload=request_payload,
-        )
-        self.session.add(job)
-        await self.session.flush()
-        return job
-
-    async def mark_running(self, job_id: str) -> bool:
-        """Mark a processing job as running."""
-        query = (
-            update(ProcessingJob)
-            .where(
-                and_(
-                    ProcessingJob.id == job_id,
-                    ProcessingJob.session_id == self.session_id,
-                )
-            )
-            .values(
-                status="running",
-                started_at=datetime.utcnow(),
-            )
-        )
-        result = await self.session.execute(query)
-        await self.session.flush()
-        return bool(result.rowcount)
-
-    async def mark_completed(self, job_id: str, result_payload: dict | None = None) -> bool:
-        """Mark a processing job as completed."""
-        query = (
-            update(ProcessingJob)
-            .where(
-                and_(
-                    ProcessingJob.id == job_id,
-                    ProcessingJob.session_id == self.session_id,
-                )
-            )
-            .values(
-                status="completed",
-                completed_at=datetime.utcnow(),
-                result_payload=result_payload,
-                error_message=None,
-            )
-        )
-        result = await self.session.execute(query)
-        await self.session.flush()
-        return bool(result.rowcount)
-
-    async def mark_failed(self, job_id: str, error_message: str) -> bool:
-        """Mark a processing job as failed."""
-        query = (
-            update(ProcessingJob)
-            .where(
-                and_(
-                    ProcessingJob.id == job_id,
-                    ProcessingJob.session_id == self.session_id,
-                )
-            )
-            .values(
-                status="failed",
-                completed_at=datetime.utcnow(),
-                error_message=error_message,
-            )
-        )
-        result = await self.session.execute(query)
-        await self.session.flush()
-        return bool(result.rowcount)
-
-    async def get_by_id(self, job_id: str) -> ProcessingJob | None:
-        """Get a processing job by id for this session."""
-        query = select(ProcessingJob).where(
-            and_(
-                ProcessingJob.id == job_id,
-                ProcessingJob.session_id == self.session_id,
-            )
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-
-
-class TransactionFingerprintRepository:
-    """
-    Repository for cross-channel transaction deduplication.
-    
-    Stores fingerprints (hash of amount + date + account) for created
-    transactions regardless of source channel. Used to detect when the
-    same transaction arrives from both email and notification.
-    """
-    
-    def __init__(self, session: AsyncSession, session_id: str = DEFAULT_SESSION_ID) -> None:
-        self.session = session
-        self.session_id = _validate_session_id(session_id)
-    
-    async def find_duplicate(
-        self,
-        fingerprint_hash: str,
-        transaction_date: datetime,
-        window_hours: int = 2,
-    ) -> TransactionFingerprint | None:
-        """
-        Find a duplicate transaction within a time window.
-        
-        Args:
-            fingerprint_hash: Hash of (amount + date + account).
-            transaction_date: Date of the transaction to check.
-            window_hours: Time window in hours for fuzzy matching.
-            
-        Returns:
-            Existing fingerprint if duplicate found, None otherwise.
-        """
-        window_start = transaction_date - timedelta(hours=window_hours)
-        window_end = transaction_date + timedelta(hours=window_hours)
-        
-        query = select(TransactionFingerprint).where(
-            and_(
-                TransactionFingerprint.session_id == self.session_id,
-                TransactionFingerprint.fingerprint_hash == fingerprint_hash,
-                TransactionFingerprint.transaction_date >= window_start,
-                TransactionFingerprint.transaction_date <= window_end,
-            )
-        ).order_by(TransactionFingerprint.created_at.desc()).limit(1)
-        
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def create(
-        self,
-        fingerprint_hash: str,
-        amount: str,
-        transaction_date: datetime,
-        source_channel: str,
-        source_id: str,
-        description: str = "",
-        firefly_transaction_id: str | None = None,
-    ) -> TransactionFingerprint:
-        """Create a new transaction fingerprint."""
-        record = TransactionFingerprint(
-            session_id=self.session_id,
-            fingerprint_hash=fingerprint_hash,
-            amount=amount,
-            transaction_date=transaction_date,
-            source_channel=source_channel,
-            source_id=source_id,
-            description=description,
-            firefly_transaction_id=firefly_transaction_id,
-        )
-        self.session.add(record)
-        await self.session.flush()
-        logger.debug(
-            "fingerprint_created",
-            hash=fingerprint_hash[:12],
-            channel=source_channel,
-        )
-        return record
-    
-    @staticmethod
-    def compute_hash(
-        amount: str,
-        transaction_date: datetime,
-        account_name: str,
-    ) -> str:
-        """
-        Compute a fingerprint hash from transaction data.
-        
-        Normalizes the amount (rounds to integer for COP) and uses
-        only the date part (not time) for matching.
-        """
-        import hashlib
-        from decimal import Decimal, ROUND_HALF_UP
-        
-        # Normalize amount: round to integer for large currencies (COP)
-        try:
-            amt = Decimal(str(amount))
-            normalized_amount = str(amt.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-        except Exception:
-            normalized_amount = str(amount)
-        
-        # Use only date part for matching
-        date_str = transaction_date.strftime("%Y-%m-%d")
-        
-        # Normalize account name
-        normalized_account = account_name.strip().lower()
-        
-        raw = f"{normalized_amount}:{date_str}:{normalized_account}"
-        return hashlib.sha256(raw.encode()).hexdigest()
+    async def seed(self):
+        existing = {row.keyword for row in await self.all(include_inactive=True)}
+        for keyword, name in SEED_SENDERS.items():
+            if keyword not in existing:
+                await self.add(keyword, name, "seed")
+        return len(set(SEED_SENDERS) - existing)

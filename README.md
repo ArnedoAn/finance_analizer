@@ -1,439 +1,144 @@
-# Finance Analyzer
+# Finance Analyzer v2
 
-> Microservicio de automatización financiera que procesa emails de Gmail, analiza transacciones con IA (DeepSeek), y crea registros automáticos en Firefly III.
+Servicio **single-user** para Colombia: correo IMAP, notificaciones/SMS de Message Mirror y movimientos manuales convergen en Firefly III. Moneda COP; zona `America/Bogota`. `main` es la rama única de desarrollo/despliegue. No hay usuarios, sesiones, cookies, autenticación Telegram ni OAuth de Google/Microsoft.
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+## Inicio local
 
-## 📋 Tabla de Contenidos
-
-- [Características](#-características)
-- [Arquitectura](#-arquitectura)
-- [Requisitos](#-requisitos)
-- [Instalación](#-instalación)
-- [Configuración](#-configuración)
-- [Uso](#-uso)
-- [API Endpoints](#-api-endpoints)
-- [Flujo de Procesamiento](#-flujo-de-procesamiento)
-- [Desarrollo](#-desarrollo)
-- [Troubleshooting](#-troubleshooting)
-
-## ✨ Características
-
-- **📧 Integración Gmail**: OAuth 2.0 con permisos read-only
-- **🤖 Análisis con IA**: Extracción semántica de transacciones con DeepSeek
-- **💰 Firefly III**: Sincronización automática de cuentas, categorías y transacciones
-- **🔒 Seguridad**: Tokens cifrados, variables de entorno, sin hardcodeo
-- **🔁 Idempotencia**: Un email = una transacción (sin duplicados)
-- **📊 Auditoría**: Log completo de cada procesamiento
-- **🧪 Modo Dry-Run**: Prueba sin crear transacciones reales
-- **⏳ Reintentos**: Manejo automático de fallos temporales
-- **🐳 Docker Ready**: Configuración lista para producción
-
-## 🏗 Arquitectura
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Finance Analyzer                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────────────┐  │
-│  │  Gmail   │───▶│ DeepSeek │───▶│  Sync    │───▶│   Firefly III    │  │
-│  │  Client  │    │    AI    │    │ Service  │    │     Client       │  │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────────────┘  │
-│       │                │               │                   │            │
-│       │                │               │                   │            │
-│       ▼                ▼               ▼                   ▼            │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │                    SQLite Database                                │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐   │  │
-│  │  │ Processed   │  │  Audit      │  │  Account/Category Cache │   │  │
-│  │  │   Emails    │  │   Logs      │  │                         │   │  │
-│  │  └─────────────┘  └─────────────┘  └─────────────────────────┘   │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Estructura del Proyecto
-
-```
-finance_analizer/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                 # FastAPI application
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── config.py           # Pydantic Settings
-│   │   ├── exceptions.py       # Custom exceptions
-│   │   ├── logging.py          # Structured logging
-│   │   └── security.py         # Token encryption
-│   ├── models/
-│   │   ├── __init__.py
-│   │   └── schemas.py          # Pydantic models
-│   ├── db/
-│   │   ├── __init__.py
-│   │   ├── database.py         # SQLAlchemy async setup
-│   │   ├── models.py           # ORM models
-│   │   └── repositories.py     # Data access layer
-│   ├── clients/
-│   │   ├── __init__.py
-│   │   ├── gmail.py            # Gmail API client
-│   │   ├── deepseek.py         # DeepSeek AI client
-│   │   └── firefly.py          # Firefly III client
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── email_processor.py  # Main orchestration
-│   │   ├── sync_service.py     # Firefly sync
-│   │   └── transaction_service.py
-│   └── api/
-│       ├── __init__.py
-│       ├── dependencies.py     # FastAPI DI
-│       ├── routes.py           # Router config
-│       └── endpoints/
-│           ├── auth.py
-│           ├── emails.py
-│           ├── health.py
-│           ├── processing.py
-│           └── sync.py
-├── credentials/                 # OAuth credentials (gitignored)
-├── data/                        # SQLite database (gitignored)
-├── tests/
-├── .env.example
-├── .gitignore
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-└── README.md
-```
-
-## 📦 Requisitos
-
-- Python 3.11+
-- Firefly III (local o remoto)
-- Cuenta de Google Cloud con Gmail API habilitada
-- API Key de DeepSeek
-
-## 🚀 Instalación
-
-### 1. Clonar repositorio
-
-```bash
-git clone <repository-url>
-cd finance_analizer
-```
-
-### 2. Crear entorno virtual
-
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux/Mac
-source .venv/bin/activate
-```
-
-### 3. Instalar dependencias
-
-```bash
-pip install -e ".[dev]"
-```
-
-### 4. Configurar variables de entorno
+Requiere Python 3.12+, [uv](https://docs.astral.sh/uv/), una instancia Firefly III y sus cuentas asset existentes.
 
 ```bash
 cp .env.example .env
-# Editar .env con tus valores
+uv python install 3.12
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+uv run --no-project uvicorn app.main:app --reload
 ```
 
-## ⚙️ Configuración
+Complete `FINANCE_API_KEY` (obligatoria), `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN`, las cuentas y las claves LLM en `.env`. Configure los nombres exactos de cuentas asset existentes; **no se crean cuentas asset**. `/docs` expone OpenAPI. Nunca publique `.env`, cuerpos financieros ni tokens.
 
-### Google Cloud / Gmail API
+## Configuración
 
-1. Ir a [Google Cloud Console](https://console.cloud.google.com/)
-2. Crear proyecto o seleccionar existente
-3. Habilitar **Gmail API**
-4. Crear credenciales **OAuth 2.0 Client ID** (tipo: Desktop App)
-5. Descargar JSON y guardar como `credentials/google_credentials.json`
+Las variables completas están en [.env.example](.env.example); para producción use [env.production.example](env.production.example).
 
-### DeepSeek API
+| Variable | Función / predeterminado |
+|---|---|
+| `FINANCE_API_KEY` | Secreto requerido; header `X-API-Key` |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./data/finance_v2.db`; también PostgreSQL con asyncpg |
+| `TIMEZONE` | `America/Bogota` |
+| `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN` | Ledger y personal access token |
+| `FIREFLY_DEFAULT_ASSET_ACCOUNT`, `MANUAL_DEFAULT_ACCOUNT` | `Efectivo` |
+| `ACCOUNT_MAP` | JSON: paquete app, `sms:<remitente>` o substring del correo → cuenta asset existente |
+| `FIREFLY_CACHE_TTL_MINUTES` | 360; se fuerza refresco si falta una cuenta |
+| `AUTO_CREATE_CATEGORIES` | false; usar categorías existentes |
+| `MAIL_ACCOUNTS` | JSON de N cuentas IMAP; `[]` desactiva correo |
+| `EMAIL_LOOKBACK_DAYS`, `EMAIL_MAX_BODY_CHARS` | 7 y 12000 |
+| `LLM_BASE_URL` | `https://opencode.ai/inference/go/openai/v1` |
+| `LLM_API_KEY`, `LLM_MODELS` | OpenCode Go; `deepseek-v4.1-flash,hy3,mimo-v2.6-flash` en orden |
+| `LLM_USER_AGENT` | `finance-analyzer/2.0` |
+| `LLM_FALLBACK_BASE_URL`, `LLM_FALLBACK_API_KEY`, `LLM_FALLBACK_MODEL` | DeepSeek directo opcional; URL `https://api.deepseek.com/v1`, modelo `deepseek-chat` |
+| `DEDUP_WINDOW_MINUTES`, `MAX_ATTEMPTS` | 60 y 8 |
+| `SCHEDULER_ENABLED`, `CYCLE_CRON` | true, `0 * * * *` |
+| `SENDER_LEARNING_CRON` | `0 3 1,15 * *` |
 
-1. Obtener API key en [DeepSeek](https://platform.deepseek.com/)
-2. Configurar en `.env`:
-   ```
-   DEEPSEEK_API_KEY=tu-api-key
-   ```
+### Correo IMAP
 
-### Firefly III
+```dotenv
+MAIL_ACCOUNTS='[{"name":"personal","provider":"gmail","username":"owner@gmail.com","password":"app-password","folder":"INBOX","port":993,"ssl":true},{"name":"propio","provider":"custom","host":"imap.example.com","username":"owner@example.com","password":"secret"}]'
+```
 
-1. En Firefly III, ir a **Options → Profile → OAuth**
-2. Crear nuevo **Personal Access Token**
-3. Configurar en `.env`:
-   ```
-   FIREFLY_BASE_URL=http://localhost:8080
-   FIREFLY_API_TOKEN=tu-token
-   ```
+`provider` puede ser `gmail`, `yahoo`, `icloud` o `custom`; los tres primeros completan host. Use contraseñas de aplicación cuando el proveedor lo exija. Outlook se integra mediante reenvío automático a una cuenta IMAP, **no OAuth**. Cada nombre debe ser estable y único. IMAP usa stdlib en un thread, `EXAMINE` y `BODY.PEEK`, sin marcar como leído. Se persisten UIDVALIDITY, último UID, último poll y error por cuenta. El primer poll usa `SINCE` con el lookback. Se filtra From por remitentes conocidos; HTML se convierte a texto y se recorta.
 
-### Variables de Entorno Clave
+## API `/api/v1`
+
+Todas las rutas requieren `X-API-Key`, salvo `/health/live` y `/health/ready`. Clave ausente/incorrecta: 401. No envíe headers `X-Telegram-*`, `X-User-Id` o `X-Session-ID`.
+
+| Método | Ruta | Uso |
+|---|---|---|
+| GET | `/health/live`, `/health/ready` | Probes públicos |
+| GET | `/health` | Estado, versión y servicios database/firefly/llm/mail por cuenta |
+| POST | `/notifications/webhook` | Ingesta durable y procesamiento inmediato en background |
+| POST | `/transactions/manual` | Movimiento manual; 201 con inbox_id, firefly_transaction_id y status created |
+| POST | `/processing/run?dry_run=false` | Poll IMAP y procesamiento inmediato; dry-run solo previsualiza pendientes existentes, sin persistir ni consultar IMAP |
+| GET | `/processing/statistics` | by_status, by_source, by_method, pending, failed, last_run |
+| GET | `/inbox?status=&source=&method=&limit=50` | Listado sin raw_text |
+| GET | `/inbox/{id}` | Detalle con raw_text |
+| POST | `/inbox/{id}/retry`, `/inbox/retry-failed` | Reencolar; `{requeued:n}` |
+| GET | `/mail/accounts` | Configuración sin secretos y estado del poll |
+| POST | `/mail/accounts/{name}/test` | Conectividad; `{ok,error}` |
+| GET/POST | `/senders` | Consultar/agregar remitentes |
+| DELETE | `/senders/{keyword}` | Eliminar remitente |
+| POST | `/senders/seed`, `/senders/learn` | Semilla/aprendizaje |
+| POST | `/sync/all` | Refrescar caché Firefly |
+| GET | `/sync/accounts`, `/sync/categories` | Cuentas/categorías |
+| GET | `/scheduler/status` | Estado de jobs |
+| POST | `/scheduler/jobs/{job_id}/trigger` | Ejecutar `cycle` o `sender_learning` |
+
+Se eliminaron `/auth/*`, `/emails/*`, `/processing/batch`, `/processing/jobs/*`, `/processing/single`, `/processing/dry-run`, `/processing/audit`, `/processing/retry-failed`, `/notifications/process`, `/notifications/history` y `/notifications/stats`. Los reintentos viven en inbox; no hay jobs HTTP para polling.
+
+### Message Mirror
+
+URL directa: `https://financeapi.esclab.tech/api/v1/notifications/webhook` (no el dominio antiguo que redirige POST). Configure la API key tanto para envíos Dart como nativos.
 
 ```bash
-# Encryption key (generar con: openssl rand -hex 32)
-TOKEN_ENCRYPTION_KEY=your-32-byte-hex-key
-
-# Gmail filters (subjects to match)
-GMAIL_SUBJECT_FILTERS=Factura,Pago,Recibo,Compra,Transferencia
-
-# Processing options
-DRY_RUN=false
-AUTO_CREATE_ACCOUNTS=true
-AUTO_CREATE_CATEGORIES=true
+curl -X POST http://localhost:8000/api/v1/notifications/webhook \
+  -H "X-API-Key: $FINANCE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"id":"phone-123","type":"notification","app":"com.todo1.mobile","sender":"Bancolombia","title":"Compra","message":"Compraste $25.000 en TIENDA","timestamp":"1794877200000","device":"phone"}'
 ```
 
-## 🎯 Uso
+Campos string: `id,type,app,sender,title,message,text,big_text,timestamp,date,category,device`; `type` es `notification` o `sms`. Extras (incluido `user_id`) se ignoran. Contenido: `big_text > message > text`; debe existir contenido. Fecha: timestamp epoch ms o ISO, luego `date` (`yyyy-MM-dd HH:mm`) local Bogotá.
 
-### Iniciar servidor
+- 202: `{accepted:true,status:"queued",inbox_id:n}`; se guarda antes de procesar.
+- 200: `{accepted:false,status:"duplicate"|"ignored"}`. Fuentes no conocidas se guardan **sin cuerpo** por privacidad.
+- 401: clave inválida. 422: payload inválido.
+- Cliente: 2xx entregado; 4xx excepto 408/429 va a dead-letter persistente, visible y reencolable; red, 5xx, 408 y 429 se reintentan con backoff. Nunca descartar silenciosamente.
+
+### Efectivo / manual
 
 ```bash
-# Desarrollo
-uvicorn app.main:app --reload
-
-# Producción
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+curl -X POST http://localhost:8000/api/v1/transactions/manual \
+  -H "X-API-Key: $FINANCE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"amount":12000,"description":"Almuerzo","type":"withdrawal","account":"Efectivo"}'
 ```
 
-### Con Docker
+`amount > 0`, descripción obligatoria, tipo `withdrawal` (default) o `deposit`; opcionales `category,account,merchant,date` (ISO). Bot Telegram: solo `ADMIN_ID`, `/gasto <monto> <descripción>` y `/ingreso`; `FINANCE_API_URL` + `FINANCE_API_KEY`, sin sesiones.
+
+## Pipeline y garantías
+
+1. Todas las fuentes pasan por `inbox_items`; se persiste antes de llamadas externas. Estados: pending, created, duplicate, ignored, failed. Detalle conserva resultado, método, intentos, próximo intento, error e ID Firefly.
+2. Reglas deterministas descartan compras rechazadas, recordatorios de pago, extractos y OTP evaluando asunto y los primeros 300 caracteres compactados del cuerpo. Las palabras promocionales se evalúan solo en asunto, nunca en pies bancarios.
+3. Parsers de plantilla regex (`app/parsers`) primero; LLM únicamente si no aplican. La moneda del parser procede del marcador junto al monto; el LLM devuelve COP o USD, sin inferir moneda de pies informativos. OpenAI-compatible JSON validado, tolera fences; error o JSON inválido pasa al siguiente modelo y luego al fallback opcional. Texto limitado a 4000 caracteres, cuentas asset y categorías válidas. Headers Bearer, User-Agent y `x-opencode-session` estable por ciclo.
+4. Errores LLM/Firefly/red: backoff 5m, 15m, 1h, 3h, 6h, 12h…; al alcanzar 8 intentos queda failed, reintentable manualmente.
+5. `source_ref` único: email `<account>:<uidvalidity>:<uid>`; teléfono SHA256(app|sender|content|timestamp). Dedup financiero **solo entre email y familia teléfono**, misma cuenta asset, monto exacto y ventana de 60 min. Nunca fusionar dos compras iguales del mismo canal.
+6. Fecha/hora explícita del mensaje manda; si solo hay fecha y coincide con el día local, conservar occurred_at. Datetimes aware UTC internamente y offset Bogotá al enviar a Firefly; no utcnow naive.
+7. Asset por ACCOUNT_MAP y luego default; nunca crear asset. Se crean expense/revenue de comercio con mayúsculas/espacios normalizados, sin prefijos DLO*, UBR*, PAYU*, MERCADOPAGO*; casar prefijos truncados de al menos 10 caracteres.
+8. COP salvo USD/US$ explícito. Categorías existentes; `apply_rules=true` permite que manden reglas Firefly. Tags `auto` y canal; external_id `fa:<source_ref>`.
+9. Caché compartida con TTL, no sync por item. Procesamiento serializado para evitar carreras de dedup. Un único worker/proceso con scheduler habilitado.
+
+`dry_run=true` puede consumir una extracción LLM, pero devuelve su resultado en `previews`: method, amount, currency, merchant, category, asset_account, transaction_type, date y duplicate_of (además de inbox_id/status). No cambia inbox, estados IMAP, intentos ni Firefly. Las cuentas/categorías se pueden consultar para enriquecer el preview.
+
+La imagen de producción usa UID/GID `999:999`; `/app/data` y `/app/logs` existen y pertenecen a ese usuario. Los bind mounts del host deben ser escribibles para `999:999`.
+
+## Docker y despliegue
 
 ```bash
-# Producción
-docker-compose up -d
-
-# Desarrollo
-docker-compose -f docker-compose.dev.yml up
+docker compose -f docker-compose.dev.yml up --build
+# Producción: copiar env.production.example a .env, completar secretos y FINANCE_IMAGE
+docker compose -f docker-compose.prod.yml up -d
 ```
 
-### DNS público y OAuth de Gmail (deploy)
+Dev usa SQLite persistente en `finance-dev-data`, código app montado y hot reload; conecte su Firefly existente. Prod usa PostgreSQL 16 sin puerto público y volumen nuevo `postgres-v2-data`. La imagen Python 3.12 corre sin root, instala el wheel con código incluido y tiene healthcheck sin curl. API publicada solo en loopback: coloque proxy HTTPS delante. Para proxy en otra red Docker, conecte el servicio a esa red y use puerto interno 8000. Mantenga un solo worker para scheduler/dedup; no escale réplicas sin coordinación externa.
 
-- Define `PUBLIC_BASE_URL` (ej. `https://finance.example.com`, sin slash final) en `.env` / `.env.production`. El contenedor deriva el callback OAuth como `${PUBLIC_BASE_URL}/api/v1/auth/callback` al arrancar — no requiere rebuild de imagen.
-- Registra EXACTAMENTE esa misma URL en Google Cloud Console → APIs & Services → Credentials → OAuth client → Authorized redirect URIs. Un carácter distinto (esquema, host, puerto, path, trailing slash) provoca `redirect_uri_mismatch`.
-- `GMAIL_REDIRECT_URI` permanece como override opcional: solo úsalo si el callback real debe diferir de `PUBLIC_BASE_URL` (ej. proxy con path distinto).
-- Tras cambiar dominio: actualiza `PUBLIC_BASE_URL`, reinicia el contenedor y re-registra la nueva URL en Google Cloud Console. **No** hace falta rebuild ni reautenticación de tokens existentes.
+**Cutover v2:** no hay migraciones ni compatibilidad con tablas multi-tenant. Detenga v1, respalde su DB y credenciales fuera del repo, y cree una DB v2 vacía (`create_all` al iniciar). SQLite usa nombre nuevo y Compose un volumen PostgreSQL nuevo. No apunte v2 a la DB v1. Los movimientos ya creados siguen en Firefly; limite lookback/configure remitentes antes de activar el scheduler para evitar reingesta histórica. Reconfigure Mirror y bot con URL directa y API key. Gmail OAuth/token encryption y volúmenes de credenciales ya no se usan.
 
-### Primera ejecución
+GHCR (`deploy-ghcr.yml`) ejecuta pytest y Ruff antes de construir/publicar; luego dispara Coolify si están configurados `COOLIFY_URL` y `COOLIFY_TOKEN`. Configure `FINANCE_IMAGE=ghcr.io/<owner>/finance-analyzer:<tag>`; preferir SHA para rollback. Haga backup de DB v2 y de Firefly; no loguee secretos ni cuerpos financieros.
 
-0. Obtener/crear sesión de usuario (recomendado):
-   ```bash
-   curl -i http://localhost:8000/api/v1/auth/url
-   ```
-   Usa el `X-Session-ID` retornado (o cookie `finance_session_id`) en llamadas siguientes.
-   También puedes usar `X-User-Id` y la API resolverá un `session_id` estable por usuario.
-   Si vienes desde Telegram, envía headers `X-Telegram-Session` o `X-Telegram-User-ID` (+ opcional `X-Telegram-Chat-ID`).
-
-1. Autenticar Gmail:
-   ```bash
-   curl -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/auth/url
-   ```
-   Abre `authorization_url` en el navegador. El callback enlaza OAuth a esa sesión.
-
-2. Configurar Firefly token para esa sesión:
-   ```bash
-   curl -X PUT \
-     -H "Content-Type: application/json" \
-     -H "X-Session-ID: <tu-session-id>" \
-     -d '{"token":"<firefly-token-del-usuario>"}' \
-     http://localhost:8000/api/v1/auth/firefly/token
-   ```
-
-3. Sincronizar Firefly III:
-   ```bash
-   curl -X POST -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/sync/all
-   ```
-
-4. Procesar emails (dry-run primero):
-   ```bash
-   curl -X POST -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/processing/dry-run
-   ```
-
-5. Procesar de verdad:
-   ```bash
-   curl -X POST -H "X-Session-ID: <tu-session-id>" http://localhost:8000/api/v1/processing/batch
-   ```
-
-### Sesiones multiusuario
-
-- La API soporta múltiples usuarios concurrentes mediante `session_id` con enfoque Telegram-first.
-- Prioridad de resolución de sesión: `X-Telegram-Session` → `X-Telegram-User-ID`/`X-Telegram-Chat-ID` → `X-User-Id` → `X-Session-ID` → cookie.
-- OAuth de Gmail queda aislado por sesión (cada sesión guarda su propio token cifrado).
-- Firefly también queda aislado por sesión: cada sesión tiene su token propio vía `/api/v1/auth/firefly/token`.
-- Idempotencia/auditoría y cache (`processed_emails`, `audit_logs`, `processed_notifications`, `transaction_fingerprints`, `scheduler_job_logs`, `account_cache`, `category_cache`, `tag_cache`, `known_senders`) están segmentadas por sesión.
-- El scheduler automático procesa todas las sesiones activas detectadas (DB + tokens), y `SCHEDULER_DEFAULT_SESSION_ID` se usa como sesión semilla/fallback.
-
-Ejemplo de frontend con `X-User-Id`:
-```bash
-curl -X GET "${PUBLIC_BASE_URL}/api/v1/auth/status" \
-  -H "X-User-Id: 123456789"
-```
-
-### Flujo recomendado para bot de Telegram
-
-1. El bot recibe el token Firefly del usuario.
-2. El bot llama a:
-   ```bash
-   POST /api/v1/auth/telegram/firefly
-   {
-     "telegram_user_id": "<telegram-user-id>",
-     "telegram_chat_id": "<telegram-chat-id-opcional>",
-     "token": "<firefly-token-usuario>"
-   }
-   ```
-3. La API responde con `session_id` (estable para ese user/chat).
-4. En todas las llamadas futuras del bot para ese usuario, enviar:
-   - `X-Telegram-Session: <session_id>` (recomendado), o
-   - `X-Telegram-User-ID` y `X-Telegram-Chat-ID`.
-5. Luego usar endpoints normales (`/sync/*`, `/processing/*`, `/auth/url`, etc.).
-
-Ejemplo de request desde bot:
-```bash
-curl -X POST http://localhost:8000/api/v1/processing/batch \
-  -H "X-Telegram-Session: <session-id>" \
-  -H "Content-Type: application/json" \
-  -d '{"max_emails": 20, "dry_run": false}'
-```
-
-Notas:
-- Si dos usuarios usan el mismo Firefly server, no se mezclan: cada token queda en su sesión.
-- Si un mismo usuario de Telegram usa dos chats distintos y envías ambos IDs, cada chat tendrá sesión separada.
-- Si quieres una sola sesión por usuario sin importar chat, envía solo `telegram_user_id`.
-
-### ¿Cómo funciona multi-sesión para Gmail?
-
-- Gmail también es por sesión (`google_token_<session_id>.json` cifrado).
-- Para conectar Gmail de ese usuario, llama `/api/v1/auth/url` usando la misma sesión Telegram:
-  ```bash
-  curl -H "X-Telegram-Session: <session-id>" http://localhost:8000/api/v1/auth/url
-  ```
-- El `state` OAuth incluye y firma el `session_id`; en callback se recupera esa misma sesión.
-- Resultado: Firefly + Gmail + auditoría quedan alineados bajo el mismo `session_id` del usuario Telegram.
-
-## 🔌 API Endpoints
-
-### Health & Auth
-
-| Método | Endpoint | Descripción |
-|--------|----------|-------------|
-| GET | `/api/v1/auth/url` | Obtener URL OAuth Gmail para la sesión actual |
-| POST | `/api/v1/auth/telegram/firefly` | Registrar token Firefly desde Telegram (crea/resuelve sesión) |
-| PUT | `/api/v1/auth/firefly/token` | Configurar token Firefly para la sesión actual |
-| DELETE | `/api/v1/auth/firefly/token` | Eliminar token Firefly de la sesión actual |
-| GET | `/api/v1/auth/firefly/status` | Estado Firefly en la sesión actual |
-| GET | `/api/v1/health` | Estado de todos los servicios |
-| GET | `/api/v1/health/live` | Liveness probe |
-| GET | `/api/v1/health/ready` | Readiness probe |
-| POST | `/api/v1/auth/gmail/init` | Iniciar OAuth Gmail |
-| GET | `/api/v1/auth/status` | Estado de autenticación |
-
-### Emails
-
-| Método | Endpoint | Descripción |
-|--------|----------|-------------|
-| GET | `/api/v1/emails` | Listar emails con filtros |
-| GET | `/api/v1/emails/{id}` | Detalle de email |
-| GET | `/api/v1/emails/{id}/analyze` | Analizar sin crear |
-
-### Processing
-
-| Método | Endpoint | Descripción |
-|--------|----------|-------------|
-| POST | `/api/v1/processing/batch` | Procesar lote de emails |
-| POST | `/api/v1/processing/single` | Procesar email específico |
-| POST | `/api/v1/processing/dry-run` | Procesar sin crear transacciones |
-| POST | `/api/v1/processing/retry-failed` | Reintentar fallidos |
-| GET | `/api/v1/processing/audit` | Ver logs de auditoría |
-| GET | `/api/v1/processing/statistics` | Estadísticas |
-
-### Sync
-
-| Método | Endpoint | Descripción |
-|--------|----------|-------------|
-| POST | `/api/v1/sync/all` | Sincronizar todo |
-| POST | `/api/v1/sync/accounts` | Sincronizar cuentas |
-| POST | `/api/v1/sync/categories` | Sincronizar categorías |
-| GET | `/api/v1/sync/accounts` | Ver cuentas cacheadas |
-| GET | `/api/v1/sync/categories` | Ver categorías cacheadas |
-
-## 🔄 Flujo de Procesamiento
-
-```
-1. FETCH EMAILS
-   └─ Gmail API → Filtrar por subject → Excluir procesados
-
-2. ANALYZE (por cada email)
-   └─ DeepSeek AI → Extraer: amount, date, merchant, category, type
-
-3. RESOLVE ACCOUNTS
-   ├─ Source: Asset (gastos) o Revenue (ingresos)
-   └─ Destination: Expense (gastos) o Asset (ingresos)
-   └─ Auto-crear si no existe
-
-4. RESOLVE CATEGORY
-   └─ Buscar o crear en Firefly III
-
-5. CREATE TRANSACTION
-   └─ POST /api/v1/transactions en Firefly III
-
-6. AUDIT
-   └─ Guardar resultado en audit_logs
-   └─ Marcar email como procesado (idempotencia)
-```
-
-## 🛠 Desarrollo
-
-### Tests
+## Desarrollo y comprobaciones
 
 ```bash
-pytest
-pytest --cov=app
+uv run --no-project ruff check app tests
+uv run --no-project pytest
 ```
 
-### Linting
+Fixtures: SQLite en memoria con Base v2, settings sin `.env`, key `test-key`, override get_db, sin lifespan/scheduler/red. Tests nuevos del pipeline/clientes terminan en `_v2.py`. El test Firefly en vivo se omite por defecto; requiere `RUN_FIREFLY_INTEGRATION=1`, `FIREFLY_BASE_URL` y `FIREFLY_API_TOKEN` explícitos y solo hace lecturas.
 
-```bash
-ruff check app/
-black app/
-mypy app/
-```
-
-### Pre-commit
-
-```bash
-pre-commit install
-pre-commit run --all-files
-```
-
-## ❓ Troubleshooting
-
-### Gmail OAuth Error
-- Verificar que `credentials/google_credentials.json` existe
-- Verificar que Gmail API está habilitada en Google Cloud
-- Eliminar `credentials/google_token*.json` y re-autenticar
-- Verificar que estás reutilizando el mismo `X-Session-ID` entre `/auth/url` y el resto de requests
-
-### Firefly Connection Error
-- Verificar `FIREFLY_BASE_URL` (incluir puerto)
-- Verificar que el token está configurado en la sesión correcta (`/api/v1/auth/firefly/token`)
-- Verificar que el token tiene permisos correctos
-- Probar: `curl -H "Authorization: Bearer TOKEN" URL/api/v1/about`
-
-### DeepSeek Rate Limit
-- El sistema tiene reintentos automáticos
-- Considerar reducir `GMAIL_MAX_RESULTS`
-- Verificar límites de tu plan
-
-### Duplicados
-- El sistema usa `Message-ID` + `internal_id` para idempotencia
-- Ver tabla `processed_emails` en la base de datos
-- Revisar `audit_logs` para detalles
-
-## 📄 Licencia
-
-MIT License - ver [LICENSE](LICENSE) para detalles.
+Véase [decisión de arquitectura](docs/enfoques.md). La guía `docs/omo-model-config.md` configura agentes de desarrollo, **no** los modelos LLM del servicio.

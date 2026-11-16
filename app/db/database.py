@@ -80,9 +80,7 @@ async def init_db() -> None:
 
     Should be called on application startup.
     """
-    # ponytail: create_all only. Databases created before the session_id era
-    # need a manual wipe (or a one-off alembic migration) — no hand-rolled
-    # upgrade layer.
+    # Schema cutover requires a fresh database; create_all performs no migrations.
     engine = _get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

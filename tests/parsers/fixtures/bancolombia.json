@@ -1,0 +1,438 @@
+[
+  {
+    "text": "Compraste $25.000 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "25000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Recibiste $30.000 de JUAN",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "deposit",
+      "amount": "30000.00",
+      "counterparty_hint": "JUAN"
+    }
+  },
+  {
+    "text": "Enviaste $12.000 a MARIA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "MARIA"
+    }
+  },
+  {
+    "text": "Compra rechazada por fondos insuficientes",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA. Tu saldo es $1.000.000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA. Si no reconoces esta compra llama al 018000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA pagada a 12 cuotas de $4.166",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA. Fecha: 15/11/2026 Hora: 13:45",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA, saldo disponible $99.000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA; saldo $99.000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA\nsaldo $99.000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA - saldo $99.000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA saldo $99.000",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA cuotas 12",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Devolución de compra $15.000 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "refund",
+      "amount": "15000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Anulaste la compra de $15.000 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "refund",
+      "amount": "15000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Reversión: Compraste $15.000 en TIENDA fue reversada",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "refund",
+      "amount": "15000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Reembolso de compra $15.000 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "refund",
+      "amount": "15000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Compra por $15.000 en TIENDA fue cancelada",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Intento de compra $15.000 en TIENDA no exitoso",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Compra no autorizada $15.000 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Compraste $15.000 en TIENDA fue declinada",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Transferiste $300.000 desde tu cuenta *1234 a la cuenta *5678 Nequi",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "account_hint": "1234",
+      "counterparty_hint": "*5678 Nequi"
+    }
+  },
+  {
+    "text": "Recibiste $25.000 de JUAN. Pagaste $3.000 en X",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review",
+      "amount": "25000.00",
+      "template_id": "review.mixed"
+    }
+  },
+  {
+    "text": "Pagaste $3.000 en X. Recibiste $25.000 de JUAN",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review",
+      "amount": "3000.00"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA. Vence 15/12/2027",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "occurred_at": null,
+      "date_only": null
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA a las 13:45 del 16/11/2026",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "occurred_at": "2026-11-16T13:45:00-05:00",
+      "date_only": null
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA. Fecha: 15/11/2026 Hora: 13:45",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "occurred_at": "2026-11-15T13:45:00-05:00"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA el 16/11/2026",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "occurred_at": null,
+      "date_only": "2026-11-16"
+    }
+  },
+  {
+    "text": "Compraste $50.000 en TIENDA. Fecha límite: 15/12/2027",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "occurred_at": null,
+      "date_only": null
+    }
+  },
+  {
+    "text": "Compraste $5.000 en EXTRACTO RESTAURANT",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review"
+    }
+  },
+  {
+    "text": "Compra aprobada $5.000 en OTP BAR",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review"
+    }
+  },
+  {
+    "text": "Compra aprobada $5.000 en CLAVE DINAMICA STORE",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review"
+    }
+  },
+  {
+    "text": "Retiraste $5.000. Recordatorio: cuota",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "5000.00"
+    }
+  },
+  {
+    "text": "Compraste $5.000 en TIENDA",
+    "subject": "Extracto mensual",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review"
+    }
+  },
+  {
+    "text": "Clave dinámica 123456",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Compraste $5.000 en TIENDA. Promoción exclusiva",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal"
+    }
+  },
+  {
+    "text": "Compraste $1.5 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review",
+      "amount": null
+    }
+  },
+  {
+    "text": "Compraste $2.5 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review",
+      "amount": null
+    }
+  },
+  {
+    "text": "Compraste $0.500 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review",
+      "amount": null
+    }
+  },
+  {
+    "text": "Compraste $5.000,000 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "review",
+      "amount": null
+    }
+  },
+  {
+    "text": "Compraste $99999999999 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "99999999999.00"
+    }
+  },
+  {
+    "text": "Compraste $5.000 123 en TIENDA",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "amount": "5000.00",
+      "merchant": null
+    }
+  },
+  {
+    "text": "Compraste $5.000 en TIENDA $999",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "merchant": null
+    }
+  },
+  {
+    "text": "Compraste $5.000 en TIENDA 123456789",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "merchant": null
+    }
+  },
+  {
+    "text": "Compraste $5.000 en XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "merchant": null
+    }
+  },
+  {
+    "text": "Bancolombia le informa Compra por $50.000 en TIENDA con su T.Cred *1234",
+    "subject": "",
+    "sender": "87400",
+    "expected": {
+      "kind": "withdrawal",
+      "merchant": "TIENDA",
+      "account_hint": "1234"
+    }
+  },
+  {
+    "text": "Compraste $10.000 en CAFE con tu tarjeta *5678",
+    "subject": "",
+    "sender": "890099",
+    "expected": {
+      "account_hint": "5678"
+    }
+  },
+  {
+    "text": "Compraste US$25.99 en AMAZON el 2026-11-16T10:30:15Z",
+    "subject": "",
+    "sender": "bancolombia",
+    "expected": {
+      "currency": "USD",
+      "amount": "25.99",
+      "occurred_at": "2026-11-16T10:30:15+00:00"
+    }
+  }
+]

@@ -83,6 +83,7 @@ dmypy.json
 credentials/
 *.json
 !**/schemas/*.json
+!tests/parsers/fixtures/*.json
 google_credentials.json
 google_token.json
 *.pem

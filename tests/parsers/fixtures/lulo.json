@@ -1,0 +1,65 @@
+[
+  {
+    "text": "Compra realizada $25.000 en TIENDA",
+    "subject": "",
+    "sender": "lulo",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "25000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Recibiste $30.000 de JUAN",
+    "subject": "",
+    "sender": "lulo",
+    "expected": {
+      "kind": "deposit",
+      "amount": "30000.00",
+      "counterparty_hint": "JUAN"
+    }
+  },
+  {
+    "text": "Enviaste $12.000 a MARIA",
+    "subject": "",
+    "sender": "lulo",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "MARIA"
+    }
+  },
+  {
+    "text": "Compra rechazada por fondos insuficientes",
+    "subject": "",
+    "sender": "lulo",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Valor: $35.000 en CAFE",
+    "subject": "Compra realizada",
+    "sender": "lulo",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "35000.00",
+      "merchant": "CAFE"
+    }
+  },
+  {
+    "text": "No olvides pagar tu tarjeta",
+    "subject": "Tu fecha de pago ya está cerca",
+    "sender": "lulo",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Compraste $5.000 en TIENDA",
+    "subject": "Compra rechazada",
+    "sender": "lulo",
+    "expected": {
+      "kind": "ignore"
+    }
+  }
+]

@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -53,6 +54,14 @@ def _get_engine() -> AsyncEngine:
             if "sqlite" in settings.database_url
             else {},
         )
+        if "sqlite" in settings.database_url:
+            @event.listens_for(_engine.sync_engine, "connect")
+            def sqlite_pragmas(connection, _record):
+                cursor = connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.close()
         logger.info("database_engine_created", url=settings.database_url.split("@")[-1])
 
     return _engine
@@ -75,16 +84,9 @@ def _get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def init_db() -> None:
-    """
-    Initialize the database by creating all tables.
-
-    Should be called on application startup.
-    """
-    # Schema cutover requires a fresh database; create_all performs no migrations.
-    engine = _get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
+    """Check connectivity; Alembic owns schema changes."""
+    async with _get_engine().connect() as connection:
+        await connection.execute(text("SELECT 1"))
     logger.info("database_initialized")
 
 

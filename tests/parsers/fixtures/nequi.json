@@ -1,0 +1,87 @@
+[
+  {
+    "text": "Pagaste $25.000 en TIENDA",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "25000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Recibiste $30.000 de JUAN",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "deposit",
+      "amount": "30000.00",
+      "counterparty_hint": "JUAN"
+    }
+  },
+  {
+    "text": "Enviaste $12.000 a MARIA",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "MARIA"
+    }
+  },
+  {
+    "text": "Compra rechazada por fondos insuficientes",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "ignore"
+    }
+  },
+  {
+    "text": "Nequi: Enviaste $300.000 a BANCOLOMBIA",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "BANCOLOMBIA",
+      "account_hint": null
+    }
+  },
+  {
+    "text": "Nequi: Recibiste $200.000 de BANCOLOMBIA",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "deposit",
+      "counterparty_hint": "BANCOLOMBIA",
+      "account_hint": null
+    }
+  },
+  {
+    "text": "Recibiste $5.000 de tu Bolsillo",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "deposit",
+      "counterparty_hint": "tu Bolsillo",
+      "account_hint": null
+    }
+  },
+  {
+    "text": "Pagaste $500.000 a TARJETA DE CREDITO VISA",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "TARJETA DE CREDITO VISA"
+    }
+  },
+  {
+    "text": "Enviaste $5.000 a tu Bolsillo",
+    "subject": "",
+    "sender": "nequi",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "tu Bolsillo"
+    }
+  }
+]

@@ -9,6 +9,10 @@ class FireflyError(FinanceAnalyzerError):
     pass
 
 
+class PermanentError(FireflyError, ValueError):
+    """Non-retryable validation failure, safe to route to human review."""
+
+
 class LLMError(FinanceAnalyzerError):
     pass
 

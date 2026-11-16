@@ -5,12 +5,14 @@ services:
       dockerfile: Dockerfile.dev
     env_file: .env
     environment:
-      DATABASE_URL: sqlite+aiosqlite:///./data/finance_v2.db
+      DATABASE_URL: sqlite+aiosqlite:///./data/finance_v3.db
       TZ: America/Bogota
     ports:
       - "127.0.0.1:${PORT:-8000}:8000"
     volumes:
       - ./app:/app/app
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
       - finance-dev-data:/app/data
 volumes:
   finance-dev-data:

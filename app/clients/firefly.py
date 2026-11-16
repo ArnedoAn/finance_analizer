@@ -3,6 +3,7 @@
 import httpx
 
 from app.core.config import get_settings
+from app.core.exceptions import FireflyError, PermanentError
 
 
 class FireflyClient:
@@ -20,15 +21,31 @@ class FireflyClient:
         )
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
-        response = await self._client.request(method, path, **kwargs)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = await self._client.request(method, path, **kwargs)
+        except httpx.RequestError as exc:
+            raise FireflyError("Firefly network request failed") from exc
+        if 400 <= response.status_code < 500 and response.status_code != 429:
+            try:
+                body = response.json()
+                message = str(body.get("message", "Validation failed"))
+                errors = body.get("errors", {})
+                message = f"{message}: {errors}" if errors else message
+            except (ValueError, AttributeError):
+                message = "Request rejected"
+            token = self.settings.firefly_api_token.get_secret_value()
+            if token:
+                message = message.replace(token, "[redacted]")
+            raise PermanentError(f"Firefly {response.status_code}: {message[:1500]}")
+        if response.is_error:
+            raise FireflyError(f"Firefly temporarily unavailable ({response.status_code})")
+        return response.json() if response.content else {}
 
-    async def _list(self, path: str) -> list[dict]:
+    async def _list(self, path: str, **params) -> list[dict]:
         rows = []
         page = 1
         while True:
-            result = await self._request("GET", path, params={"page": page, "limit": 100})
+            result = await self._request("GET", path, params={**params, "page": page, "limit": 100})
             data = result["data"]
             rows.extend(data)
             pagination = result.get("meta", {}).get("pagination", {})
@@ -49,7 +66,7 @@ class FireflyClient:
 
     async def create_account(self, name: str, type: str) -> dict:
         if type not in {"expense", "revenue"}:
-            raise ValueError("Only merchant expense/revenue accounts may be created")
+            raise PermanentError("Only merchant expense/revenue accounts may be created")
         result = await self._request(
             "POST", "accounts", json={"name": name, "type": type, "currency_code": "COP"}
         )
@@ -61,13 +78,38 @@ class FireflyClient:
         )
         return str(result["data"]["id"])
 
+    async def find_by_external_id(self, external_id: str) -> str | None:
+        escaped = external_id.replace("\\", "\\\\").replace('"', '\\"')
+        rows = await self._list("search/transactions", query=f'external_id_is:"{escaped}"')
+        for row in rows:
+            splits = row.get("attributes", {}).get("transactions", [])
+            if any(split.get("external_id") == external_id for split in splits):
+                return str(row["id"])
+        return None
+
+    async def update_transaction(self, transaction_id: str, payload: dict) -> str:
+        result = await self._request("PUT", f"transactions/{transaction_id}", json={**payload, "apply_rules": True})
+        return str(result["data"]["id"])
+
+    async def delete_transaction(self, transaction_id: str) -> None:
+        await self._request("DELETE", f"transactions/{transaction_id}")
+
+    async def insight(self, start, end) -> dict:
+        return await self._request(
+            "GET", "insight/expense/category",
+            params={"start": start.isoformat(), "end": end.isoformat()},
+        )
+
+    async def list_auto_transactions(self) -> list[dict]:
+        return await self._list("search/transactions", query='tag_is:"auto"')
+
     async def check_connection(self) -> bool:
         if not self.settings.firefly_base_url or not self.settings.firefly_api_token.get_secret_value():
             return False
         try:
             await self._request("GET", "about")
             return True
-        except (httpx.HTTPError, ValueError, KeyError):
+        except (FireflyError, httpx.HTTPError, ValueError, KeyError):
             return False
 
     async def close(self) -> None:

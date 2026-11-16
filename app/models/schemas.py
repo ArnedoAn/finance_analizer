@@ -1,31 +1,17 @@
-"""Validated inputs and LLM extraction output."""
+"""Validated owner and phone API inputs."""
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class TransactionAnalysis(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="ignore")
-    is_transaction: bool = True
-    amount: Decimal | None = Field(default=None, gt=0)
-    currency: str = "COP"
-    merchant: str = ""
-    description: str = ""
-    category: str | None = None
-    asset_account: str | None = None
-    transaction_type: Literal["withdrawal", "deposit"] = "withdrawal"
-    date: str | None = None
-
-    @model_validator(mode="after")
-    def require_amount(self):
-        if self.is_transaction and self.amount is None:
-            raise ValueError("A transaction requires a positive amount")
-        return self
-
-
 class WebhookPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
+    event_id: UUID | None = None
+    notification_key: str = ""
+    post_time: int | None = None
     id: str = ""
     type: Literal["notification", "sms"] = "notification"
     app: str = ""
@@ -47,15 +33,18 @@ class WebhookPayload(BaseModel):
 
 
 class ManualTransaction(BaseModel):
-    amount: Decimal = Field(gt=0)
-    description: str = Field(min_length=1)
-    type: Literal["withdrawal", "deposit"] = "withdrawal"
+    client_ref: str = Field(min_length=1, max_length=255)
+    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    description: str = Field(min_length=1, max_length=4000)
+    type: Literal["withdrawal", "deposit", "transfer", "refund"] = "withdrawal"
     category: str | None = None
     account: str | None = None
     merchant: str | None = None
-    date: str | None = None
+    destination_account: str | None = None
+    date: datetime | None = None
 
 
 class SenderInput(BaseModel):
     keyword: str = Field(min_length=1)
     name: str = ""
+    require_auth: bool = True

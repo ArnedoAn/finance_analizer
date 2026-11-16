@@ -1,24 +1,22 @@
-# Decisión: single-user v2 en main
+# Decisión: single-user v3 en main
 
 **Fecha: 2026-11-16. Estado: vigente.**
 
-`main` es ahora la única línea de desarrollo y despliegue de Finance Analyzer **single-user v2**, para el dueño. La estrategia anterior de conservar `main` multi-usuario y una rama `individual` separada queda **obsoleta**. No se debe volver a `individual` ni restaurar el diseño multi-tenant.
+Único usuario en Colombia, COP/America/Bogota y Firefly III como ledger. `main` es la única línea de desarrollo y despliegue; las ramas individual/multi-tenant, sesiones y OAuth quedaron obsoletas. Objetivo: ningún gasto perdido, duplicado ni mal registrado en silencio; lo dudoso se conserva en revisión y se notifica al dueño.
 
-## Corte limpio
+## Contrato operativo
 
-- Eliminar sesiones, session_id en DB/repositorios, cookies y headers Telegram/usuario/sesión, fan-out del scheduler y override user_id del webhook.
-- Proteger API con FINANCE_API_KEY / X-API-Key; únicamente health/live y health/ready son públicos.
-- Base v2 nueva con create_all, sin migraciones ni lectura de DB anterior. Respaldar v1 antes del corte; Firefly conserva el ledger.
-- N cuentas IMAP con usuario/contraseña de aplicación. Gmail/Yahoo/iCloud/custom; Outlook vía reenvío. Sin OAuth Google/Microsoft ni cifrado local de tokens OAuth.
-- Inbox durable único para email, notification, sms y manual. Reglas → parsers → LLM OpenCode Go con fallback opcional DeepSeek → Firefly.
-- COP y America/Bogota; fechas aware, cuentas asset existentes, categorías existentes por defecto y reglas Firefly habilitadas.
-- Dedup de source_ref y dedup cross-channel email/teléfono con monto/cuenta/ventana exactos; nunca fusionar compras repetidas del mismo canal.
-- Un ciclo programado poll+procesamiento, aprendizaje de remitentes y procesamiento inmediato de webhook. Sin protocolo HTTP de jobs/polling.
+- Inbox durable para email, notification, sms y manual, persistido antes de red. Estados de revisión/rechazo/anulación explícitos; cuerpos truncados con retención y nunca logueados.
+- OWN_ACCOUNTS contiene fuentes, aliases y productos; no existe fallback bancario a Efectivo. Transferencias entre propias no inflan ingresos/gastos.
+- Reglas de remitentes exactas, autenticación mail alineada y aprendizaje solo como propuesta. Descarga header-first; un correo roto no detiene la cuenta.
+- Parsers por banco con Extraction común, dinero Decimal, fechas ancladas y verificación semántica del LLM. USD, mezcla de eventos o datos ambiguos requieren revisión.
+- Idempotencia por source_ref/client_ref y adopción Firefly por external_id antes de cada POST. Claim de fila, líder PostgreSQL del scheduler y un worker de despliegue, sin lock global durante red.
+- Dedup entre canales distintos, Message-ID entre buzones y emparejamiento de transferencias. Nunca colapsar compras repetidas del mismo canal por contenido.
+- Revisión, edición/void y conciliación hacen recuperables errores y borrados externos. Errores permanentes requieren revisión; transitorios tienen backoff y alerta.
+- Telegram es push/notificación al dueño y registro manual auxiliar, no el canal principal. Message Mirror usa outbox nativo durable, ACK, pausa por autenticación y dead-letter visible.
 
-## Clientes y despliegue
+## Datos y despliegue
 
-Message Mirror usa URL directa financeapi.esclab.tech, API key y cola persistente con dead-letter para errores permanentes. El bot solo permite finanzas a ADMIN_ID y usa la misma API key; no sesiones. GHCR → Coolify continúa sobre main, con tests y Ruff antes del build. Consultar README para variables, endpoints, operación y corte de DB.
+Alembic reemplaza create_all de v2. Baseline v3 crea DB vacía o actualiza en sitio el esquema single-user v2 sin perder inbox ni cursores; remitentes heredados quedan pendientes de aprobación. Conservar DB/volumen v2 y respaldar antes de arrancar. V1/multi-tenant requiere DB separada y no se acepta como upgrade en sitio. Downgrade exige restaurar respaldo coherente, no borrar tablas.
 
-## Historia (no operativa)
-
-El repositorio tuvo una etapa individual v1 y luego una etapa multi-usuario; la decisión del 2026-09-13 propuso ramas vivas separadas. La decisión del **2026-11-16 reemplaza esa propuesta por completo**. Los módulos, endpoints y pruebas de sesión/OAuth anteriores no son referencias válidas para nuevas implementaciones.
+Imágenes con uv.lock, sin root, migración previa y un worker. GHCR verifica SQLite/PostgreSQL antes de publicar; Coolify falla ante configuración incompleta. API key requerida, secretos por *_FILE, docs de producción opt-in. Ver README para comandos, variables, recuperación y rollback.

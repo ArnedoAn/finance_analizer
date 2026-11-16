@@ -1,0 +1,39 @@
+[
+  {
+    "text": "Compraste $25.000 en TIENDA",
+    "subject": "",
+    "sender": "daviplata",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "25000.00",
+      "merchant": "TIENDA"
+    }
+  },
+  {
+    "text": "Recibiste $30.000 de JUAN",
+    "subject": "",
+    "sender": "daviplata",
+    "expected": {
+      "kind": "deposit",
+      "amount": "30000.00",
+      "counterparty_hint": "JUAN"
+    }
+  },
+  {
+    "text": "Enviaste $12.000 a MARIA",
+    "subject": "",
+    "sender": "daviplata",
+    "expected": {
+      "kind": "withdrawal",
+      "counterparty_hint": "MARIA"
+    }
+  },
+  {
+    "text": "Compra rechazada por fondos insuficientes",
+    "subject": "",
+    "sender": "daviplata",
+    "expected": {
+      "kind": "ignore"
+    }
+  }
+]

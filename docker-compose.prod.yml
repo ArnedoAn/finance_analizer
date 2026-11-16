@@ -18,8 +18,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      FINANCE_API_KEY: ${FINANCE_API_KEY:?Set FINANCE_API_KEY}
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-finance_analyzer}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_analyzer_v2}
+      APP_ENV: production
+      EXPOSE_DOCS: ${EXPOSE_DOCS:-false}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-finance_analyzer}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_analyzer_v2}
       TZ: America/Bogota
     ports:
       - "127.0.0.1:${PORT:-8000}:8000"

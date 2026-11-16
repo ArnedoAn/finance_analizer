@@ -1,144 +1,178 @@
-# Finance Analyzer v2
+# Finance Analyzer v3
 
-Servicio **single-user** para Colombia: correo IMAP, notificaciones/SMS de Message Mirror y movimientos manuales convergen en Firefly III. Moneda COP; zona `America/Bogota`. `main` es la rama única de desarrollo/despliegue. No hay usuarios, sesiones, cookies, autenticación Telegram ni OAuth de Google/Microsoft.
+Servicio single-user para Colombia: correo IMAP, notificaciones/SMS de Message Mirror y registros manuales convergen en Firefly III. COP y `America/Bogota`; `main` es la única rama de desarrollo/despliegue. Firefly es el ledger. Lo dudoso se conserva en revisión, nunca se convierte silenciosamente en gasto. No hay sesiones, cookies, multi-tenant ni OAuth Google/Microsoft.
 
 ## Inicio local
 
-Requiere Python 3.12+, [uv](https://docs.astral.sh/uv/), una instancia Firefly III y sus cuentas asset existentes.
+Requiere Python 3.12+, [uv](https://docs.astral.sh/uv/), Firefly III y cuentas existentes.
 
 ```bash
 cp .env.example .env
+# Completar secretos, OWN_ACCOUNTS y MAIL_ACCOUNTS antes de arrancar.
 uv python install 3.12
-uv venv --python 3.12
-uv pip install -e ".[dev]"
-uv run --no-project uvicorn app.main:app --reload
+uv sync --frozen --extra dev
+uv run --frozen alembic upgrade head
+uv run --frozen uvicorn app.main:app --reload
 ```
 
-Complete `FINANCE_API_KEY` (obligatoria), `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN`, las cuentas y las claves LLM en `.env`. Configure los nombres exactos de cuentas asset existentes; **no se crean cuentas asset**. `/docs` expone OpenAPI. Nunca publique `.env`, cuerpos financieros ni tokens.
+`FINANCE_API_KEY` y `PHONE_API_KEY` son obligatorias, distintas y de **al menos 32 caracteres cada una**. Genere dos secretos aleatorios independientes (por ejemplo, `openssl rand -hex 32` dos veces), nunca use los placeholders de los ejemplos. Configure `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN`, las cuentas propias y LLM. `uv.lock` fija dependencias de desarrollo y producción; actualícelo deliberadamente con `uv lock` cuando cambie `pyproject.toml`. No publique `.env`, cuerpos financieros, DB ni tokens.
 
 ## Configuración
 
-Las variables completas están en [.env.example](.env.example); para producción use [env.production.example](env.production.example).
+Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.production.example). Nombres en mayúsculas de los campos de `app/core/config.py`.
 
-| Variable | Función / predeterminado |
+| Variable | Uso / valor predeterminado |
 |---|---|
-| `FINANCE_API_KEY` | Secreto requerido; header `X-API-Key` |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./data/finance_v2.db`; también PostgreSQL con asyncpg |
-| `TIMEZONE` | `America/Bogota` |
+| `FINANCE_API_KEY` | Secreto administrativo obligatorio, ≥32 caracteres; header `X-API-Key`; no guardarlo en el teléfono |
+| `PHONE_API_KEY` | Secreto independiente obligatorio, ≥32 caracteres; solo ingesta `/notifications/webhook` y prueba `/auth/check` |
+| `APP_ENV`, `EXPOSE_DOCS` | development, false; en production OpenAPI y `/docs` deshabilitados salvo opt-in |
+| `DATABASE_URL`, `DATABASE_URL_FILE` | `sqlite+aiosqlite:///./data/finance_v3.db`; PostgreSQL usa `postgresql+asyncpg://`; `_FILE` evita exponer la contraseña en el entorno |
+| `TIMEZONE` | America/Bogota |
 | `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN` | Ledger y personal access token |
-| `FIREFLY_DEFAULT_ASSET_ACCOUNT`, `MANUAL_DEFAULT_ACCOUNT` | `Efectivo` |
-| `ACCOUNT_MAP` | JSON: paquete app, `sms:<remitente>` o substring del correo → cuenta asset existente |
-| `FIREFLY_CACHE_TTL_MINUTES` | 360; se fuerza refresco si falta una cuenta |
-| `AUTO_CREATE_CATEGORIES` | false; usar categorías existentes |
-| `MAIL_ACCOUNTS` | JSON de N cuentas IMAP; `[]` desactiva correo |
-| `EMAIL_LOOKBACK_DAYS`, `EMAIL_MAX_BODY_CHARS` | 7 y 12000 |
-| `LLM_BASE_URL` | `https://opencode.ai/inference/go/openai/v1` |
-| `LLM_API_KEY`, `LLM_MODELS` | OpenCode Go; `deepseek-v4.1-flash,hy3,mimo-v2.6-flash` en orden |
-| `LLM_USER_AGENT` | `finance-analyzer/2.0` |
-| `LLM_FALLBACK_BASE_URL`, `LLM_FALLBACK_API_KEY`, `LLM_FALLBACK_MODEL` | DeepSeek directo opcional; URL `https://api.deepseek.com/v1`, modelo `deepseek-chat` |
-| `DEDUP_WINDOW_MINUTES`, `MAX_ATTEMPTS` | 60 y 8 |
+| `OWN_ACCOUNTS` | Lista JSON de cuentas propias, fuentes, aliases y últimos cuatro dígitos |
+| `MANUAL_DEFAULT_ACCOUNT` | Efectivo; solo registro manual, nunca fallback de fuentes bancarias |
+| `FIREFLY_CACHE_TTL_MINUTES` | 360 |
+| `MAIL_ACCOUNTS` | Lista JSON, `[]` desactiva correo |
+| `EMAIL_LOOKBACK_DAYS`, `EMAIL_MAX_BODY_CHARS` | 7, 12000 |
+| `LLM_BASE_URL` | https://opencode.ai/inference/go/openai/v1 |
+| `LLM_API_KEY`, `LLM_MODELS` | deepseek-v4.1-flash,hy3,mimo-v2.6-flash en orden |
+| `LLM_USER_AGENT` | finance-analyzer/3.0 |
+| `LLM_FALLBACK_BASE_URL`, `LLM_FALLBACK_API_KEY`, `LLM_FALLBACK_MODEL` | https://api.deepseek.com/v1, secreto opcional, deepseek-chat |
+| `DEDUP_WINDOW_MINUTES`, `TRANSFER_PAIR_WINDOW_MINUTES` | 60, 30 |
+| `MAX_AMOUNT_COP`, `REVIEW_AMOUNT_COP` | 50000000, 2000000 |
+| `LLM_AUTO_APPROVE_MAX_COP` | 0: toda extracción LLM requiere revisión humana; elevarlo es un opt-in de riesgo |
+| `SMS_AUTO_APPROVE_MAX_COP` | 2000000; 0 exige revisión de todos los SMS, además de las demás reglas |
+| `FAIL_AFTER_HOURS` | 72 horas para fallos transitorios automáticos |
+| `RAW_TEXT_RETENTION_DAYS` | 30 para ignored/rejected/duplicate; 180 para el resto |
 | `SCHEDULER_ENABLED`, `CYCLE_CRON` | true, `0 * * * *` |
 | `SENDER_LEARNING_CRON` | `0 3 1,15 * *` |
+| `RECONCILE_CRON` | `0 4 * * *`, conciliación diaria con Firefly |
+| `NOTIFY_URL`, `NOTIFY_API_KEY` | Bot `POST /notify` y secreto compartido |
+| `NOTIFY_MIN_INTERVAL_MINUTES`, `PHONE_SILENCE_HOURS` | 15, 24 |
+| `DIGEST_CRON` | `0 8 * * *`, resumen del día anterior |
+| `WEEKLY_DIGEST_CRON` | `0 8 * * 1`, resumen semanal los lunes |
 
-### Correo IMAP
+### Cuentas propias y confianza
 
-```dotenv
-MAIL_ACCOUNTS='[{"name":"personal","provider":"gmail","username":"owner@gmail.com","password":"app-password","folder":"INBOX","port":993,"ssl":true},{"name":"propio","provider":"custom","host":"imap.example.com","username":"owner@example.com","password":"secret"}]'
+`OWN_ACCOUNTS` reemplaza por completo `ACCOUNT_MAP`. Ejemplo:
+
+```json
+[{"firefly_account":"Nequi","bank":"nequi","kind":"wallet","last4":[],"aliases":["nequi"],"sources":["app:com.nequi.MobileApp","sms:85954","email:nequi.com.co"]}]
 ```
 
-`provider` puede ser `gmail`, `yahoo`, `icloud` o `custom`; los tres primeros completan host. Use contraseñas de aplicación cuando el proveedor lo exija. Outlook se integra mediante reenvío automático a una cuenta IMAP, **no OAuth**. Cada nombre debe ser estable y único. IMAP usa stdlib en un thread, `EXAMINE` y `BODY.PEEK`, sin marcar como leído. Se persisten UIDVALIDITY, último UID, último poll y error por cuenta. El primer poll usa `SINCE` con el lookback. Se filtra From por remitentes conocidos; HTML se convierte a texto y se recorta.
+`kind`: savings, checking, credit, wallet, pocket o cash. Configure los paquetes app, códigos SMS y dominios reales; no copie fuentes que no pertenezcan a su banco. Las cuentas deben existir en Firefly. Una fuente reconocida sin cuenta resoluble queda `needs_review`; no se contabiliza contra Efectivo. Contrapartes propias se registran como transferencias asset→asset o asset→liability, no ingreso+gasto. Las cuentas faltantes degradan salud y generan alerta.
+
+IMAP usa usuario/contraseña de aplicación (`gmail`, `yahoo`, `icloud`, `custom`). Outlook: reenvío a IMAP, sin OAuth. Cada nombre de cuenta es estable y único. Custom requiere `host`; configure `authserv_ids` con los authserv-id reales del proveedor, no con dominios tomados de un correo. Lista vacía no confía en autenticación. Se valida el Authentication-Results confiable más alto y DKIM/DMARC alineado al dominio From parseado; no se confía en display names ni substrings. Una excepción `require_auth=false` es un opt-out explícito por regla y debe ser excepcional.
+
+Se leen primero cabeceras con BODY.PEEK y cuerpo solo si corresponde. Se persisten UIDVALIDITY, UID, errores y fallos consecutivos; un mensaje roto no bloquea los siguientes. Aprender remitentes solo propone reglas `pending_approval`; aprobarlas exige revisión humana. Tras la migración v2 todas las reglas antiguas quedan pendientes, incluso las semillas: revisarlas y aprobarlas antes de reactivar el scheduler.
+
+**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con `OWN_ACCOUNTS.sources` no es prueba criptográfica. El límite `SMS_AUTO_APPROVE_MAX_COP=2000000` permite contabilización automática solo si pasan también las demás comprobaciones. Use `0` para exigir revisión de todos los SMS. Por defecto `LLM_AUTO_APPROVE_MAX_COP=0`: incluso una extracción coherente con el texto queda para revisión humana; subir el límite acepta el riesgo de texto malicioso o saldos confundidos con gastos.
+
+### Secretos por archivo
+
+`FINANCE_API_KEY`, `PHONE_API_KEY`, `DATABASE_URL`, `FIREFLY_API_TOKEN`, `LLM_API_KEY`, `LLM_FALLBACK_API_KEY`, `MAIL_ACCOUNTS`, `NOTIFY_API_KEY` y `OWN_ACCOUNTS` soportan `<VAR>_FILE`. Monte archivos read-only, elimine el valor directo correspondiente y configure la ruta **dentro** del contenedor (por ejemplo, `PHONE_API_KEY_FILE=/run/secrets/phone_api_key`, `DATABASE_URL_FILE=/run/secrets/database_url`). Los archivos de cuentas contienen JSON; el de DB contiene la URL completa. Use Compose secrets o mounts en un override local de despliegue; no incluya secretos en la imagen, Git ni argumentos de build. El ejemplo Compose lee `.env`; las rutas del host no son rutas del contenedor.
 
 ## API `/api/v1`
 
-Todas las rutas requieren `X-API-Key`, salvo `/health/live` y `/health/ready`. Clave ausente/incorrecta: 401. No envíe headers `X-Telegram-*`, `X-User-Id` o `X-Session-ID`.
+Todas las rutas requieren `X-API-Key` salvo `/health/live` y `/health/ready`. Use `PHONE_API_KEY` en Message Mirror para ingesta y `/auth/check`; esa clave no permite leer el inbox ni administrar cuentas o transacciones. Los consumidores administrativos usan `FINANCE_API_KEY`. Tras 10 fallos 401/min por IP se limita el tráfico con claves inválidas; una clave válida no debe quedar bloqueada por esos fallos. No envíe headers de usuario/sesión/Telegram. OpenAPI solo se expone en producción con `EXPOSE_DOCS=true`.
 
-| Método | Ruta | Uso |
+| Método | Ruta | Función |
 |---|---|---|
-| GET | `/health/live`, `/health/ready` | Probes públicos |
-| GET | `/health` | Estado, versión y servicios database/firefly/llm/mail por cuenta |
-| POST | `/notifications/webhook` | Ingesta durable y procesamiento inmediato en background |
-| POST | `/transactions/manual` | Movimiento manual; 201 con inbox_id, firefly_transaction_id y status created |
-| POST | `/processing/run?dry_run=false` | Poll IMAP y procesamiento inmediato; dry-run solo previsualiza pendientes existentes, sin persistir ni consultar IMAP |
-| GET | `/processing/statistics` | by_status, by_source, by_method, pending, failed, last_run |
-| GET | `/inbox?status=&source=&method=&limit=50` | Listado sin raw_text |
-| GET | `/inbox/{id}` | Detalle con raw_text |
-| POST | `/inbox/{id}/retry`, `/inbox/retry-failed` | Reencolar; `{requeued:n}` |
-| GET | `/mail/accounts` | Configuración sin secretos y estado del poll |
-| POST | `/mail/accounts/{name}/test` | Conectividad; `{ok,error}` |
-| GET/POST | `/senders` | Consultar/agregar remitentes |
-| DELETE | `/senders/{keyword}` | Eliminar remitente |
-| POST | `/senders/seed`, `/senders/learn` | Semilla/aprendizaje |
+| GET | `/auth/check` | `{ok:true}`, probar conexión sin efectos |
+| GET | `/health/live`, `/health/ready`, `/health` | Probes públicos live/ready; diagnóstico autenticado |
+| POST | `/notifications/webhook` | Persistir evento; procesar en background |
+| POST | `/transactions/manual` | Registro idempotente con `client_ref` obligatorio |
+| GET | `/inbox?status=&source=&method=&limit=&offset=` | `{items,total}`, sin cuerpo |
+| GET | `/inbox/{id}` | Detalle sin texto crudo por defecto; `?include_raw=true` es opt-in explícito para raw_text |
+| POST | `/inbox/{id}/approve`, `/inbox/{id}/reject` | Resolver revisión; approve acepta correcciones |
+| PATCH | `/inbox/{id}` | Corregir creado y actualizar Firefly |
+| POST | `/inbox/{id}/void` | Eliminar en Firefly y marcar voided |
+| POST | `/inbox/{id}/reprocess`, `/inbox/retry-failed` | Reencolar para nueva evaluación |
+| GET | `/mail/accounts` | Configuración sin secretos, cursor y fallos consecutivos |
+| POST | `/mail/accounts/{name}/test` | Prueba IMAP con error enmascarado |
+| POST | `/mail/accounts/{name}/repoll?since=YYYY-MM-DD` | Releer rango histórico deliberadamente |
+| GET/POST | `/senders` | Consultar/agregar reglas |
+| POST | `/senders/{id}/approve` | Activar propuesta revisada |
+| DELETE | `/senders/{id}` | Eliminar regla |
+| GET | `/reports/summary?period=day\|week\|month&date=YYYY-MM-DD` | Totales por kind/categoría/cuenta y comercios |
+| GET | `/processing/statistics` | Counts por estado/fuente/método, antigüedad pendiente y último ciclo real |
+| POST | `/processing/run`, `/reconcile/run` | Ejecutar ciclo o conciliación Firefly |
 | POST | `/sync/all` | Refrescar caché Firefly |
-| GET | `/sync/accounts`, `/sync/categories` | Cuentas/categorías |
-| GET | `/scheduler/status` | Estado de jobs |
-| POST | `/scheduler/jobs/{job_id}/trigger` | Ejecutar `cycle` o `sender_learning` |
-
-Se eliminaron `/auth/*`, `/emails/*`, `/processing/batch`, `/processing/jobs/*`, `/processing/single`, `/processing/dry-run`, `/processing/audit`, `/processing/retry-failed`, `/notifications/process`, `/notifications/history` y `/notifications/stats`. Los reintentos viven en inbox; no hay jobs HTTP para polling.
+| GET | `/sync/accounts`, `/sync/categories`, `/scheduler/status` | Consultar caché/jobs |
 
 ### Message Mirror
 
-URL directa: `https://financeapi.esclab.tech/api/v1/notifications/webhook` (no el dominio antiguo que redirige POST). Configure la API key tanto para envíos Dart como nativos.
+URL directa: `https://financeapi.esclab.tech/api/v1/notifications/webhook`. No use un dominio que redirija POST. Probar conexión usa `GET /api/v1/auth/check`.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/notifications/webhook \
-  -H "X-API-Key: $FINANCE_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"id":"phone-123","type":"notification","app":"com.todo1.mobile","sender":"Bancolombia","title":"Compra","message":"Compraste $25.000 en TIENDA","timestamp":"1794877200000","device":"phone"}'
+  -H "X-API-Key: $PHONE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"event_id":"f044850a-4678-4dfd-9c4d-22c73a3a7167","type":"notification","app":"com.nequi.MobileApp","sender":"Nequi","title":"Compra","message":"Pagaste $25.000 en TIENDA","notification_key":"bank-event-123","post_time":1794877200000}'
 ```
 
-Campos string: `id,type,app,sender,title,message,text,big_text,timestamp,date,category,device`; `type` es `notification` o `sms`. Extras (incluido `user_id`) se ignoran. Contenido: `big_text > message > text`; debe existir contenido. Fecha: timestamp epoch ms o ISO, luego `date` (`yyyy-MM-dd HH:mm`) local Bogotá.
+El UUID `event_id` es estable en todos los reintentos del outbox nativo; `notification_key` es sbn.key y `post_time` epoch ms. Se conservan campos v2 (`timestamp`, `date`, `big_text`, etc.). Sin event_id se usa huella con timestamp; sin ambos se genera UUID, nunca se deduplica solo por contenido. Fechas fuera de 2020…mañana van a revisión con hora de recepción.
 
-- 202: `{accepted:true,status:"queued",inbox_id:n}`; se guarda antes de procesar.
-- 200: `{accepted:false,status:"duplicate"|"ignored"}`. Fuentes no conocidas se guardan **sin cuerpo** por privacidad.
-- 401: clave inválida. 422: payload inválido.
-- Cliente: 2xx entregado; 4xx excepto 408/429 va a dead-letter persistente, visible y reencolable; red, 5xx, 408 y 429 se reintentan con backoff. Nunca descartar silenciosamente.
+- 202: `{accepted:true,status:"queued",inbox_id}`.
+- 200: `{accepted:false,status:"duplicate"|"ignored",inbox_id}`.
+- 401: clave inválida; 422: payload inválido.
+- Teléfono: solo confirma un 2xx con JSON válido, `status` queued/duplicate/ignored e `inbox_id` válido; HTML/ACK malformado no confirma entrega. 401/403/404/3xx pausa la cola y avisa; otros 4xx van a dead-letter; red/5xx/408/429 reintentan con backoff. 20 intentos o 72 h llevan a dead-letter sin bloquear eventos posteriores.
 
-### Efectivo / manual
+### Manual y revisión
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/transactions/manual \
   -H "X-API-Key: $FINANCE_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"amount":12000,"description":"Almuerzo","type":"withdrawal","account":"Efectivo"}'
+  -d '{"client_ref":"manual-20261116-001","amount":12000,"description":"Almuerzo","type":"withdrawal","account":"Efectivo"}'
 ```
 
-`amount > 0`, descripción obligatoria, tipo `withdrawal` (default) o `deposit`; opcionales `category,account,merchant,date` (ISO). Bot Telegram: solo `ADMIN_ID`, `/gasto <monto> <descripción>` y `/ingreso`; `FINANCE_API_URL` + `FINANCE_API_KEY`, sin sesiones.
+Reutilizar `client_ref` devuelve el mismo item. Cuenta, fecha ISO, monto y categoría se validan antes de crear. Categorías usan casefold y nombre canónico; desconocidas devuelven 422 con sugerencias. Un fallo manual devuelve 502 con inbox_id/status/error y **no** se reintenta automáticamente. Antes de repetir, consulte el item y use el mismo client_ref.
 
-## Pipeline y garantías
+Revisión permite corregir amount, merchant, category, firefly_account, transaction_type y occurred_at al aprobar. Se pueden reprocesar ignored, duplicate, failed, rejected y needs_review. Para un creado, use PATCH o void; si se borró directamente en Firefly, ejecute conciliación para eliminar el fantasma local de dedup.
 
-1. Todas las fuentes pasan por `inbox_items`; se persiste antes de llamadas externas. Estados: pending, created, duplicate, ignored, failed. Detalle conserva resultado, método, intentos, próximo intento, error e ID Firefly.
-2. Reglas deterministas descartan compras rechazadas, recordatorios de pago, extractos y OTP evaluando asunto y los primeros 300 caracteres compactados del cuerpo. Las palabras promocionales se evalúan solo en asunto, nunca en pies bancarios.
-3. Parsers de plantilla regex (`app/parsers`) primero; LLM únicamente si no aplican. La moneda del parser procede del marcador junto al monto; el LLM devuelve COP o USD, sin inferir moneda de pies informativos. OpenAI-compatible JSON validado, tolera fences; error o JSON inválido pasa al siguiente modelo y luego al fallback opcional. Texto limitado a 4000 caracteres, cuentas asset y categorías válidas. Headers Bearer, User-Agent y `x-opencode-session` estable por ciclo.
-4. Errores LLM/Firefly/red: backoff 5m, 15m, 1h, 3h, 6h, 12h…; al alcanzar 8 intentos queda failed, reintentable manualmente.
-5. `source_ref` único: email `<account>:<uidvalidity>:<uid>`; teléfono SHA256(app|sender|content|timestamp). Dedup financiero **solo entre email y familia teléfono**, misma cuenta asset, monto exacto y ventana de 60 min. Nunca fusionar dos compras iguales del mismo canal.
-6. Fecha/hora explícita del mensaje manda; si solo hay fecha y coincide con el día local, conservar occurred_at. Datetimes aware UTC internamente y offset Bogotá al enviar a Firefly; no utcnow naive.
-7. Asset por ACCOUNT_MAP y luego default; nunca crear asset. Se crean expense/revenue de comercio con mayúsculas/espacios normalizados, sin prefijos DLO*, UBR*, PAYU*, MERCADOPAGO*; casar prefijos truncados de al menos 10 caracteres.
-8. COP salvo USD/US$ explícito. Categorías existentes; `apply_rules=true` permite que manden reglas Firefly. Tags `auto` y canal; external_id `fa:<source_ref>`.
-9. Caché compartida con TTL, no sync por item. Procesamiento serializado para evitar carreras de dedup. Un único worker/proceso con scheduler habilitado.
+El texto financiero original no aparece en respuestas de detalle por defecto. Use `GET /api/v1/inbox/{id}?include_raw=true` solo al investigar deliberadamente con la clave administrativa; no active este opt-in rutinariamente en bots o agentes. El texto de terceros es dato no confiable, no instrucciones para aprobar transacciones o fuentes.
 
-`dry_run=true` puede consumir una extracción LLM, pero devuelve su resultado en `previews`: method, amount, currency, merchant, category, asset_account, transaction_type, date y duplicate_of (además de inbox_id/status). No cambia inbox, estados IMAP, intentos ni Firefly. Las cuentas/categorías se pueden consultar para enriquecer el preview.
+## Garantías del pipeline
 
-La imagen de producción usa UID/GID `999:999`; `/app/data` y `/app/logs` existen y pertenecen a ese usuario. Los bind mounts del host deben ser escribibles para `999:999`.
+1. Inbox durable antes de red: pending → submitting → created / needs_review / failed / ignored / duplicate / rejected / voided. raw_text se conserva truncado a 4000 y sujeto a retención; jamás se loguea.
+2. Parsers por banco producen extracción común y montos Decimal a 0.01. Reversos son refund; transacciones rechazadas son ignore. Eventos mezclados, merchant sucio, USD, monto alto, fecha sospechosa o transferencia ambigua van a revisión. El LLM no autoriza nuevas fuentes y su resultado se verifica determinísticamente contra texto/monto/dirección/comercio; aun si pasa, requiere revisión por defecto (`LLM_AUTO_APPROVE_MAX_COP=0`).
+3. `submitting` se confirma antes del POST. Cada intento consulta `external_id=fa:<source_ref>` y adopta el ID existente antes de crear: una respuesta perdida no implica otro gasto. PostgreSQL usa claim por fila y líder de scheduler con advisory lock; SQLite serializa claims. No se mantiene lock global durante red.
+4. Dedup entre canales distintos usa cuenta propia, monto, moneda y kind en ±60 min; compras iguales del mismo canal no se fusionan. Email también usa Message-ID normalizado entre buzones. Manual↔automático dudoso va a revisión. Las dos patas de una transferencia propia se emparejan en 30 min.
+5. Errores permanentes (validación/cuenta/datos) van a revisión con motivo. Transitorios tienen backoff y solo pasan a failed tras 72 h, con alerta. Conciliación busca creados borrados y transacciones auto sin item.
+6. Notificaciones al bot `POST /notify`, `x-api-key`, `{message,silent}`: resumen de carga agrupado, alertas throttled por clave, digest diario 08:00 y semanal lunes. Se alerta por fallos, pendientes >2 h, IMAP ≥3 fallos, cuenta inexistente, silencio del teléfono y diferencias de conciliación. Configure ambos extremos; no basta con tener el bot desplegado.
 
-## Docker y despliegue
+**Privacidad de Telegram:** los bots no ofrecen cifrado de extremo a extremo. Los resúmenes (montos, cuentas y comercios) atraviesan y se almacenan en infraestructura de Telegram; no envíe cuerpos crudos, OTP ni credenciales. Configure `NOTIFY_URL` por HTTPS o una red privada controlada y mantenga `NOTIFY_API_KEY` independiente de las claves de la API.
+
+## Migraciones y despliegue
 
 ```bash
 docker compose -f docker-compose.dev.yml up --build
-# Producción: copiar env.production.example a .env, completar secretos y FINANCE_IMAGE
+# Producción: completar .env desde env.production.example y fijar FINANCE_IMAGE por SHA.
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-Dev usa SQLite persistente en `finance-dev-data`, código app montado y hot reload; conecte su Firefly existente. Prod usa PostgreSQL 16 sin puerto público y volumen nuevo `postgres-v2-data`. La imagen Python 3.12 corre sin root, instala el wheel con código incluido y tiene healthcheck sin curl. API publicada solo en loopback: coloque proxy HTTPS delante. Para proxy en otra red Docker, conecte el servicio a esa red y use puerto interno 8000. Mantenga un solo worker para scheduler/dedup; no escale réplicas sin coordinación externa.
+Ambas imágenes ejecutan `alembic upgrade head` **antes** de uvicorn; fallo de migración impide servir. Producción usa un worker y UID/GID `999:999`; mounts de data/logs deben ser escribibles por ese usuario. La imagen instala dependencias desde uv.lock sin herramientas de desarrollo. PostgreSQL 16 no publica puerto; la API se publica en loopback, con proxy HTTPS delante. No lance simultáneamente dos migradores sobre la misma DB; detenga la instancia antigua antes del upgrade. Mantenga una réplica con scheduler activo.
 
-**Cutover v2:** no hay migraciones ni compatibilidad con tablas multi-tenant. Detenga v1, respalde su DB y credenciales fuera del repo, y cree una DB v2 vacía (`create_all` al iniciar). SQLite usa nombre nuevo y Compose un volumen PostgreSQL nuevo. No apunte v2 a la DB v1. Los movimientos ya creados siguen en Firefly; limite lookback/configure remitentes antes de activar el scheduler para evitar reingesta histórica. Reconfigure Mirror y bot con URL directa y API key. Gmail OAuth/token encryption y volúmenes de credenciales ya no se usan.
+Los Dockerfiles fijan `python:3.12-slim` por digest del índice OCI multiarch (`sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b`) obtenido de la API Registry de Docker Hub; uv 0.9.11 también usa digest multiarch de GHCR (`sha256:5aa820129de0a600924f166aec9cb51613b15b68f1dcd2a02f31a500d2ede568`). Ambos índices incluyen linux/amd64 y linux/arm64. Al actualizar, consulte de nuevo los metadatos autenticados del registry y cambie deliberadamente todos los stages; una etiqueta nueva no actualiza estos pins automáticamente.
 
-GHCR (`deploy-ghcr.yml`) ejecuta pytest y Ruff antes de construir/publicar; luego dispara Coolify si están configurados `COOLIFY_URL` y `COOLIFY_TOKEN`. Configure `FINANCE_IMAGE=ghcr.io/<owner>/finance-analyzer:<tag>`; preferir SHA para rollback. Haga backup de DB v2 y de Firefly; no loguee secretos ni cuerpos financieros.
+### Upgrade de v2 existente
+
+1. Detener el servicio y programadores; respaldar DB de Finance Analyzer **y Firefly**. Guardar configuración fuera de Git. Para PostgreSQL, `pg_dump` consistente; SQLite debe copiarse detenido incluyendo WAL si existe.
+2. Mantener `DATABASE_URL` apuntando a la misma DB v2. El default local cambió a finance_v3.db: configure explícitamente `sqlite+aiosqlite:///./data/finance_v2.db` para conservar datos existentes. Compose producción conserva `finance_analyzer_v2` y `postgres-v2-data` deliberadamente: no renombre ni borre el volumen.
+3. Cambiar ACCOUNT_MAP por OWN_ACCOUNTS y configurar secretos/notificaciones. Generar las claves administrativas y del teléfono independientes (≥32 caracteres), actualizar Message Mirror con `PHONE_API_KEY` y conservar `FINANCE_API_KEY` solo en consumidores administrativos. Mantener scheduler deshabilitado durante revisión inicial.
+4. Ejecutar `uv run --frozen alembic upgrade head` (o iniciar la imagen, que ejecuta lo mismo). Baseline `20261116_01` crea una DB vacía o agrega columnas/tablas v3 a las tres tablas single-user v2 existentes; no borra inbox, IDs, cursores ni estados previos. No use `alembic stamp head`: omitiría los cambios de esquema.
+5. Revisar y aprobar reglas antiguas de remitentes; la migración las pone en pending_approval y exige autenticación. Comprobar salud/cuentas, pendientes, revisión y conciliación antes de habilitar scheduler. No fuerce repoll histórico sin necesidad.
+
+La DB v1/multi-tenant **no** se migra en sitio: baseline rechaza tablas/esquema no reconocidos. Respalde v1, cree otra DB y conserve Firefly como ledger histórico; controle lookback para no reingestar. El downgrade de baseline no elimina datos: falla deliberadamente. Rollback exige detener v3, restaurar backup coherente de DB y configuración e imagen anterior; volver solo a la imagen v2 no deshace el esquema ni reglas de confianza.
+
+GHCR ejecuta matriz SQLite/PostgreSQL 16, migración y tests antes del build, con ambas claves de prueba válidas. Todas las acciones están fijadas a commits verificados mediante refs de la API de GitHub; cada job declara permisos mínimos (quality: contents read; publicación: contents read y packages write; deploy: ninguno). PR solo verifica; publicación y deploy exigen `refs/heads/main`, **también en workflow_dispatch**. Coolify **falla** si faltan `COOLIFY_URL` (variable del repositorio) o `COOLIFY_TOKEN` (secret), o si webhook devuelve error; no hay deploy omitido silenciosamente. Use endpoint HTTPS directo y versión de imagen por SHA. El workflow alternativo deploy.yml fue retirado.
 
 ## Desarrollo y comprobaciones
 
 ```bash
-uv run --no-project ruff check app tests
-uv run --no-project pytest
+uv sync --frozen --extra dev
+uv run --frozen ruff check app tests alembic
+uv run --frozen pytest
+# TEST_DATABASE_URL selecciona DB desechable para pruebas; nunca apuntar a producción.
 ```
 
-Fixtures: SQLite en memoria con Base v2, settings sin `.env`, key `test-key`, override get_db, sin lifespan/scheduler/red. Tests nuevos del pipeline/clientes terminan en `_v2.py`. El test Firefly en vivo se omite por defecto; requiere `RUN_FIREFLY_INTEGRATION=1`, `FIREFLY_BASE_URL` y `FIREFLY_API_TOKEN` explícitos y solo hace lecturas.
-
-Véase [decisión de arquitectura](docs/enfoques.md). La guía `docs/omo-model-config.md` configura agentes de desarrollo, **no** los modelos LLM del servicio.
+Las pruebas no deben abrir cuentas reales ni `.env` del desarrollador. Integración Firefly requiere opt-in explícito `RUN_FIREFLY_INTEGRATION=1` y credenciales de prueba. Revise también la migración sobre una copia v2 con datos en SQLite y PostgreSQL antes de producción. [Decisión de arquitectura](docs/enfoques.md). `docs/omo-model-config.md` configura agentes de desarrollo, no el LLM del servicio.

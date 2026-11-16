@@ -1,21 +1,41 @@
-"""Generic password-authenticated IMAP, with blocking operations off the event loop."""
-
+"""Read-only, verified-TLS IMAP ingestion with per-message failure isolation."""
 import asyncio
 import imaplib
 import re
+import ssl
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email import policy
 from email.parser import BytesParser
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
 from app.core.config import get_settings
+from app.security.sender_trust import PROVIDER_AUTHSERV_IDS, AuthResult, authentication_result
 
-_PROVIDER_HOSTS = {
-    "gmail": "imap.gmail.com", "yahoo": "imap.mail.yahoo.com", "icloud": "imap.mail.me.com",
-}
+_PROVIDER_HOSTS = {"gmail": "imap.gmail.com", "yahoo": "imap.mail.yahoo.com", "icloud": "imap.mail.me.com"}
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_HEADER_QUERY = "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID AUTHENTICATION-RESULTS ARC-AUTHENTICATION-RESULTS)] INTERNALDATE)"
+
+
+@dataclass(frozen=True)
+class MailHeader:
+    uid: int
+    message_id: str | None = None
+    from_address: str = ""
+    from_display: str = ""
+    subject: str = ""
+    occurred_at: datetime | None = None
+    auth: AuthResult = AuthResult()
+
+
+@dataclass(frozen=True)
+class MailMessage(MailHeader):
+    body: str | None = None
+    error: str | None = None
 
 
 class IMAPClient:
@@ -23,13 +43,22 @@ class IMAPClient:
         self.account = account
         self.max_body_chars = get_settings().email_max_body_chars
 
+    def _safe_error(self, exc: Exception) -> str:
+        error = str(exc)
+        secrets = (self.account.username, self.account.password.get_secret_value())
+        for secret in sorted((v for v in secrets if v), key=len, reverse=True):
+            for value in {secret, quote(secret, safe=""), repr(secret)[1:-1]}:
+                error = error.replace(value, "***")
+        return error[:500]
+
     def _connect(self):
         account = self.account
         host = account.host or _PROVIDER_HOSTS.get(account.provider, "")
         if not host:
             raise ValueError("An IMAP host is required for a custom provider")
-        cls = imaplib.IMAP4_SSL if account.ssl else imaplib.IMAP4
-        connection = cls(host, account.port, timeout=30)
+        if not account.ssl:
+            raise ValueError("IMAP requires verified TLS (ssl=true)")
+        connection = imaplib.IMAP4_SSL(host, account.port, timeout=30, ssl_context=ssl.create_default_context())
         try:
             connection.login(account.username, account.password.get_secret_value())
             status, _ = connection.select(account.folder, readonly=True)
@@ -44,7 +73,7 @@ class IMAPClient:
     def _logout(connection) -> None:
         try:
             connection.logout()
-        except (OSError, imaplib.IMAP4.error):
+        except Exception:
             pass
 
     async def test(self) -> dict:
@@ -52,61 +81,70 @@ class IMAPClient:
             await asyncio.to_thread(self._test)
             return {"ok": True, "error": None}
         except Exception as exc:
-            # Server responses can echo the login name; do not return credentials.
-            error = str(exc).replace(self.account.password.get_secret_value(), "***") if self.account.password.get_secret_value() else str(exc)
-            return {"ok": False, "error": error[:500]}
+            return {"ok": False, "error": self._safe_error(exc)}
 
     def _test(self) -> None:
-        connection = self._connect()
-        self._logout(connection)
+        self._logout(self._connect())
 
-    async def poll(self, uidvalidity: str | None, last_uid: int, lookback_days: int) -> tuple[str, int, list[dict]]:
-        return await asyncio.to_thread(self._poll, uidvalidity, last_uid, lookback_days)
+    async def poll(self, uidvalidity: int | None, last_uid: int, lookback_days: int,
+                   want_body: Callable[[MailHeader], bool]) -> tuple[int, int, list[MailMessage]]:
+        try:
+            return await asyncio.to_thread(self._poll, uidvalidity, last_uid, lookback_days, want_body)
+        except Exception as exc:
+            raise RuntimeError(self._safe_error(exc)) from None
 
-    def _poll(self, uidvalidity, last_uid, lookback_days):
+    @staticmethod
+    def _fetch(connection, uid, query):
+        status, parts = connection.uid("fetch", str(uid), query)
+        if status != "OK":
+            raise RuntimeError(f"IMAP fetch failed for UID {uid}")
+        fetched = next((part for part in parts or [] if isinstance(part, tuple) and isinstance(part[1], bytes)), None)
+        if fetched is None:
+            raise RuntimeError(f"IMAP fetch omitted content for UID {uid}")
+        return fetched[0], BytesParser(policy=policy.default).parsebytes(fetched[1])
+
+    def _poll(self, uidvalidity, last_uid, lookback_days, want_body):
         connection = self._connect()
         try:
-            _, validity_data = connection.response("UIDVALIDITY")
-            if not validity_data or not validity_data[0]:
+            _, data = connection.response("UIDVALIDITY")
+            if not data or not data[0]:
                 raise RuntimeError("IMAP server did not provide UIDVALIDITY")
-            validity = validity_data[0].decode("ascii").strip()
+            validity = int(data[0])
             continuing = validity == uidvalidity and last_uid > 0
-            if continuing:
-                criteria = f"UID {last_uid + 1}:*"
-            else:
-                since = datetime.now(UTC) - timedelta(days=lookback_days)
-                criteria = f'SINCE {since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}'
+            since = datetime.now(UTC) - timedelta(days=lookback_days)
+            criteria = f"UID {last_uid + 1}:*" if continuing else f"SINCE {since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"
             status, data = connection.uid("search", None, criteria)
             if status != "OK":
                 raise RuntimeError("IMAP UID search failed")
             uids = sorted(int(uid) for uid in (data[0] or b"").split())
             if continuing:
-                # IMAP n:* can return the highest existing UID even when n is larger.
                 uids = [uid for uid in uids if uid > last_uid]
             highwater = last_uid if continuing else 0
             messages = []
+            authserv_ids = getattr(self.account, "authserv_ids", None)
+            if authserv_ids is None:
+                authserv_ids = PROVIDER_AUTHSERV_IDS.get(self.account.provider, ())
             for uid in uids:
-                status, parts = connection.uid("fetch", str(uid), "(BODY.PEEK[] INTERNALDATE)")
-                if status != "OK":
-                    raise RuntimeError(f"IMAP fetch failed for UID {uid}")
-                fetched = next((part for part in parts if isinstance(part, tuple)), None)
-                if fetched is None:
-                    raise RuntimeError(f"IMAP fetch omitted body for UID {uid}")
-                metadata, raw = fetched
-                message = BytesParser(policy=policy.default).parsebytes(raw)
-                occurred_at = self._date(message, metadata)
-                messages.append({
-                    "uid": uid, "sender": str(message.get("From", "")),
-                    "subject": str(message.get("Subject", "")),
-                    "body": self._body(message), "occurred_at": occurred_at,
-                })
+                item = MailMessage(uid)
+                try:
+                    metadata, header = self._fetch(connection, uid, _HEADER_QUERY)
+                    display, address = parseaddr(str(header.get("From", "")))
+                    message_id = str(header.get("Message-ID", "")).strip().strip("<>").strip().lower() or None
+                    item = MailMessage(uid, message_id, address.lower(), display, str(header.get("Subject", "")),
+                                       self._date(header, metadata), authentication_result(header, address, authserv_ids))
+                    if want_body(item):
+                        _, message = self._fetch(connection, uid, "(BODY.PEEK[])")
+                        item = replace(item, body=self._body(message))
+                except Exception as exc:
+                    item = replace(item, error=self._safe_error(exc))
+                messages.append(item)
                 highwater = uid
             return validity, highwater, messages
         finally:
             self._logout(connection)
 
     @staticmethod
-    def _date(message, metadata) -> datetime:
+    def _date(message, metadata) -> datetime | None:
         candidates = [str(message.get("Date", ""))]
         internal = re.search(rb'INTERNALDATE "([^"]+)"', metadata)
         if internal:
@@ -118,7 +156,7 @@ class IMAPClient:
                     return date.astimezone(UTC)
             except (TypeError, ValueError, OverflowError):
                 continue
-        raise ValueError("Mail has no valid timezone-aware Date or INTERNALDATE")
+        return None
 
     def _body(self, message) -> str:
         plain, html = [], []
@@ -144,4 +182,4 @@ class IMAPClient:
         return body.strip()[:self.max_body_chars]
 
     async def close(self) -> None:
-        """Connections are closed after each worker-thread operation."""
+        """Connections are closed after every operation."""

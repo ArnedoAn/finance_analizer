@@ -33,6 +33,7 @@ class InboxItem(Base):
     source: Mapped[str] = mapped_column(String(20), index=True)
     source_ref: Mapped[str] = mapped_column(String(512), unique=True)
     account_name: Mapped[str | None] = mapped_column(String(255))
+    message_id: Mapped[str | None] = mapped_column(String(512), index=True)
     app: Mapped[str | None] = mapped_column(String(255))
     sender: Mapped[str] = mapped_column(String(512), default="")
     subject_or_title: Mapped[str] = mapped_column(Text, default="")
@@ -46,6 +47,12 @@ class InboxItem(Base):
     category: Mapped[str | None] = mapped_column(String(255))
     asset_account: Mapped[str | None] = mapped_column(String(255))
     transaction_type: Mapped[str | None] = mapped_column(String(20))
+    destination_account: Mapped[str | None] = mapped_column(String(255))
+    original_kind: Mapped[str | None] = mapped_column(String(20))
+    template_id: Mapped[str | None] = mapped_column(String(255))
+    review_reason: Mapped[str | None] = mapped_column(Text)
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    claim_until: Mapped[datetime | None] = mapped_column(AwareDateTime())
     firefly_transaction_id: Mapped[str | None] = mapped_column(String(100))
     duplicate_of_id: Mapped[int | None] = mapped_column(ForeignKey("inbox_items.id"))
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -62,6 +69,7 @@ class MailAccountState(Base):
     last_uid: Mapped[int] = mapped_column(Integer, default=0)
     last_poll_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
     last_error: Mapped[str | None] = mapped_column(Text)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class KnownSender(Base):
@@ -70,4 +78,28 @@ class KnownSender(Base):
     keyword: Mapped[str] = mapped_column(String(255), unique=True)
     name: Mapped[str] = mapped_column(String(255), default="")
     source: Mapped[str] = mapped_column(String(30), default="manual")
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    require_auth: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class InboxEvent(Base):
+    __tablename__ = "inbox_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    inbox_id: Mapped[int] = mapped_column(ForeignKey("inbox_items.id"), index=True)
+    action: Mapped[str] = mapped_column(String(40))
+    detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+
+
+class CycleRun(Base):
+    __tablename__ = "cycle_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    finished_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    result: Mapped[str | None] = mapped_column(Text)
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    last_sent_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)

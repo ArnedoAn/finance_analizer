@@ -1,8 +1,9 @@
 """Durable inbox queries and atomic claims; callers own commits."""
+import json
 from datetime import timedelta
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import String, cast, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timezone import now_utc
@@ -28,18 +29,32 @@ class InboxRepository:
     async def by_ref(self, ref):
         return await self.session.scalar(select(InboxItem).where(InboxItem.source_ref == ref))
 
-    async def list(self, status=None, source=None, method=None, limit=50, offset=0):
-        query = select(InboxItem)
+    @staticmethod
+    def _filtered(query, status=None, source=None, method=None, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False):
         for key, value in (("status", status), ("source", source), ("method", method)):
             if value:
                 query = query.where(getattr(InboxItem, key) == value)
+        if since is not None:
+            query = query.where(InboxItem.occurred_at >= since)
+        if until is not None:
+            query = query.where(InboxItem.occurred_at <= until)
+        if review_reason:
+            query = query.where(InboxItem.review_reason.icontains(review_reason, autoescape=True))
+        if q:
+            query = query.where(or_(InboxItem.merchant.icontains(q, autoescape=True), InboxItem.description.icontains(q, autoescape=True)))
+        if tag:
+            # Portable JSON-array membership: match the quoted element in the serialized column.
+            query = query.where(cast(InboxItem.tags, String).contains(json.dumps(tag), autoescape=True))
+        if unparsed:
+            query = query.where(InboxItem.status.in_(["needs_review", "failed"]), or_(InboxItem.amount.is_(None), InboxItem.merchant.is_(None), InboxItem.merchant == ""))
+        return query
+
+    async def list(self, status=None, source=None, method=None, limit=50, offset=0, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False):
+        query = self._filtered(select(InboxItem), status, source, method, since, until, review_reason, q, tag, unparsed)
         return list((await self.session.scalars(query.order_by(InboxItem.id.desc()).offset(offset).limit(limit))).all())
 
-    async def count(self, status=None, source=None, method=None):
-        query = select(func.count()).select_from(InboxItem)
-        for key, value in (("status", status), ("source", source), ("method", method)):
-            if value:
-                query = query.where(getattr(InboxItem, key) == value)
+    async def count(self, status=None, source=None, method=None, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False):
+        query = self._filtered(select(func.count()).select_from(InboxItem), status, source, method, since, until, review_reason, q, tag, unparsed)
         return await self.session.scalar(query)
 
     async def due(self):

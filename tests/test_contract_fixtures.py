@@ -23,6 +23,8 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.api.routers import system, widgets
 from app.core.config import MailAccount
 from app.db.models import MailAccountState
@@ -318,6 +320,7 @@ async def seed_alerts(db, ids):
 # --- The test --------------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not DART_API.is_file(), reason="needs the finan monorepo: app/ is absent in the standalone analyzer repo")
 async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, service, db, clients, settings, monkeypatch, tmp_path):
     started = datetime.now(UTC)
     firefly, llm = clients

@@ -98,9 +98,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # v4: never deploy on push. Secrets (FIELD_ENCRYPTION_KEY_FILE, ...) must exist on the
+  # server first, and the owner's server AI deploys following docs/DEPLOY.md. Manual only.
   deploy:
     needs: build-and-push
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     permissions: {}
     runs-on: ubuntu-latest
     steps:

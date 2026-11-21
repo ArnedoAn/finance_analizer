@@ -268,7 +268,7 @@ async def test_emit_takes_advisory_lock_first_only_on_postgres(db, monkeypatch):
         return await real_execute(statement, *args, **kwargs)
 
     monkeypatch.setattr(db, "execute", spy)
-    assert alerting._is_postgres(db) is False
+    monkeypatch.setattr(alerting, "_is_postgres", lambda session: False)  # same check on SQLite and Postgres runs
     assert await alerting.emit(db, "system_failure", title="t", body="b", dedupe_key="sqlite-1")
     assert not any(isinstance(entry, dict) for entry in statements)
 

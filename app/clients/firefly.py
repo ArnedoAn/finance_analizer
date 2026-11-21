@@ -1,5 +1,7 @@
 """Single-owner Firefly JSON:API client; retries belong to the durable inbox."""
 
+from decimal import Decimal, InvalidOperation
+
 import httpx
 
 from app.core.config import get_settings
@@ -99,6 +101,42 @@ class FireflyClient:
             "GET", "insight/expense/category",
             params={"start": start.isoformat(), "end": end.isoformat()},
         )
+
+    @staticmethod
+    def _decimal(value) -> Decimal:
+        """Firefly sends money as strings, numbers or ``[{"sum": "-12.00"}]`` lists; spending is negative."""
+        if isinstance(value, list):
+            return sum((FireflyClient._decimal(row.get("sum") if isinstance(row, dict) else row) for row in value), Decimal(0))
+        try:
+            return abs(Decimal(str(value))) if value not in (None, "") else Decimal(0)
+        except InvalidOperation:
+            return Decimal(0)
+
+    async def budget_progress(self, start, end) -> list[dict]:
+        """Active budgets with a limit in the period: ``[{name, spent, limit}]`` (COP, two decimals)."""
+        params = {"start": start.isoformat(), "end": end.isoformat()}
+        insight = None
+        rows = []
+        for budget in await self._list("budgets"):
+            attrs = budget.get("attributes", {})
+            if attrs.get("active") is False:
+                continue
+            limits = (await self._request("GET", f"budgets/{budget['id']}/limits", params=params)).get("data", [])
+            limits = [row.get("attributes", {}) for row in limits]
+            limits = [row for row in limits if row.get("currency_code") in (None, "", "COP")]
+            limit = sum((self._decimal(row.get("amount")) for row in limits), Decimal(0))
+            if limit <= 0:
+                continue
+            if any("spent" in row for row in limits):
+                spent = sum((self._decimal(row.get("spent")) for row in limits), Decimal(0))
+            else:
+                if insight is None:
+                    result = await self._request("GET", "insight/expense/budget", params=params)
+                    insight = result if isinstance(result, list) else result.get("data", [])
+                spent = sum((self._decimal(row.get("difference")) for row in insight
+                             if str(row.get("id")) == str(budget["id"]) and row.get("currency_code") in (None, "", "COP")), Decimal(0))
+            rows.append({"name": attrs.get("name", str(budget["id"])), "spent": spent.quantize(Decimal("0.01")), "limit": limit.quantize(Decimal("0.01"))})
+        return rows
 
     async def list_auto_transactions(self) -> list[dict]:
         return await self._list("search/transactions", query='tag_is:"auto"')

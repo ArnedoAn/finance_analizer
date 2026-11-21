@@ -53,7 +53,7 @@ async def test_forecast_without_subscriptions(client, db):
     assert response.json() == {
         "month": "2026-11", "as_of": "2026-11-10", "currency": "COP",
         "income": "1000000.00", "spent": "150000.00", "balance": "850000.00",
-        "projected_spent": "450000.00", "projected_balance": "550000.00",
+        "projected_spent": "450000.00", "projected_balance": "550000.00", "projected_fixed": "0.00",
         "days_elapsed": 10, "days_left": 20, "daily_available": "42500.00", "spent_today": "50000.00",
     }
 
@@ -74,6 +74,7 @@ async def test_forecast_with_subscriptions(client, db):
     assert body["projected_balance"] == "1545000.00"
     assert body["daily_available"] == "89250.00"  # (2,000k - 15k - 200k) / 20
     assert body["spent_today"] == "0.00"
+    assert body["projected_fixed"] == "15000.00"  # only Netflix is still to come; the gym already charged
 
 
 async def test_forecast_tag_filter(client, db):

@@ -198,6 +198,7 @@ async def forecast(session, settings, day: date | None = None, tag: str | None =
         "month": f"{day.year:04d}-{day.month:02d}", "as_of": day.isoformat(), "currency": "COP",
         "income": _money(income), "spent": _money(spent), "balance": _money(income - spent),
         "projected_spent": _money(projected_spent), "projected_balance": _money(income - projected_spent),
+        "projected_fixed": _money(projected_fixed),
         "days_elapsed": days_elapsed, "days_left": days_left,
         # On the last day nothing is left to divide over, so the remainder is today's allowance.
         "daily_available": _money(max(ZERO, income - projected_fixed - spent) / max(days_left, 1)),

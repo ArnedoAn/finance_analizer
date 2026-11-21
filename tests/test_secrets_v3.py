@@ -3,7 +3,7 @@ import pytest
 from app.core.secrets import read_secret
 
 
-@pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY", "FIREFLY_API_TOKEN", "LLM_API_KEY", "LLM_FALLBACK_API_KEY", "MAIL_ACCOUNTS", "NOTIFY_API_KEY", "OWN_ACCOUNTS", "DATABASE_URL"])
+@pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY", "FIREFLY_API_TOKEN", "LLM_API_KEY", "LLM_FALLBACK_API_KEY", "MAIL_ACCOUNTS", "OWN_ACCOUNTS", "DATABASE_URL"])
 def test_secret_file_precedence_and_newline(name, monkeypatch, tmp_path):
     path = tmp_path / "secret"
     path.write_text(" secret value \r\n", encoding="utf-8")
@@ -45,7 +45,7 @@ def compose_env(monkeypatch):
         "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
         "FIREFLY_API_TOKEN": "direct-firefly-token", "LLM_API_KEY": "direct-llm-token",
         "LLM_FALLBACK_API_KEY": "", "MAIL_ACCOUNTS": "", "OWN_ACCOUNTS": "",
-        "NOTIFY_API_KEY": "direct-notify-token", "SCHEDULER_ENABLED": "false", "APP_ENV": "production",
+        "SCHEDULER_ENABLED": "false", "APP_ENV": "production",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -57,7 +57,7 @@ def test_compose_direct_values_with_empty_file_variables(compose_env):
     from app.core.config import Settings
 
     config = Settings(_env_file=None)
-    for name in ("FINANCE_API_KEY", "PHONE_API_KEY", "FIREFLY_API_TOKEN", "LLM_API_KEY", "NOTIFY_API_KEY"):
+    for name in ("FINANCE_API_KEY", "PHONE_API_KEY", "FIREFLY_API_TOKEN", "LLM_API_KEY"):
         assert getattr(config, name.lower()).get_secret_value() == compose_env[name]
     assert config.database_url == compose_env["DATABASE_URL"]
     assert config.mail_accounts == config.own_accounts == []

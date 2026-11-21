@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
-from app.core.config import OwnAccount
+from app.core.config import OwnAccount, Settings
 from app.core.exceptions import PermanentError
 from app.db.models import InboxItem
 from app.models.schemas import ManualTransaction, WebhookPayload
@@ -265,46 +265,31 @@ async def test_email_message_id_deduplicates_across_imap_accounts(service, monke
         assert state.last_uid == 1 and str(state.uidvalidity) == "42"
 
 
-async def test_notification_throttle_is_persistent_and_key_scoped(db, settings, monkeypatch):
-    import httpx
-    from pydantic import SecretStr
+async def test_alert_throttle_is_persistent_and_key_scoped(db):
+    from sqlalchemy import update
 
     from app.db.models import Notification
-    from app.services.notifications import Notifier
+    from app.services.alerts import emit
 
-    settings.notify_url = "https://notify.invalid/notify"
-    settings.notify_api_key = SecretStr("notify-test-key")
-    post = AsyncMock(return_value=httpx.Response(200, request=httpx.Request("POST", settings.notify_url)))
-    monkeypatch.setattr(httpx.AsyncClient, "post", post)
-    assert await Notifier(db, settings).send("failed:1", "x" * 5000, silent=True)
-    # A new instance must honor the DB throttle, not an in-memory cache.
-    assert not await Notifier(db, settings).send("failed:1", "again")
-    assert await Notifier(db, settings).send("failed:2", "separate alert")
-    assert post.await_count == 2
-    payload = post.call_args_list[0].kwargs
-    assert payload["headers"] == {"x-api-key": "notify-test-key"}
-    assert payload["json"] == {"message": "x" * 4000, "silent": True}
-    record = await db.get(Notification, "failed:1")
-    record.last_sent_at = datetime.now(UTC) - timedelta(hours=6, seconds=1)
-    await db.commit()
-    assert await Notifier(db, settings).send("failed:1", "after six hours")
+    async def send(key):
+        return await emit(db, "system_failure", title="Falla", body="Detalle", dedupe_key=key, min_interval_minutes=360)
+
+    assert await send("failed:1")
+    # The throttle lives in the database, not in memory, and is scoped by key.
+    assert await send("failed:1") is None
+    assert await send("failed:2")
+    await db.execute(update(Notification).where(Notification.key == "alert:failed:1").values(last_sent_at=datetime.now(UTC) - timedelta(hours=6, seconds=1)))
+    assert await send("failed:1")
 
 
-async def test_batch_notification_uses_fifteen_minute_throttle(service, monkeypatch):
-    send = AsyncMock(return_value=True)
-    monkeypatch.setattr(service.notifier, "send", send)
-    await service.notify_batch({"created": 1, "needs_review": 2})
-    assert send.call_args.args[0] == "batch"
-    assert send.call_args.args[2] == 15
+async def test_failed_outage_emits_system_failure_alert(service, clients):
+    from app.db.models_alerts import Alert
 
-
-async def test_failed_outage_sends_immediate_alert(service, clients, monkeypatch):
-    send = AsyncMock(return_value=True)
-    monkeypatch.setattr(service.notifier, "send", send)
     clients[0].create_transaction.side_effect = OSError("offline")
     row = await service.process(await item(service, created_at=datetime.now(UTC) - timedelta(hours=73)))
     assert row.status == "failed"
-    assert send.call_args.args[0] == f"failed:{row.id}"
+    alert = await service.session.scalar(select(Alert).where(Alert.type == "system_failure"))
+    assert alert.item_id == row.id and alert.dedupe_key == f"failed:{row.id}"
 
 
 async def test_ambiguous_transfer_requires_review(service, clients, extraction, monkeypatch):
@@ -385,9 +370,17 @@ async def test_llm_threshold_never_overrides_verification(service, clients, monk
     clients[0].create_transaction.assert_not_awaited()
 
 
+async def test_sms_default_requires_review(service, clients):
+    assert Settings.model_fields["sms_auto_approve_max_cop"].default == Decimal("0")
+    service.settings.sms_auto_approve_max_cop = Decimal("0")
+    row = await service.process(await item(service, source="sms"))
+    assert row.status == "needs_review" and "SMS extraction requires human review" in row.review_reason
+    clients[0].create_transaction.assert_not_awaited()
+
+
 @pytest.mark.parametrize("amount,expected", [("2000000", "created"), ("2000001", "needs_review")])
-async def test_sms_parser_default_two_million_limit(service, clients, extraction, monkeypatch, amount, expected):
-    assert service.settings.sms_auto_approve_max_cop == Decimal("2000000")
+async def test_sms_parser_limit_when_raised(service, clients, extraction, monkeypatch, amount, expected):
+    service.settings.sms_auto_approve_max_cop = Decimal("2000000")
     monkeypatch.setattr(pipeline, "parse", lambda *args: replace(extraction, amount=Decimal(amount)))
     row = await service.process(await item(service, source="sms"))
     assert row.method == "parser" and row.status == expected
@@ -438,8 +431,6 @@ async def test_mail_auth_failure_and_sensitive_code_privacy(service, clients, mo
     imap = AsyncMock()
     imap.poll.return_value = (42, 1, [message])
     monkeypatch.setattr(pipeline, "IMAPClient", lambda account: imap)
-    send = AsyncMock(return_value=True)
-    monkeypatch.setattr(service.notifier, "send", send)
     await service.poll_mail()
     row = await service.inbox.by_ref("mail:primary:42:1")
     assert row.raw_text is None
@@ -447,8 +438,10 @@ async def test_mail_auth_failure_and_sensitive_code_privacy(service, clients, mo
         assert row.status == "ignored" and row.subject_or_title == ""
     else:
         assert row.status == "needs_review" and row.review_reason
-        send.assert_awaited()
-        assert "123456" not in str(send.call_args)
+        from app.db.models_alerts import Alert
+        alert = await service.session.scalar(select(Alert))
+        assert alert.type == "pending_review" and alert.item_id == row.id
+        assert "123456" not in alert.title + alert.body
     clients[1].analyze.assert_not_awaited()
     clients[0].create_transaction.assert_not_awaited()
 

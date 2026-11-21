@@ -40,7 +40,8 @@ class OwnAccount(BaseModel):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False, enable_decoding=False, hide_input_in_errors=True)
     finance_api_key: SecretStr = Field(min_length=32)
-    phone_api_key: SecretStr = Field(min_length=32)
+    # Legacy shared ingest key; optional. When set it is adopted as the `phone-legacy` device (see app.api.dependencies).
+    phone_api_key: SecretStr | None = None
     app_name: str = "finance-analyzer"
     app_env: str = "development"
     debug: bool = False
@@ -61,12 +62,15 @@ class Settings(BaseSettings):
     max_amount_cop: Decimal = Decimal("50000000")
     review_amount_cop: Decimal = Decimal("2000000")
     llm_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
-    sms_auto_approve_max_cop: Decimal = Field(default=Decimal("2000000"), ge=0)
+    # v4: 0 = every SMS goes to human review (SMS sender IDs are spoofable); raise only deliberately.
+    sms_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
     fail_after_hours: int = Field(default=72, gt=0)
     transfer_pair_window_minutes: int = Field(default=30, ge=0)
     raw_text_retention_days: int = Field(default=30, ge=1)
-    notify_url: str = ""
-    notify_api_key: SecretStr = SecretStr("")
+    # v4 Phase 2: base64 32-byte AES-GCM master key, normally via FIELD_ENCRYPTION_KEY_FILE.
+    field_encryption_key: SecretStr = SecretStr("")
+    # v4 Phase 5: JSON status written atomically by infra/backup/backup.sh.
+    backup_status_file: str = "/var/lib/finance/backup-status.json"
     notify_min_interval_minutes: int = Field(default=15, ge=0)
     phone_silence_hours: int = Field(default=24, gt=0)
     digest_cron: str = "0 8 * * *"
@@ -92,7 +96,7 @@ class Settings(BaseSettings):
         from app.core.secrets import read_secret
 
         values = dict(values)
-        for name in ("FINANCE_API_KEY", "PHONE_API_KEY", "DATABASE_URL", "FIREFLY_API_TOKEN", "LLM_API_KEY", "LLM_FALLBACK_API_KEY", "MAIL_ACCOUNTS", "NOTIFY_API_KEY", "OWN_ACCOUNTS"):
+        for name in ("FINANCE_API_KEY", "PHONE_API_KEY", "DATABASE_URL", "FIREFLY_API_TOKEN", "LLM_API_KEY", "LLM_FALLBACK_API_KEY", "MAIL_ACCOUNTS", "OWN_ACCOUNTS", "FIELD_ENCRYPTION_KEY"):
             if name.lower() in values and not os.environ.get(name + "_FILE"):
                 continue
             value = read_secret(name)
@@ -106,11 +110,25 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def unique_mail_names(self):
-        if self.finance_api_key.get_secret_value() == self.phone_api_key.get_secret_value():
+        phone = self.phone_api_key.get_secret_value() if self.phone_api_key is not None else None
+        if phone is not None and len(phone) < 32:
+            raise ValueError("PHONE_API_KEY must be at least 32 characters")
+        if phone is not None and self.finance_api_key.get_secret_value() == phone:
             raise ValueError("FINANCE_API_KEY and PHONE_API_KEY must be distinct")
         names = [account.name for account in self.mail_accounts]
         if len(names) != len(set(names)):
             raise ValueError("MAIL_ACCOUNTS names must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def check_field_encryption_key(self):
+        from app.security.crypto import parse_key
+
+        key = self.field_encryption_key.get_secret_value()
+        if key:
+            parse_key(key)
+        elif self.app_env == "production":
+            raise ValueError("FIELD_ENCRYPTION_KEY or FIELD_ENCRYPTION_KEY_FILE is required in production")
         return self
 
     @property

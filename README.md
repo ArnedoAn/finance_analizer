@@ -15,7 +15,7 @@ uv run --frozen alembic upgrade head
 uv run --frozen uvicorn app.main:app --reload
 ```
 
-`FINANCE_API_KEY` y `PHONE_API_KEY` son obligatorias, distintas y de **al menos 32 caracteres cada una**. Genere dos secretos aleatorios independientes (por ejemplo, `openssl rand -hex 32` dos veces), nunca use los placeholders de los ejemplos. Configure `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN`, las cuentas propias y LLM. `uv.lock` fija dependencias de desarrollo y producción; actualícelo deliberadamente con `uv lock` cuando cambie `pyproject.toml`. No publique `.env`, cuerpos financieros, DB ni tokens.
+`FINANCE_API_KEY` (≥32 caracteres) es obligatoria. `PHONE_API_KEY` es opcional y transitoria (≥32 caracteres y distinta de la clave admin): su primer uso válido la migra al dispositivo de ingesta `phone-legacy`; después se retira revocando ese dispositivo y quitando la variable. Genere secretos aleatorios independientes (por ejemplo, `openssl rand -hex 32`), nunca use los placeholders de los ejemplos. Configure `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN`, las cuentas propias y LLM. `uv.lock` fija dependencias de desarrollo y producción; actualícelo deliberadamente con `uv lock` cuando cambie `pyproject.toml`. No publique `.env`, cuerpos financieros, DB ni tokens.
 
 ## Configuración
 
@@ -24,7 +24,7 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 | Variable | Uso / valor predeterminado |
 |---|---|
 | `FINANCE_API_KEY` | Secreto administrativo obligatorio, ≥32 caracteres; header `X-API-Key`; no guardarlo en el teléfono |
-| `PHONE_API_KEY` | Secreto independiente obligatorio, ≥32 caracteres; solo ingesta `/notifications/webhook` y prueba `/auth/check` |
+| `PHONE_API_KEY` | Opcional y transitoria, ≥32 caracteres; se migra al dispositivo `phone-legacy` (solo ingesta `/notifications/webhook` y prueba `/auth/check`) |
 | `APP_ENV`, `EXPOSE_DOCS` | development, false; en production OpenAPI y `/docs` deshabilitados salvo opt-in |
 | `DATABASE_URL`, `DATABASE_URL_FILE` | `sqlite+aiosqlite:///./data/finance_v3.db`; PostgreSQL usa `postgresql+asyncpg://`; `_FILE` evita exponer la contraseña en el entorno |
 | `TIMEZONE` | America/Bogota |
@@ -41,13 +41,13 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 | `DEDUP_WINDOW_MINUTES`, `TRANSFER_PAIR_WINDOW_MINUTES` | 60, 30 |
 | `MAX_AMOUNT_COP`, `REVIEW_AMOUNT_COP` | 50000000, 2000000 |
 | `LLM_AUTO_APPROVE_MAX_COP` | 0: toda extracción LLM requiere revisión humana; elevarlo es un opt-in de riesgo |
-| `SMS_AUTO_APPROVE_MAX_COP` | 2000000; 0 exige revisión de todos los SMS, además de las demás reglas |
+| `SMS_AUTO_APPROVE_MAX_COP` | 0 (todo SMS va a revisión); un valor mayor permite contabilizar automáticamente SMS hasta ese monto si pasan las demás reglas |
 | `FAIL_AFTER_HOURS` | 72 horas para fallos transitorios automáticos |
-| `RAW_TEXT_RETENTION_DAYS` | 30 para ignored/rejected/duplicate; 180 para el resto |
+| `RAW_TEXT_RETENTION_DAYS` | 30 para todos los estados; el texto crudo se guarda cifrado (AES-GCM) mientras tanto |
 | `SCHEDULER_ENABLED`, `CYCLE_CRON` | true, `0 * * * *` |
 | `SENDER_LEARNING_CRON` | `0 3 1,15 * *` |
 | `RECONCILE_CRON` | `0 4 * * *`, conciliación diaria con Firefly |
-| `NOTIFY_URL`, `NOTIFY_API_KEY` | Bot `POST /notify` y secreto compartido |
+| `FIELD_ENCRYPTION_KEY_FILE`, `BACKUP_STATUS_FILE` | Clave maestra de cifrado de campos (archivo montado) y JSON de estado del respaldo |
 | `NOTIFY_MIN_INTERVAL_MINUTES`, `PHONE_SILENCE_HOURS` | 15, 24 |
 | `DIGEST_CRON` | `0 8 * * *`, resumen del día anterior |
 | `WEEKLY_DIGEST_CRON` | `0 8 * * 1`, resumen semanal los lunes |
@@ -66,21 +66,23 @@ IMAP usa usuario/contraseña de aplicación (`gmail`, `yahoo`, `icloud`, `custom
 
 Se leen primero cabeceras con BODY.PEEK y cuerpo solo si corresponde. Se persisten UIDVALIDITY, UID, errores y fallos consecutivos; un mensaje roto no bloquea los siguientes. Aprender remitentes solo propone reglas `pending_approval`; aprobarlas exige revisión humana. Tras la migración v2 todas las reglas antiguas quedan pendientes, incluso las semillas: revisarlas y aprobarlas antes de reactivar el scheduler.
 
-**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con `OWN_ACCOUNTS.sources` no es prueba criptográfica. El límite `SMS_AUTO_APPROVE_MAX_COP=2000000` permite contabilización automática solo si pasan también las demás comprobaciones. Use `0` para exigir revisión de todos los SMS. Por defecto `LLM_AUTO_APPROVE_MAX_COP=0`: incluso una extracción coherente con el texto queda para revisión humana; subir el límite acepta el riesgo de texto malicioso o saldos confundidos con gastos.
+**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con `OWN_ACCOUNTS.sources` no es prueba criptográfica. Por defecto `SMS_AUTO_APPROVE_MAX_COP=0`: todo SMS queda para revisión; subirlo permite contabilización automática hasta ese monto solo si pasan también las demás comprobaciones. Por defecto `LLM_AUTO_APPROVE_MAX_COP=0`: incluso una extracción coherente con el texto queda para revisión humana; subir el límite acepta el riesgo de texto malicioso o saldos confundidos con gastos.
 
 ### Secretos por archivo
 
-`FINANCE_API_KEY`, `PHONE_API_KEY`, `DATABASE_URL`, `FIREFLY_API_TOKEN`, `LLM_API_KEY`, `LLM_FALLBACK_API_KEY`, `MAIL_ACCOUNTS`, `NOTIFY_API_KEY` y `OWN_ACCOUNTS` soportan `<VAR>_FILE`. Monte archivos read-only, elimine el valor directo correspondiente y configure la ruta **dentro** del contenedor (por ejemplo, `PHONE_API_KEY_FILE=/run/secrets/phone_api_key`, `DATABASE_URL_FILE=/run/secrets/database_url`). Los archivos de cuentas contienen JSON; el de DB contiene la URL completa. Use Compose secrets o mounts en un override local de despliegue; no incluya secretos en la imagen, Git ni argumentos de build. El ejemplo Compose lee `.env`; las rutas del host no son rutas del contenedor.
+`FINANCE_API_KEY`, `PHONE_API_KEY`, `DATABASE_URL`, `FIREFLY_API_TOKEN`, `LLM_API_KEY`, `LLM_FALLBACK_API_KEY`, `MAIL_ACCOUNTS`, `OWN_ACCOUNTS` y `FIELD_ENCRYPTION_KEY` soportan `<VAR>_FILE`. Monte archivos read-only, elimine el valor directo correspondiente y configure la ruta **dentro** del contenedor (por ejemplo, `PHONE_API_KEY_FILE=/run/secrets/phone_api_key`, `DATABASE_URL_FILE=/run/secrets/database_url`). Los archivos de cuentas contienen JSON; el de DB contiene la URL completa. Use Compose secrets o mounts en un override local de despliegue; no incluya secretos en la imagen, Git ni argumentos de build. El ejemplo Compose lee `.env`; las rutas del host no son rutas del contenedor.
 
 ## API `/api/v1`
 
-Todas las rutas requieren `X-API-Key` salvo `/health/live` y `/health/ready`. Use `PHONE_API_KEY` en Message Mirror para ingesta y `/auth/check`; esa clave no permite leer el inbox ni administrar cuentas o transacciones. Los consumidores administrativos usan `FINANCE_API_KEY`. Tras 10 fallos 401/min por IP se limita el tráfico con claves inválidas; una clave válida no debe quedar bloqueada por esos fallos. No envíe headers de usuario/sesión/Telegram. OpenAPI solo se expone en producción con `EXPOSE_DOCS=true`.
+Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready` y `POST /devices/enroll`. La app usa claves por dispositivo (alcances `ingest`, `read`, `review`; `admin` implica todo); una clave `ingest` solo permite `/notifications/webhook` y `/auth/check`. `PHONE_API_KEY` es opcional y transitoria (se adopta como dispositivo `phone-legacy`). Los consumidores administrativos usan `FINANCE_API_KEY`. Tras 10 fallos 401/min por IP se limita el tráfico con claves inválidas; una clave válida no debe quedar bloqueada por esos fallos. No envíe headers de usuario/sesión. OpenAPI solo se expone en producción con `EXPOSE_DOCS=true`.
 
 | Método | Ruta | Función |
 |---|---|---|
 | GET | `/auth/check` | `{ok:true}`, probar conexión sin efectos |
 | GET | `/health/live`, `/health/ready`, `/health` | Probes públicos live/ready; diagnóstico autenticado |
 | POST | `/notifications/webhook` | Persistir evento; procesar en background |
+| GET | `/alerts?after_id=&limit=&include_acked=` | Avisos para la app (`read`): `{items,last_id}` en orden ascendente por `id` |
+| POST | `/alerts/{id}/ack` | Marca el aviso como visto (`read`) |
 | POST | `/transactions/manual` | Registro idempotente con `client_ref` obligatorio |
 | GET | `/inbox?status=&source=&method=&limit=&offset=` | `{items,total}`, sin cuerpo |
 | GET | `/inbox/{id}` | Detalle sin texto crudo por defecto; `?include_raw=true` es opt-in explícito para raw_text |
@@ -138,9 +140,9 @@ El texto financiero original no aparece en respuestas de detalle por defecto. Us
 3. `submitting` se confirma antes del POST. Cada intento consulta `external_id=fa:<source_ref>` y adopta el ID existente antes de crear: una respuesta perdida no implica otro gasto. PostgreSQL usa claim por fila y líder de scheduler con advisory lock; SQLite serializa claims. No se mantiene lock global durante red.
 4. Dedup entre canales distintos usa cuenta propia, monto, moneda y kind en ±60 min; compras iguales del mismo canal no se fusionan. Email también usa Message-ID normalizado entre buzones. Manual↔automático dudoso va a revisión. Las dos patas de una transferencia propia se emparejan en 30 min.
 5. Errores permanentes (validación/cuenta/datos) van a revisión con motivo. Transitorios tienen backoff y solo pasan a failed tras 72 h, con alerta. Conciliación busca creados borrados y transacciones auto sin item.
-6. Notificaciones al bot `POST /notify`, `x-api-key`, `{message,silent}`: resumen de carga agrupado, alertas throttled por clave, digest diario 08:00 y semanal lunes. Se alerta por fallos, pendientes >2 h, IMAP ≥3 fallos, cuenta inexistente, silencio del teléfono y diferencias de conciliación. Configure ambos extremos; no basta con tener el bot desplegado.
+6. Avisos sin bot: el analizador inserta filas en la tabla `alerts` y la app las consulta con `GET /alerts` (`after_id`) y las muestra como notificaciones locales; no hay `POST /notify` ni servicio externo. Tipos: `pending_review` (con categorías sugeridas), `question`, `big_amount`, `duplicate_suspect`, `system_failure` (fallos, pendientes >2 h, IMAP ≥3 fallos, cuenta inexistente, conciliación), `phone_silence`, `digest_daily`, `digest_weekly`, `month_close`, `budget_80`, `budget_100`, `key_expiring`, `backup_failed`, más los de anomalías y suscripciones. `NOTIFY_MIN_INTERVAL_MINUTES` es el anti-ruido por tipo/clave de deduplicación.
 
-**Privacidad de Telegram:** los bots no ofrecen cifrado de extremo a extremo. Los resúmenes (montos, cuentas y comercios) atraviesan y se almacenan en infraestructura de Telegram; no envíe cuerpos crudos, OTP ni credenciales. Configure `NOTIFY_URL` por HTTPS o una red privada controlada y mantenga `NOTIFY_API_KEY` independiente de las claves de la API.
+**Privacidad de los avisos:** los títulos y cuerpos incluyen montos y comercios pero nunca texto crudo, OTP ni credenciales; solo los lee un dispositivo con alcance `read`.
 
 ## Migraciones y despliegue
 

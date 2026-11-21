@@ -10,19 +10,23 @@ from uuid import uuid4
 from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.clients.imap import IMAPClient
 from app.clients.llm import verify_llm
 from app.core.config import get_settings
 from app.core.exceptions import PermanentError
+from app.core.logging import get_logger
 from app.db.models import CycleRun, InboxEvent, InboxItem
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
 from app.parsers import normalize_merchant, parse
 from app.security import is_sensitive_code
 from app.security.sender_trust import evaluate_email
-from app.services.notifications import Notifier
+from app.services import alerts as alerting
+from app.services import audit, flags, rules
+
+logger = get_logger(__name__)
 
 _ECONOMIC_LOCKS = WeakValueDictionary()
 
@@ -45,7 +49,6 @@ class Processor:
         self.inbox = InboxRepository(session)
         self.senders = KnownSenderRepository(session)
         self.mail_states = MailStateRepository(session)
-        self.notifier = Notifier(session, self.settings)
         self._accounts = self._categories = None
 
     async def sync(self, force=False):
@@ -54,7 +57,8 @@ class Processor:
             self._categories = await self.firefly.categories()
         missing = [a.firefly_account for a in self.settings.own_accounts if not any(x["name"].casefold() == a.firefly_account.casefold() and x["type"] in {"asset", "liability", "liabilities"} for x in self._accounts)]
         for name in missing:
-            await self.notifier.send("missing-account:" + name, "Cuenta propia inexistente en Firefly: " + name)
+            if await alerting.emit(self.session, "system_failure", title="Cuenta propia inexistente en Firefly", body=f"La cuenta «{name}» configurada en OWN_ACCOUNTS no existe en Firefly.", dedupe_key="missing-account:" + name, min_interval_minutes=360):
+                await self.session.commit()
         return {"accounts": len(self._accounts), "categories": len(self._categories), "missing_accounts": missing}
 
     async def accounts(self):
@@ -159,8 +163,8 @@ class Processor:
                     status = "ignored" if sensitive else "needs_review" if auth_failed or message.error else "duplicate" if duplicate else "pending" if trusted else "ignored"
                     reason = "sensitive_code" if sensitive else "sender_auth_failed" if auth_failed else message.error
                     item, inserted = await self._insert(ref, source="email", account_name=account.name, message_id=message.message_id, sender=message.from_address, subject_or_title="" if sensitive else message.subject, raw_text=None if sensitive or auth_failed else (message.body or message.subject or "")[:4000], occurred_at=message.occurred_at or _now(), status=status, review_reason=reason, duplicate_of_id=duplicate.id if duplicate else None, template_id="ignore.sensitive_code" if sensitive else None)
-                    if inserted and auth_failed and not sensitive:
-                        await self.notifier.send("sender-auth:" + message.from_address.rsplit("@", 1)[-1], "Correo bancario requiere revisión por autenticación del remitente; buzón " + account.name)
+                    if inserted:
+                        await self._announce(item, None)
                     if not inserted and auth_failed and not sensitive and item.status in {"ignored", "pending", "needs_review"}:
                         item.status, item.review_reason, item.raw_text = "needs_review", "sender_auth_failed", None
                     if since and not inserted and trusted and not sensitive and item.status == "ignored":
@@ -176,7 +180,8 @@ class Processor:
             state.last_poll_at = _now()
             await self.session.commit()
             if state.consecutive_failures >= 3:
-                await self.notifier.send("mail:" + account.name, "Buzón con fallos consecutivos: " + account.name)
+                if await alerting.emit(self.session, "system_failure", title="Buzón de correo con fallos", body=f"No se pudo consultar el buzón «{account.name}» en {state.consecutive_failures} intentos seguidos. Revisa sus credenciales y la conexión.", dedupe_key="mail:" + account.name, min_interval_minutes=360):
+                    await self.session.commit()
         return result
 
     async def _merchant(self, merchant, kind):
@@ -279,6 +284,8 @@ class Processor:
             reasons.append("amount absent, invalid, or over review threshold")
         if not item.merchant or normalize_merchant(item.merchant) != item.merchant or "$" in item.merchant or len(item.merchant) > 60:
             reasons.append("merchant is not clean")
+        await rules.apply(self.session, item)
+        reasons.extend(await flags.policy_reasons(self.session, item))
         if reasons:
             item.status, item.review_reason = "needs_review", "; ".join(dict.fromkeys(reasons))
 
@@ -287,7 +294,8 @@ class Processor:
         kind = item.transaction_type
         other = await self._asset(item.destination_account) if kind == "transfer" else await self._merchant(item.merchant, kind)
         source, destination = (other, asset) if kind in {"deposit", "refund"} else (asset, other)
-        split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str(item.amount.quantize(Decimal("0.01"))), "currency_code": item.currency, "description": item.subject_or_title or item.merchant, "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref, "tags": ["manual"] if item.source == "manual" else ["auto", item.source]}
+        automatic = ["manual"] if item.source == "manual" else ["auto", item.source]
+        split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str(item.amount.quantize(Decimal("0.01"))), "currency_code": item.currency, "description": item.description or item.subject_or_title or item.merchant, "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref, "tags": automatic + [tag for tag in item.tags or [] if tag not in automatic]}
         if item.category:
             split["category_name"] = item.category
         return {"apply_rules": True, "error_if_duplicate_hash": True, "transactions": [split]}
@@ -376,9 +384,17 @@ class Processor:
         item.claim_token = item.claim_until = None
         self.session.add(InboxEvent(inbox_id=item.id, action=item.status, detail=item.review_reason or item.last_error))
         await self.session.commit()
-        if item.status == "failed" and old_status != "failed":
-            await self.notifier.send("failed:" + str(item.id), f"Transacción fallida #{item.id}; requiere atención")
+        await self._announce(item, old_status)
         return item
+
+    async def _announce(self, item, old_status):
+        """Item alerts are best-effort: a failure here must never fail the finance operation."""
+        try:
+            async with self.session.begin_nested():
+                await alerting.item_event(self.session, self.settings, item, old_status)
+            await self.session.commit()
+        except Exception as exc:
+            logger.error("item_alert_failed", inbox_id=item.id, error_type=type(exc).__name__)
 
     async def cycle(self, dry_run=False):
         poll = {"skipped": True} if dry_run else await self.poll_mail()
@@ -401,33 +417,56 @@ class Processor:
             await self._purge()
             await self.session.commit()
             await self.alerts()
-            if counts:
-                await self.notify_batch(counts)
         return result
 
-    async def notify_batch(self, counts=None):
-        stats = await self.inbox.statistics()
-        since = _now() - timedelta(minutes=max(1, self.settings.notify_min_interval_minutes))
-        rows = (await self.session.execute(select(InboxItem.transaction_type, func.count(), func.sum(InboxItem.amount)).where(InboxItem.status == "created", InboxItem.updated_at >= since).group_by(InboxItem.transaction_type))).all()
-        kinds = {kind: (count, amount) for kind, count, amount in rows}
-        def subtotal(kind):
-            count, amount = kinds.get(kind, (0, Decimal(0)))
-            return f"{count} (${amount:,.0f})"
-        text = f"Carga {_now().astimezone(self.zone):%H:%M} — {subtotal('withdrawal')} gastos, {subtotal('deposit')} ingresos, {subtotal('transfer')} transferencias, {subtotal('refund')} devoluciones; {stats['needs_review']} para revisar, {stats['failed']} fallidos"
-        await self.notifier.send("batch", text, self.settings.notify_min_interval_minutes)
-
     async def alerts(self):
-        stats = await self.inbox.statistics()
-        if (stats["oldest_pending_age_s"] or 0) > 7200:
-            await self.notifier.send("old-pending", "Hay transacciones pendientes de más de 2 horas")
-        last_phone = await self.session.scalar(select(func.max(InboxItem.created_at)).where(InboxItem.source.in_(["sms", "notification"])))
-        if last_phone is None or _now() - last_phone > timedelta(hours=self.settings.phone_silence_hours):
-            await self.notifier.send("phone-silence", "Sin eventos recientes del teléfono; revisar Message Mirror")
+        """Periodic checks after each cycle. A failing check is logged and never aborts the others or the cycle."""
+        today = _now().astimezone(self.zone).date()
+
+        async def old_pending():
+            await alerting.check_old_pending(self.session, await self.inbox.statistics())
+
+        async def phone_silence():
+            await alerting.check_phone_silence(self.session, self.settings)
+
+        async def budgets():
+            await alerting.check_budgets(self.session, self.firefly, today)
+
+        async def key_expiring():
+            await alerting.check_key_expiring(self.session, self.settings)
+
+        async def backup_failed():
+            await alerting.check_backup(self.session, self.settings)
+
+        async def month_close():
+            if (today + timedelta(days=1)).day == 1:
+                month, final = today.replace(day=1), False
+            elif today.day == 1:
+                month, final = (today - timedelta(days=1)).replace(day=1), True
+            else:
+                return
+            await alerting.month_close(self.session, await self.report("month", month, insight=False), month, final)
+
+        async def report_alerts():
+            from app.services import reports
+            await reports.alert_check(self.session, self.settings, self.firefly)
+
+        async def anomaly_alerts():
+            from app.services import anomalies
+            await anomalies.alert_check(self.session, self.settings, self.firefly)
+
+        for check in (old_pending, phone_silence, budgets, key_expiring, backup_failed, month_close, report_alerts, anomaly_alerts):
+            try:
+                await check()
+                await self.session.commit()
+            except Exception as exc:
+                await self.session.rollback()
+                logger.error("alert_check_failed", check=check.__name__, error_type=type(exc).__name__)
 
     async def _purge(self):
         from sqlalchemy import update
-        for statuses, days in [(["ignored", "rejected", "duplicate"], self.settings.raw_text_retention_days), (["pending", "submitting", "created", "needs_review", "failed", "voided"], 180)]:
-            await self.session.execute(update(InboxItem).where(InboxItem.status.in_(statuses), InboxItem.created_at < _now() - timedelta(days=days)).values(raw_text=None))
+        # Raw text lives RAW_TEXT_RETENTION_DAYS in every status (contract section 10); only rows that still hold text are touched.
+        await self.session.execute(update(InboxItem).where(InboxItem.created_at < _now() - timedelta(days=self.settings.raw_text_retention_days), InboxItem.raw_text.is_not(None)).values(raw_text=None))
         await self.session.execute(update(InboxItem).where(InboxItem.status.in_(["ignored", "rejected"]), InboxItem.created_at < _now() - timedelta(days=self.settings.raw_text_retention_days)).values(subject_or_title=""))
 
     async def learn_senders(self):
@@ -451,23 +490,45 @@ class Processor:
         await self.session.commit()
         return {"senders_seen": len(candidates), "senders_learned": learned, "errors": errors}
 
-    async def review(self, item, action, corrections=None):
+    @staticmethod
+    def _clean_tags(value):
+        if value is None:
+            return []
+        if not isinstance(value, list | tuple) or len(value) > 10:
+            raise ValueError("Invalid tags")
+        tags = []
+        for tag in value:
+            tag = tag.strip() if isinstance(tag, str) else ""
+            if not tag or len(tag) > 40:
+                raise ValueError("Invalid tags")
+            if tag not in tags:
+                tags.append(tag)
+        return tags
+
+    async def _audit_review(self, item, action, changes, principal):
+        await audit.record(self.session, action="inbox." + action, target_type="inbox_item", target_id=item.id, detail={"changes": changes}, principal=principal)
+
+    async def review(self, item, action, corrections=None, principal=None):
         if action == "approve" and item.status == "created":
             raise ValueError("Edit already-created transactions instead of approving")
         if item.status == "submitting" or (item.claim_until and item.claim_until > _now()):
             raise ValueError("Item is currently submitting; retry after reconciliation")
+        changes = {}
         if action == "reject":
             if item.status == "created":
                 raise ValueError("Void created items instead of rejecting")
+            changes["status"] = {"old": item.status, "new": "rejected"}
             item.status = "rejected"
         elif action == "void":
             if item.firefly_transaction_id:
                 await self.firefly.delete_transaction(item.firefly_transaction_id)
+            changes["status"] = {"old": item.status, "new": "voided"}
             item.status = "voided"
         else:
             corrections = corrections or {}
             for key, value in corrections.items():
                 field = "asset_account" if key == "firefly_account" else key
+                old = getattr(item, field, None)
                 if field == "occurred_at":
                     value = _aware(value, self.zone)
                 if field == "amount":
@@ -481,7 +542,15 @@ class Processor:
                         raise ValueError("Unknown category")
                 if field == "merchant":
                     value = normalize_merchant(value)
+                if field == "description":
+                    value = (value or "").strip() or None
+                    if value and len(value) > 500:
+                        raise ValueError("Description is too long")
+                if field == "tags":
+                    value, old = self._clean_tags(value), list(old or [])
                 setattr(item, field, value)
+                if old != value:
+                    changes[key] = {"old": old, "new": value}
             if not item.amount or not item.asset_account or not item.merchant:
                 raise ValueError("Review requires amount, merchant and own account")
             if item.currency != "COP":
@@ -490,12 +559,19 @@ class Processor:
             if action == "edit":
                 if item.status != "created":
                     raise ValueError("Only created items can be edited")
-                await self.firefly.update_transaction(item.firefly_transaction_id, await self._split(item))
+                payload = await self._split(item)
+                if "category" in corrections and not item.category:
+                    # Firefly keeps the current category when the key is absent; null clears it.
+                    payload["transactions"][0]["category_name"] = None
+                await self.firefly.update_transaction(item.firefly_transaction_id, payload)
             else:
                 item.method = item.method or "review"
                 item.status = "needs_review"
+                if changes:
+                    await self._audit_review(item, action, changes, principal)
                 await self.session.commit()
                 return await self.process(item, approved=True)
+        await self._audit_review(item, action, changes, principal)
         self.session.add(InboxEvent(inbox_id=item.id, action=action, detail=json.dumps(corrections, default=str)))
         await self.session.commit()
         return item
@@ -513,7 +589,8 @@ class Processor:
         orphaned = [row for row in await self.firefly.list_auto_transactions() if str(row["id"]) not in known]
         await self.session.commit()
         if voided or orphaned:
-            await self.notifier.send("reconcile", f"Conciliación: {len(voided)} borradas en Firefly, {len(orphaned)} sin inbox")
+            await alerting.emit(self.session, "system_failure", title="Conciliación con diferencias", body=f"{len(voided)} movimientos ya no existen en Firefly y {len(orphaned)} transacciones de Firefly no tienen registro en la bandeja.", dedupe_key="reconcile", min_interval_minutes=360)
+            await self.session.commit()
         return {"voided": voided, "orphaned": orphaned}
 
     async def report(self, period="day", date=None, insight=True):
@@ -549,6 +626,6 @@ class Processor:
         report = await self.report(period, day)
         previous = await self.report(period, day - timedelta(days=7 if weekly else 1))
         stats = await self.inbox.statistics()
-        message = f"Resumen {period} {report['start']} — {report['totals']}\nCategorías {report['by_category']}\nCuentas {report['by_account']}\nComercios {report['top_merchants']}\nPeriodo anterior {previous['totals']}\nSalud: pendientes {stats['pending']}, revisión {stats['needs_review']}, último ciclo {stats['last_cycle']}"
-        await self.notifier.send(f"digest:{period}:{day}", message, minutes=1440)
+        await alerting.digest(self.session, report, previous, stats, weekly)
+        await self.session.commit()
         return report

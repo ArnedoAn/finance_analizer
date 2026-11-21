@@ -2,12 +2,13 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 from app.core.timezone import now_utc
 from app.db.database import Base
+from app.security.crypto import EncryptedText
 
 
 class AwareDateTime(TypeDecorator):
@@ -37,7 +38,7 @@ class InboxItem(Base):
     app: Mapped[str | None] = mapped_column(String(255))
     sender: Mapped[str] = mapped_column(String(512), default="")
     subject_or_title: Mapped[str] = mapped_column(Text, default="")
-    raw_text: Mapped[str | None] = mapped_column(Text)
+    raw_text: Mapped[str | None] = mapped_column(EncryptedText)
     occurred_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     method: Mapped[str | None] = mapped_column(String(20))
@@ -60,6 +61,9 @@ class InboxItem(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+    # v4 (Phase 4 migration adds these columns): owner/assistant description and context tags.
+    description: Mapped[str | None] = mapped_column(Text)
+    tags: Mapped[list[str] | None] = mapped_column(JSON)
 
 
 class MailAccountState(Base):
@@ -103,3 +107,8 @@ class Notification(Base):
     __tablename__ = "notifications"
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
     last_sent_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+
+
+# v4 domain tables live in one module per phase so parallel work never shares a file.
+# Imported here so Base.metadata (tests, Alembic autogenerate) always sees them.
+from app.db import models_alerts, models_assistant, models_devices, models_flags, models_rules  # noqa: E402,F401

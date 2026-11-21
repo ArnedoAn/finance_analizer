@@ -4,16 +4,16 @@ Single-owner Colombia service on main; Python 3.12+, FastAPI, async SQLAlchemy, 
 
 ## Boundaries
 
-- app/core: settings, file-backed secrets, timezone/logging/errors. FINANCE_API_KEY and distinct PHONE_API_KEY required, each >=32 characters; both and DATABASE_URL support _FILE.
+- app/core: settings, file-backed secrets, timezone/logging/errors. FINANCE_API_KEY required (>=32 characters); PHONE_API_KEY optional legacy ingest key (>=32 characters when set, distinct from the admin key); both and DATABASE_URL support _FILE.
 - app/db: inbox, IMAP checkpoints, source rules, audit events, cycle runs and notification throttle. Repositories are the data-access boundary. Alembic owns schema; init_db must not create/alter tables.
 - app/clients: Firefly, OpenAI-compatible LLM, read-only header-first IMAP.
 - app/parsers: common immutable Extraction plus one module per bank; Decimal money and anchored dates.
-- app/services: persist before network; durable claims, idempotent external_id adoption, review, reconciliation, backoff, notifications and scheduler leadership.
-- app/api: /api/v1, X-API-Key except health/live and health/ready. PHONE_API_KEY is ingestion-only (/notifications/webhook, /auth/check); private/admin routes require FINANCE_API_KEY. Production docs and raw inbox text (include_raw=true) are explicit opt-ins.
+- app/services: persist before network; durable claims, idempotent external_id adoption, review, reconciliation, backoff, alerts (`alerts` table polled by the app via GET /alerts) and scheduler leadership.
+- app/api: /api/v1, X-API-Key except health/live and health/ready and the code-authenticated POST devices/enroll. Keys are per device (`cofre_` + token_urlsafe(32)); only their sha256 hex is stored (table devices, unique index) with scopes ingest, read, review, admin (admin implies all, review implies read, ingest only webhook and auth/check). Revoked or expired devices get 401; last_used_at is written at most once a minute per device. FINANCE_API_KEY is the server-side admin (device_id None). PHONE_API_KEY is optional and legacy: its first valid use registers it as the ingest device `phone-legacy`; retire it by revoking that device and removing the variable. Production docs and raw inbox text (include_raw=true) are explicit opt-ins.
 
 Use aware UTC internally and America/Bogota for Firefly. Never log credentials or financial bodies. OWN_ACCOUNTS replaces ACCOUNT_MAP: unresolved bank account goes to needs_review, never a silent cash default. Never create own accounts. Never merge identical purchases from the same channel. Cross-source/manual ambiguity requires review. Learned sources require explicit approval and aligned mail authentication by default.
 
-LLM_AUTO_APPROVE_MAX_COP defaults to 0 (human review); SMS_AUTO_APPROVE_MAX_COP defaults to 2000000, with 0 requiring review for all SMS. SMS sender IDs are spoofable, not cryptographic bank authentication. OTP bodies must not reach storage/LLM. Telegram bot messages are not end-to-end encrypted; never include raw financial bodies or credentials.
+LLM_AUTO_APPROVE_MAX_COP and SMS_AUTO_APPROVE_MAX_COP default to 0 (human review); raising them is a deliberate owner decision. SMS sender IDs are spoofable, not cryptographic bank authentication. OTP bodies must not reach storage/LLM. Alerts contain amounts and merchants but never raw financial bodies or credentials.
 
 Container runs alembic upgrade head before one uvicorn worker. Preserve existing v2 database and volume during upgrade; baseline supports empty and v2 DB, rejects v1. Do not stamp past migrations or import mutable runtime models into revision definitions. Schema changes require a new revision; never rewrite an applied baseline.
 

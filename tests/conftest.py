@@ -1,4 +1,5 @@
 """Offline v3 fixtures; TEST_DATABASE_URL opts into a real PostgreSQL backend."""
+import base64
 import os
 from collections.abc import AsyncGenerator
 from dataclasses import replace
@@ -16,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 os.environ["FINANCE_API_KEY"] = "test-admin-key-01234567890123456789"
 os.environ["PHONE_API_KEY"] = "test-phone-key-01234567890123456789"
 os.environ["SCHEDULER_ENABLED"] = "false"
+os.environ["FIELD_ENCRYPTION_KEY"] = base64.b64encode(os.urandom(32)).decode()
 
 from app.core.config import OwnAccount, Settings, get_settings
 from app.db.models import Base
@@ -34,7 +36,8 @@ def settings(monkeypatch):
             firefly_account="Nequi", bank="nequi", kind="wallet", last4=["1234"],
             aliases=["nequi"], sources=["app:com.nequi.MobileApp", "sms:85954", "email:nequi.com.co"],
         )],
-        manual_default_account="Nequi", notify_url="", _env_file=None,
+        # Pipeline tests exercise SMS auto-creation; production default is 0 (see test_sms_default_requires_review).
+        manual_default_account="Nequi", sms_auto_approve_max_cop=Decimal("2000000"), _env_file=None,
     )
     monkeypatch.setattr("app.api.dependencies.get_settings", lambda: config)
     yield config
@@ -109,15 +112,15 @@ def service(db, settings, clients, extraction, monkeypatch):
 
 @pytest_asyncio.fixture
 async def client(db, settings, service, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
-    from app.api import routes
     from app.api.dependencies import _auth_failures, get_db, get_processor
+    from app.api.routers import ingest, system
     from app.main import app
 
     async def process_isolated(item_id):
         await service.process(await service.inbox.get(item_id))
 
-    monkeypatch.setattr(routes, "process_background", process_isolated)
-    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+    monkeypatch.setattr(ingest, "process_background", process_isolated)
+    monkeypatch.setattr(system, "get_settings", lambda: settings)
 
     async def isolated_db():
         yield db

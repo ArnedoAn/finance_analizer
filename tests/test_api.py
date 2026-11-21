@@ -143,8 +143,9 @@ async def test_unknown_manual_category_returns_suggestions(client):
     ("POST", "/api/v1/reconcile/run", None),
 ])
 async def test_phone_key_cannot_access_admin_routes(client, clients, method, path, body):
+    # A valid ingest key is authenticated but lacks scope: 403, not 401 (contract section 1).
     response = await client.request(method, path, headers={"X-API-Key": PHONE_KEY}, json=body)
-    assert response.status_code == 401
+    assert response.status_code == 403
     clients[0].create_transaction.assert_not_awaited()
 
 
@@ -167,7 +168,7 @@ async def test_inbox_raw_requires_explicit_opt_in_and_claims_never_escape(client
 async def test_health_never_logs_into_mailboxes(client, settings, clients, monkeypatch):
     from unittest.mock import AsyncMock
 
-    from app.api import routes
+    from app.api.routers import system as routes
     from app.core.config import MailAccount
 
     settings.mail_accounts = [MailAccount(name="primary", provider="gmail", username="user@gmail.com", password="private")]
@@ -184,7 +185,7 @@ async def test_health_never_logs_into_mailboxes(client, settings, clients, monke
 async def test_mail_test_rate_limits_logins_per_account(client, settings, monkeypatch):
     from unittest.mock import AsyncMock
 
-    from app.api import routes
+    from app.api.routers import system as routes
     from app.core.config import MailAccount
 
     settings.mail_accounts = [MailAccount(name=name, provider="gmail", username=name + "@gmail.com", password="private")

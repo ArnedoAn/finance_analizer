@@ -103,7 +103,7 @@ async def test_manual_network_failure_is_durable_502(client, clients, service):
     response = await client.post("/api/v1/transactions/manual", headers={"X-API-Key": ADMIN_KEY}, json={"client_ref": "offline", "amount": 12000, "description": "Cafe", "account": "Nequi"})
     assert response.status_code == 502
     body = response.json()
-    assert body["status"] == "failed" and body["error"]
+    assert body["status"] == "failed" and body["code"] == "upstream_unavailable" and body["inbox_id"]
     row = await service.inbox.get(body["inbox_id"])
     assert row.status == "failed" and row.next_attempt_at is None
 
@@ -200,3 +200,68 @@ async def test_mail_test_rate_limits_logins_per_account(client, settings, monkey
     imap.test.assert_awaited_once()
     assert (await client.post("/api/v1/mail/accounts/secondary/test", headers=headers)).status_code == 200
     assert imap.test.await_count == 2
+
+
+async def test_mail_accounts_read_view_hides_login_host_and_secrets(client, db, settings):
+    from app.core.config import MailAccount
+    from app.db.models import MailAccountState
+
+    settings.mail_accounts = [MailAccount(
+        name="primary", provider="gmail", username="owner@gmail.com", password="private-pass",
+        authserv_ids=["mx.google.com"],
+    )]
+    db.add(MailAccountState(
+        name="primary", last_uid=77, consecutive_failures=3,
+        last_error="login owner@gmail.com failed at imap.gmail.com with private-pass",
+    ))
+    await db.commit()
+    response = await client.get("/api/v1/mail/accounts", headers={"X-API-Key": ADMIN_KEY})
+    assert response.status_code == 200
+    account, = response.json()["accounts"]
+    assert set(account) == {"name", "provider", "last_poll_at", "last_error", "consecutive_failures"}
+    assert account["name"] == "primary" and account["provider"] == "gmail" and account["consecutive_failures"] == 3
+    for secret in ("owner@gmail.com", "imap.gmail.com", "private-pass", "mx.google.com"):
+        assert secret not in response.text
+    assert "[redacted]" in account["last_error"]
+
+
+async def test_quick_502_uses_the_upstream_unavailable_format(client, clients, service):
+    clients[0].create_transaction.side_effect = OSError("offline secret-host")
+    response = await client.post("/api/v1/transactions/quick", headers={"X-API-Key": ADMIN_KEY}, json={"text": "25k taxi", "client_ref": "quick-502"})
+    assert response.status_code == 502
+    body = response.json()
+    assert set(body) == {"detail", "code", "inbox_id", "status"}
+    assert body["code"] == "upstream_unavailable" and body["status"] == "failed"
+    assert (await service.inbox.get(body["inbox_id"])).status == "failed"
+
+
+async def test_statistics_amounts_today_are_two_decimal_strings(client, db):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from app.db.models import InboxItem
+
+    now = datetime.now(UTC)
+    for ref, amount in (("stat-1", "12000"), ("stat-2", "500.5")):
+        db.add(InboxItem(source="sms", source_ref=ref, occurred_at=now, status="created", amount=Decimal(amount), currency="COP", transaction_type="withdrawal"))
+    await db.commit()
+    body = (await client.get("/api/v1/processing/statistics", headers={"X-API-Key": ADMIN_KEY})).json()
+    assert body["amounts_today"] == {"withdrawal": "12500.50"}
+
+
+async def test_inbox_repository_filters_by_exact_source_ref(db):
+    from datetime import UTC, datetime
+
+    from app.db.models import InboxItem
+    from app.db.repositories import InboxRepository
+
+    now = datetime.now(UTC)
+    for ref in ("mail:abc", "mail:abcd", "sms:1"):
+        db.add(InboxItem(source="email", source_ref=ref, occurred_at=now, status="pending"))
+    await db.commit()
+    repository = InboxRepository(db)
+    found = await repository.list(source_ref="mail:abc")
+    assert [row.source_ref for row in found] == ["mail:abc"]
+    assert await repository.count(source_ref="mail:abc") == 1
+    assert await repository.count(source_ref="mail:missing") == 0
+    assert await repository.count() == 3

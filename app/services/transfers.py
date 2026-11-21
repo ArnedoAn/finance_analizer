@@ -15,6 +15,10 @@ from app.db.models import InboxEvent, InboxItem
 OPEN_STATUSES = ("created", "needs_review")
 
 
+class PairConflictError(Exception):
+    """The pair cannot be completed right now (the router answers 409 ``conflict``); nothing was voided."""
+
+
 async def _candidates(session):
     rows = (await session.scalars(select(InboxItem).where(
         InboxItem.status.in_(OPEN_STATUSES), InboxItem.transaction_type.in_(("withdrawal", "deposit")),
@@ -51,7 +55,7 @@ async def pending(session, settings) -> list[dict]:
     return result
 
 
-async def pair(service, out_id: int, in_id: int):
+async def pair(service, out_id: int, in_id: int, principal=None):
     """Turn a confirmed outgoing/incoming pair into one transfer and return ``(out_item, in_item)``.
 
     1. The outgoing item becomes ``transaction_type="transfer"`` with ``destination_account`` set
@@ -61,10 +65,12 @@ async def pair(service, out_id: int, in_id: int):
     2. The incoming item is marked ``duplicate`` with ``duplicate_of_id`` = outgoing item. If it
        was ``created`` in Firefly its transaction is voided first, so the money counts once.
 
-    The outgoing item is converted first: if voiding the incoming leg then fails, the outgoing
-    transfer is already correct and repeating the request only retries the void.
+    The outgoing item is converted first and must end ``created``: if it does not (Firefly rejected the
+    transfer, the item went back to review), PairConflictError is raised before the incoming leg is touched.
+    If voiding the incoming leg then fails, the outgoing transfer is already correct and repeating the
+    request only retries the void. ``principal`` is the audited actor of every review step.
 
-    Raises LookupError (unknown item) or ValueError (pair not valid); Firefly failures propagate.
+    Raises LookupError (unknown item), ValueError (pair not valid) or PairConflictError; Firefly failures propagate.
     """
     session = service.session
     out = await session.get(InboxItem, out_id, populate_existing=True)
@@ -84,9 +90,11 @@ async def pair(service, out_id: int, in_id: int):
         raise ValueError("out_id must be a withdrawal")
     if not resumed:
         corrections = {"transaction_type": "transfer", "destination_account": incoming.asset_account}
-        out = await service.review(out, "edit" if out.status == "created" else "approve", corrections) or out
+        out = await service.review(out, "edit" if out.status == "created" else "approve", corrections, principal=principal) or out
+    if out.status != "created":
+        raise PairConflictError(f"The outgoing item ended as {out.status}; approve it in the inbox before pairing")
     if incoming.status == "created":
-        await service.review(incoming, "void")
+        await service.review(incoming, "void", principal=principal)
     incoming.status, incoming.duplicate_of_id = "duplicate", out.id
     incoming.review_reason = None
     session.add(InboxEvent(inbox_id=incoming.id, action="paired", detail=f"transfer pair with {out.id}"))

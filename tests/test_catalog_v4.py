@@ -1,15 +1,18 @@
 """Merchants, rules, transfer pairing and anomalies (Phase 5 A6, contract sections 7, 8 and 14)."""
 from datetime import timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select
 
+from app.core.exceptions import PermanentError
 from app.core.timezone import now_utc
 from app.db.models import InboxItem
+from app.db.models_assistant import Audit
 from app.db.models_rules import Merchant, Rule
-from app.services import anomalies, rules
+from app.services import anomalies, rules, transfers
 
 ADMIN = {"X-API-Key": "test-admin-key-01234567890123456789"}
 PHONE = {"X-API-Key": "test-phone-key-01234567890123456789"}
@@ -209,6 +212,38 @@ async def test_pairing_validates_input(client, service):
     assert (await client.post("/api/v1/transfers/pair", headers=ADMIN, json={"out_id": out.id, "in_id": 9999})).status_code == 404
 
 
+async def test_pairing_leaves_the_incoming_leg_alone_when_the_outgoing_one_is_not_created(service, clients):
+    clients[0].create_transaction.side_effect = PermanentError("Firefly 422: invalid destination")
+    out = await make(service, status="needs_review", firefly_transaction_id=None, amount=Decimal("30000.00"), asset_account="Nequi")
+    incoming = await make(service, transaction_type="deposit", amount=Decimal("30000.00"), asset_account="Bancolombia", firefly_transaction_id="tx-in")
+    out_id, in_id = out.id, incoming.id
+    with pytest.raises(transfers.PairConflictError):
+        await transfers.pair(service, out_id, in_id)
+    clients[0].delete_transaction.assert_not_awaited()
+    kept = await service.inbox.get(in_id)
+    assert kept.status == "created" and kept.duplicate_of_id is None and kept.firefly_transaction_id == "tx-in"
+    assert (await service.inbox.get(out_id)).status == "needs_review"
+
+
+async def test_pairing_conflict_is_a_409_conflict(client, service, clients):
+    clients[0].create_transaction.side_effect = PermanentError("Firefly 422: invalid destination")
+    out = await make(service, status="needs_review", firefly_transaction_id=None, amount=Decimal("30000.00"), asset_account="Nequi")
+    incoming = await make(service, transaction_type="deposit", amount=Decimal("30000.00"), asset_account="Bancolombia", firefly_transaction_id="tx-in")
+    response = await client.post("/api/v1/transfers/pair", headers=ADMIN, json={"out_id": out.id, "in_id": incoming.id})
+    assert response.status_code == 409 and response.json()["code"] == "conflict"
+    clients[0].delete_transaction.assert_not_awaited()
+    assert (await service.inbox.get(incoming.id)).status == "created"
+
+
+async def test_pairing_audits_every_review_step_as_the_caller(service, db, clients):
+    out = await make(service, amount=Decimal("40000.00"), asset_account="Nequi")
+    incoming = await make(service, transaction_type="deposit", amount=Decimal("40000.00"), asset_account="Bancolombia")
+    principal = SimpleNamespace(name="alice", device_id=7)
+    await transfers.pair(service, out.id, incoming.id, principal=principal)
+    rows = (await db.execute(select(Audit.action, Audit.actor, Audit.device_id).where(Audit.action.in_(("inbox.edit", "inbox.void"))))).all()
+    assert sorted(rows) == [("inbox.edit", "alice", 7), ("inbox.void", "alice", 7)]
+
+
 # --- anomalies -----------------------------------------------------------------------------------
 
 
@@ -281,3 +316,33 @@ async def test_alert_check_emits_with_dedupe_key(service, db, settings, monkeypa
     kind, kwargs = calls[0]
     assert kind == "duplicate_suspect" and kwargs["dedupe_key"].startswith("duplicate_charge:")
     assert kwargs["currency"] == "COP" and kwargs["amount"] == Decimal("25000.00")
+
+
+async def test_merchant_count_and_rule_hits_increment_atomically(service, db):
+    from sqlalchemy import update
+
+    rule = await rules.create_rule(db, match="merchant_exact", pattern="SUPERMERCADO CENTRAL", category="Transporte")
+    merchant = Merchant(name="SUPERMERCADO CENTRAL", count=5)
+    db.add(merchant)
+    await db.commit()
+    # Another worker bumps both counters behind this session's back; a read-modify-write would lose it.
+    await db.execute(update(Merchant).values(count=10).execution_options(synchronize_session=False))
+    await db.execute(update(Rule).values(hits=10).execution_options(synchronize_session=False))
+    item = await make(service, category=None)
+    await rules.apply(db, item)
+    assert merchant.count == 11 and rule.hits == 11
+    assert item.category == "Transporte"
+
+
+async def test_text_contains_rule_matches_the_raw_text(service, db):
+    await rules.create_rule(db, match="text_contains", pattern="pagaste", category="Transporte")
+    await db.commit()
+    item = await make(service, category=None, subject_or_title="Compra", raw_text="Pagaste $12.000 en tienda")
+    await rules.apply(db, item)
+    assert item.category == "Transporte"
+
+
+async def test_merchants_limit_accepts_up_to_500(client):
+    assert (await client.get("/api/v1/merchants?limit=500", headers=ADMIN)).status_code == 200
+    assert (await client.get("/api/v1/merchants?limit=501", headers=ADMIN)).status_code == 422
+    assert (await client.get("/api/v1/merchants?limit=0", headers=ADMIN)).status_code == 422

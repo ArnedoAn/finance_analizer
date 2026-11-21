@@ -113,13 +113,15 @@ async def quick_entry(payload: QuickRequest, principal: ReviewPrincipal, service
         item = await quick.create_entry(
             service, text=payload.text, client_ref=payload.client_ref, account=payload.account, principal=principal
         )
-    except quick.UnparseableError:
-        return JSONResponse(status_code=422, content={"detail": "Could not read an amount from the text", "code": "unparseable"})
+    except quick.UnparseableError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc), "code": "unparseable"})
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     await db.commit()
     if item.status == "failed":
-        return JSONResponse(status_code=502, content={"inbox_id": item.id, "status": "failed", "error": item.last_error})
+        return JSONResponse(status_code=502, content={
+            "detail": "External service unavailable", "code": "upstream_unavailable", "inbox_id": item.id, "status": "failed",
+        })
     return item_data(item)
 
 

@@ -5,9 +5,9 @@ from decimal import Decimal
 from uuid import uuid4
 
 from app.api.dependencies import hash_secret
-from app.core.exceptions import FireflyError
+from app.core.exceptions import FireflyError, PermanentError
 from app.core.timezone import now_utc
-from app.db.models_assistant import ProposalBatch
+from app.db.models_assistant import Proposal
 from app.db.models_devices import Device
 
 ADMIN = {"X-API-Key": "test-admin-key-01234567890123456789"}
@@ -122,10 +122,10 @@ async def test_proposal_shape_and_risk_flags(client, service):
         "category": ("Transporte", False, "Alimentación"),
         "merchant": ("OTRA TIENDA", False, "SUPERMERCADO CENTRAL"),
         "description": ("Mercado", False, None),
-        "firefly_account": ("Bancolombia", False, "Nequi"),
-        "occurred_at": ("2026-11-20T10:00:00-05:00", False, None),
+        "firefly_account": ("Bancolombia", True, "Nequi"),
+        "occurred_at": ("2026-11-20T10:00:00-05:00", True, None),
         "amount": (25000, True, "12000.00"),
-        "transaction_type": ("refund", False, "withdrawal"),
+        "transaction_type": ("refund", True, "withdrawal"),
         "tags": ([" viaje ", "viaje", "casa"], False, ["casa"]),
         "void": (None, True, "created"),
         "split": ([{"amount": "5000", "category": "Transporte", "description": " taxi "}, {"amount": 7000.0, "category": "Alimentación"}], True, "12000.00"),
@@ -237,23 +237,37 @@ async def test_a_risky_proposal_must_be_applied_alone(client, service, clients):
     assert clients[0].update_transaction.call_args_list[-1].args[1]["transactions"][0]["amount"] == "12000.00"
 
 
-async def test_applying_to_a_pending_item_approves_it_and_revert_restores_the_empty_value(client, service, clients):
+async def test_editing_or_splitting_a_pending_item_conflicts_without_approving_it(client, service, clients):
     item = await make(service, status="needs_review", firefly_transaction_id=None, category=None, review_reason="merchant is not clean")
     item_id = item.id
     batch_id = (await open_batch(client))["id"]
-    pid = await proposal_id(client, batch_id, item_id, "category", "Transporte")
-    response = await apply(client, batch_id, [pid])
-    assert response.json()["applied"] == [pid], response.text
-    clients[0].create_transaction.assert_awaited_once()
-    assert clients[0].create_transaction.call_args.args[0]["transactions"][0]["category_name"] == "Transporte"
-    created = await service.inbox.get(item_id)
-    assert created.status == "created" and created.category == "Transporte"
+    edit = await proposal_id(client, batch_id, item_id, "category", "Transporte")
+    split = await proposal_id(client, batch_id, item_id, "split", [{"amount": "5000", "category": "Transporte"}, {"amount": "7000", "category": "Alimentación"}])
+    for pid in (edit, split):
+        body = (await apply(client, batch_id, [pid])).json()
+        assert body["applied"] == [] and [entry["id"] for entry in body["failed"]] == [pid]
+        assert "approve it in the inbox first" in body["failed"][0]["detail"]
+    clients[0].create_transaction.assert_not_awaited()
+    clients[0].update_transaction.assert_not_awaited()
+    after = await service.inbox.get(item_id)
+    assert after.status == "needs_review" and after.category is None and after.review_reason == "merchant is not clean"
+    proposals = (await client.get(f"{API}/{batch_id}", headers=ADMIN)).json()["proposals"]
+    assert [p["status"] for p in proposals] == ["failed", "failed"]
 
-    reverted = await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)
-    assert reverted.json()["reverted"] == [pid], reverted.text
-    payload = clients[0].update_transaction.call_args.args[1]["transactions"][0]
-    assert payload["category_name"] is None
-    assert (await service.inbox.get(item_id)).category is None
+
+async def test_a_stale_proposal_fails_with_a_conflict_and_keeps_its_old_value(client, service, clients):
+    item = await make(service)
+    item_id = item.id
+    batch_id = (await open_batch(client))["id"]
+    pid = await proposal_id(client, batch_id, item_id, "description", "Mercado")
+    assert (await client.patch(f"/api/v1/inbox/{item_id}", headers=ADMIN, json={"description": "Otra nota"})).status_code == 200
+    assert clients[0].update_transaction.await_count == 1
+    body = (await apply(client, batch_id, [pid])).json()
+    assert body["applied"] == [] and "stale" in body["failed"][0]["detail"]
+    proposal = body["batch"]["proposals"][0]
+    assert proposal["status"] == "failed" and proposal["old_value"] is None
+    assert clients[0].update_transaction.await_count == 1
+    assert (await service.inbox.get(item_id)).description == "Otra nota"
 
 
 async def test_failed_proposals_are_reported_and_change_nothing(client, service, clients):
@@ -331,7 +345,7 @@ async def test_void_of_an_unwritten_item_reverts_to_review(client, service, clie
     pid = await proposal_id(client, batch_id, item_id, "void")
     assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
     clients[0].delete_transaction.assert_not_awaited()
-    assert (await service.inbox.get(item_id)).status == "voided"
+    assert (await service.inbox.get(item_id)).status == "rejected"
     assert (await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)).json()["reverted"] == [pid]
     assert (await service.inbox.get(item_id)).status == "needs_review"
     clients[0].create_transaction.assert_not_awaited()
@@ -384,23 +398,42 @@ async def test_split_with_an_unknown_category_changes_nothing(client, service, c
     assert (await service.inbox.get(item_id)).status == "created"
 
 
-async def test_revert_expires_after_seven_days(client, service, db, clients):
-    item = await make(service)
+async def test_revert_window_is_per_proposal_and_expired_ones_are_reported(client, service, db, clients):
+    first, second = await make(service), await make(service, category="Alimentación")
     batch_id = (await open_batch(client))["id"]
     never = await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)
     assert never.status_code == 409 and never.json()["code"] == "conflict"
-    pid = await proposal_id(client, batch_id, item.id, "category", "Transporte")
-    assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
-    batch = await db.get(ProposalBatch, batch_id)
-    batch.applied_at = now_utc() - timedelta(days=8)
+    old = await proposal_id(client, batch_id, first.id, "description", "Mercado")
+    recent = await proposal_id(client, batch_id, second.id, "category", "Transporte")
+    assert (await apply(client, batch_id, [old])).json()["applied"] == [old]
+    assert (await apply(client, batch_id, [recent])).json()["applied"] == [recent]
+    assert clients[0].update_transaction.await_count == 2
+    (await db.get(Proposal, old)).applied_at = now_utc() - timedelta(days=8)
     await db.commit()
+
+    # Only the proposal inside its own window is reverted; the other one is reported, not touched.
+    result = (await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)).json()
+    assert result["reverted"] == [recent] and [entry["id"] for entry in result["failed"]] == [old]
+    assert "7-day" in result["failed"][0]["detail"] and result["batch"]["status"] == "applied"
+    assert clients[0].update_transaction.await_count == 3
+    assert (await service.inbox.get(second.id)).category == "Alimentación" and (await service.inbox.get(first.id)).description == "Mercado"
+
     expired = await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)
     assert expired.status_code == 409 and expired.json()["code"] == "revert_expired"
-    assert clients[0].update_transaction.await_count == 1
+    assert clients[0].update_transaction.await_count == 3
 
-    batch.applied_at = now_utc() - timedelta(days=6, hours=23)
-    await db.commit()
-    assert (await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)).json()["reverted"] == [pid]
+
+async def test_the_revert_deadline_counts_from_the_first_application(client, service):
+    first, second = await make(service), await make(service)
+    batch_id = (await open_batch(client))["id"]
+    a = await proposal_id(client, batch_id, first.id, "description", "uno")
+    b = await proposal_id(client, batch_id, second.id, "description", "dos")
+    initial = (await apply(client, batch_id, [a])).json()["batch"]
+    later = (await apply(client, batch_id, [b])).json()["batch"]
+    assert later["applied_at"] == initial["applied_at"] and later["revert_deadline"] == initial["revert_deadline"]
+    applied_at = {p["id"]: datetime.fromisoformat(p["applied_at"]) for p in later["proposals"]}
+    assert applied_at[b] >= applied_at[a]
+    assert datetime.fromisoformat(later["revert_deadline"]) == applied_at[a] + timedelta(days=7)
 
 
 # --- scopes ----------------------------------------------------------------------------------------
@@ -460,3 +493,124 @@ async def test_audit_trail_and_endpoint(client, service):
     future = (now_utc() + timedelta(hours=1)).isoformat()
     assert (await client.get("/api/v1/audit", headers=ADMIN, params={"since": future})).json() == {"items": [], "total": 0}
     assert (await client.get("/api/v1/audit", headers=ADMIN, params={"since": (now_utc() - timedelta(hours=1)).isoformat()})).json()["total"] == listing["total"]
+
+
+# --- state machine, concurrency and risk -----------------------------------------------------------
+
+
+async def test_a_proposal_is_applying_during_the_work_and_applied_only_after(client, service, db, monkeypatch):
+    item = await make(service)
+    batch_id = (await open_batch(client))["id"]
+    pid = await proposal_id(client, batch_id, item.id, "description", "Mercado")
+    seen = []
+    original = service.review
+
+    async def spy(target, action, *args, **kwargs):
+        seen.append((await db.get(Proposal, pid, populate_existing=True)).status)
+        return await original(target, action, *args, **kwargs)
+
+    monkeypatch.setattr(service, "review", spy)
+    assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
+    assert seen == ["applying"]
+    assert (await db.get(Proposal, pid, populate_existing=True)).status == "applied"
+
+
+async def test_claiming_is_atomic_and_a_stuck_claim_can_be_retaken(client, service, db):
+    from app.services import assistant
+
+    item = await make(service)
+    batch_id = (await open_batch(client))["id"]
+    pid = await proposal_id(client, batch_id, item.id, "description", "Mercado")
+    assert await assistant._claim(db, pid) is True
+    assert await assistant._claim(db, pid) is False
+    proposal = await db.get(Proposal, pid, populate_existing=True)
+    assert proposal.status == "applying"
+
+    # Another request holds it: reported, not run twice.
+    body = (await apply(client, batch_id, [pid])).json()
+    assert body["applied"] == [] and "being applied" in body["failed"][0]["detail"]
+
+    # Stuck for more than 10 minutes: claimable again; a failed one is claimable too.
+    proposal.applied_at = now_utc() - timedelta(minutes=11)
+    await db.commit()
+    assert await assistant._claim(db, pid) is True
+    proposal = await db.get(Proposal, pid, populate_existing=True)
+    proposal.status = "failed"
+    await db.commit()
+    assert await assistant._claim(db, pid) is True
+
+
+async def test_a_stuck_applying_proposal_is_completed_by_the_next_apply(client, service, db, clients):
+    stuck, done = await make(service), await make(service)
+    batch_id = (await open_batch(client))["id"]
+    redo = await proposal_id(client, batch_id, stuck.id, "description", "Mercado")
+    resume = await proposal_id(client, batch_id, done.id, "description", "Compra")
+    for pid in (redo, resume):
+        proposal = await db.get(Proposal, pid)
+        proposal.status, proposal.applied_at = "applying", now_utc() - timedelta(minutes=11)
+    # The second worker died after its review committed but before marking the proposal applied.
+    (await service.inbox.get(done.id)).description = "Compra"
+    await db.commit()
+
+    assert (await apply(client, batch_id, [redo])).json()["applied"] == [redo]
+    assert clients[0].update_transaction.await_count == 1
+    assert (await apply(client, batch_id, [resume])).json()["applied"] == [resume]
+    assert clients[0].update_transaction.await_count == 1
+    assert (await apply(client, batch_id, [redo, resume])).json()["applied"] == []
+
+
+async def test_a_firefly_404_when_voiding_counts_as_success(client, service, clients):
+    item = await make(service, firefly_transaction_id="tx-gone")
+    item_id = item.id
+    clients[0].delete_transaction.side_effect = PermanentError("Firefly 404: Not Found")
+    batch_id = (await open_batch(client))["id"]
+    pid = await proposal_id(client, batch_id, item_id, "void")
+    body = (await apply(client, batch_id, [pid])).json()
+    assert body["applied"] == [pid] and body["failed"] == []
+    assert (await service.inbox.get(item_id)).status == "voided"
+
+    other = await make(service, firefly_transaction_id="tx-bad")
+    clients[0].delete_transaction.side_effect = PermanentError("Firefly 422: nope")
+    batch_id = (await open_batch(client))["id"]  # the first batch is applied; proposals need an open one
+    second = await proposal_id(client, batch_id, other.id, "void")
+    assert (await apply(client, batch_id, [second])).json()["failed"][0]["id"] == second
+
+
+async def test_adding_a_proposal_locks_the_batch_row(client, service, monkeypatch):
+    from sqlalchemy.dialects import postgresql
+
+    from app.services import assistant
+
+    assert "FOR UPDATE" in str(assistant._locked_batch_query(1).compile(dialect=postgresql.dialect()))
+    item = await make(service)
+    batch_id = (await open_batch(client))["id"]
+    locked = []
+    original = assistant._lock_batch
+
+    async def spy(session, locked_id):
+        locked.append(locked_id)
+        return await original(session, locked_id)
+
+    monkeypatch.setattr(assistant, "_lock_batch", spy)
+    await proposal_id(client, batch_id, item.id, "category", "Transporte")
+    assert locked == [batch_id]
+
+
+async def test_type_account_and_date_changes_must_be_applied_alone(client, service, clients):
+    item = await make(service)
+    batch_id = (await open_batch(client))["id"]
+    safe = await proposal_id(client, batch_id, item.id, "category", "Transporte")
+    for field, value in (("transaction_type", "refund"), ("firefly_account", "Bancolombia"), ("destination_account", "Bancolombia"), ("occurred_at", "2026-11-20T10:00:00-05:00")):
+        risky = await proposal_id(client, batch_id, item.id, field, value)
+        response = await apply(client, batch_id, [safe, risky])
+        assert response.status_code == 422 and response.json()["code"] == "risky_requires_single", field
+    clients[0].update_transaction.assert_not_awaited()
+
+
+async def test_voiding_a_pending_item_is_audited_as_a_rejection(client, service, clients):
+    item = await make(service, status="needs_review", firefly_transaction_id=None)
+    batch_id = (await open_batch(client))["id"]
+    pid = await proposal_id(client, batch_id, item.id, "void")
+    assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
+    entries = (await client.get("/api/v1/audit", headers=ADMIN, params={"action": "inbox.reject"})).json()["items"]
+    assert len(entries) == 1 and entries[0]["target_id"] == str(item.id)

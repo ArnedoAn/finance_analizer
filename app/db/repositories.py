@@ -30,10 +30,12 @@ class InboxRepository:
         return await self.session.scalar(select(InboxItem).where(InboxItem.source_ref == ref))
 
     @staticmethod
-    def _filtered(query, status=None, source=None, method=None, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False):
+    def _filtered(query, status=None, source=None, method=None, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False, source_ref=None):
         for key, value in (("status", status), ("source", source), ("method", method)):
             if value:
                 query = query.where(getattr(InboxItem, key) == value)
+        if source_ref is not None:
+            query = query.where(InboxItem.source_ref == source_ref)
         if since is not None:
             query = query.where(InboxItem.occurred_at >= since)
         if until is not None:
@@ -49,12 +51,12 @@ class InboxRepository:
             query = query.where(InboxItem.status.in_(["needs_review", "failed"]), or_(InboxItem.amount.is_(None), InboxItem.merchant.is_(None), InboxItem.merchant == ""))
         return query
 
-    async def list(self, status=None, source=None, method=None, limit=50, offset=0, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False):
-        query = self._filtered(select(InboxItem), status, source, method, since, until, review_reason, q, tag, unparsed)
+    async def list(self, status=None, source=None, method=None, limit=50, offset=0, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False, source_ref: str | None = None):
+        query = self._filtered(select(InboxItem), status, source, method, since, until, review_reason, q, tag, unparsed, source_ref=source_ref)
         return list((await self.session.scalars(query.order_by(InboxItem.id.desc()).offset(offset).limit(limit))).all())
 
-    async def count(self, status=None, source=None, method=None, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False):
-        query = self._filtered(select(func.count()).select_from(InboxItem), status, source, method, since, until, review_reason, q, tag, unparsed)
+    async def count(self, status=None, source=None, method=None, since=None, until=None, review_reason=None, q=None, tag=None, unparsed=False, source_ref: str | None = None):
+        query = self._filtered(select(func.count()).select_from(InboxItem), status, source, method, since, until, review_reason, q, tag, unparsed, source_ref=source_ref)
         return await self.session.scalar(query)
 
     async def due(self):
@@ -108,12 +110,15 @@ class InboxRepository:
         result["oldest_pending_age_s"] = max(0, (now_utc() - oldest).total_seconds()) if oldest else None
         cycle = await self.session.scalar(select(CycleRun).order_by(CycleRun.id.desc()).limit(1))
         result["last_cycle"] = {"started_at": cycle.started_at, "finished_at": cycle.finished_at, "result": cycle.result} if cycle else None
+        from decimal import Decimal
         from zoneinfo import ZoneInfo
 
         from app.core.config import get_settings
 
         midnight = now_utc().astimezone(ZoneInfo(get_settings().timezone)).replace(hour=0, minute=0, second=0, microsecond=0)
-        result["amounts_today"] = dict((await self.session.execute(select(InboxItem.transaction_type, func.sum(InboxItem.amount)).where(InboxItem.status == "created", InboxItem.occurred_at >= midnight).group_by(InboxItem.transaction_type))).all())
+        totals = (await self.session.execute(select(InboxItem.transaction_type, func.sum(InboxItem.amount)).where(InboxItem.status == "created", InboxItem.occurred_at >= midnight).group_by(InboxItem.transaction_type))).all()
+        # Money crosses the API as a string with two decimals, like every other amount in the contract.
+        result["amounts_today"] = {kind: f"{Decimal(str(total or 0)).quantize(Decimal('0.01'))}" for kind, total in totals}
         return result
 
 

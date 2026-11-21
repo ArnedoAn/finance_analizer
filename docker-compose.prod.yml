@@ -22,6 +22,14 @@ services:
       EXPOSE_DOCS: ${EXPOSE_DOCS:-false}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-finance_analyzer}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-finance_analyzer_v2}
       TZ: America/Bogota
+      # Only the reverse proxy's IP may set X-Forwarded-For. Required (no default, fails closed) and
+      # NEVER "*": any client could spoof the IP used by the failed-key limiter.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:?Set FORWARDED_ALLOW_IPS to the proxy IP, never *}
+      # AES-GCM master key for raw_text: a file path inside the container, never an env value.
+      FIELD_ENCRYPTION_KEY_FILE: ${FIELD_ENCRYPTION_KEY_FILE:-/run/secrets/finance/field_encryption_key}
+    volumes:
+      # Same layout as infra/compose/finance-analyzer.v4.yml: directory 0700, files 0400 owned by uid 999.
+      - ${FINANCE_SECRETS_DIR:-/opt/finance-analyzer/secrets}:/run/secrets/finance:ro
     ports:
       - "127.0.0.1:${PORT:-8000}:8000"
     depends_on:

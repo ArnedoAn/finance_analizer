@@ -121,8 +121,41 @@ async def test_quick_firefly_failure_is_502_like_manual(client, clients, service
     response = await client.post("/api/v1/transactions/quick", headers=HEADERS, json={"text": "25k taxi", "client_ref": "abc-5"})
     assert response.status_code == 502
     body = response.json()
-    assert body["status"] == "failed" and body["error"]
+    assert body["status"] == "failed" and body["code"] == "upstream_unavailable" and body["detail"]
     assert (await service.inbox.get(body["inbox_id"])).status == "failed"
+
+
+@pytest.mark.parametrize(("text", "amount"), [("pago $45.000 ref 2000000", "45000.00"), ("pago 45k ref 2000000", "45000.00"), ("pago 45.000", "45000.00")])
+def test_parse_marked_amount_wins_over_other_numbers(text, amount):
+    assert quick.parse(text, ACCOUNTS).amount == Decimal(amount)
+
+
+@pytest.mark.parametrize("text", ["pago 45.000 ref 2000000", "cena 2 personas 80000", "7 8"])
+def test_parse_several_bare_numbers_asks_for_dollar_or_k(text):
+    with pytest.raises(quick.UnparseableError, match=r"Indica el monto con \$ o k"):
+        quick.parse(text, ACCOUNTS)
+
+
+async def test_quick_with_several_bare_numbers_is_unparseable_and_writes_nothing(client, clients, db):
+    response = await client.post("/api/v1/transactions/quick", headers=HEADERS, json={"text": "pago 45.000 ref 2000000", "client_ref": "amb-1"})
+    assert response.status_code == 422 and response.json()["code"] == "unparseable"
+    clients[0].create_transaction.assert_not_awaited()
+    assert (await db.scalars(select(InboxItem))).all() == []
+
+
+@pytest.mark.parametrize(("text", "status"), [("2m arriendo", "created"), ("2,1m arriendo", "needs_review")])
+async def test_quick_above_review_threshold_waits_for_approval(client, clients, service, text, status):
+    response = await client.post("/api/v1/transactions/quick", headers=HEADERS, json={"text": text, "client_ref": "big-1"})
+    assert response.status_code == 201 and response.json()["status"] == status
+    assert clients[0].create_transaction.await_count == (status == "created")
+    if status == "needs_review":
+        data = response.json()
+        assert data["review_reason"] and data["firefly_transaction_id"] is None
+        replay = await client.post("/api/v1/transactions/quick", headers=HEADERS, json={"text": text, "client_ref": "big-1"})
+        assert replay.json()["id"] == data["id"] and replay.json()["status"] == "needs_review"
+        approved = await service.review(await service.inbox.get(data["id"]), "approve")
+        assert approved.status == "created"
+        clients[0].create_transaction.assert_awaited_once()
 
 
 async def test_quick_requires_review_scope(client):

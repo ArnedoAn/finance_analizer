@@ -13,7 +13,7 @@ Single-owner Colombia service on main; Python 3.12+, FastAPI, async SQLAlchemy, 
 
 Use aware UTC internally and America/Bogota for Firefly. Never log credentials or financial bodies. OWN_ACCOUNTS replaces ACCOUNT_MAP: unresolved bank account goes to needs_review, never a silent cash default. Never create own accounts. Never merge identical purchases from the same channel. Cross-source/manual ambiguity requires review. Learned sources require explicit approval and aligned mail authentication by default.
 
-LLM_AUTO_APPROVE_MAX_COP and SMS_AUTO_APPROVE_MAX_COP default to 0 (human review); raising them is a deliberate owner decision. SMS sender IDs are spoofable, not cryptographic bank authentication. OTP bodies must not reach storage/LLM. Alerts contain amounts and merchants but never raw financial bodies or credentials.
+LLM_AUTO_APPROVE_MAX_COP, SMS_AUTO_APPROVE_MAX_COP and NOTIFICATION_AUTO_APPROVE_MAX_COP default to 0 (human review); raising them is a deliberate owner decision. INGEST_MAX_EVENTS_PER_HOUR (default 120) caps ingest events per hour with an in-process counter, which is only correct with the single uvicorn worker. SMS sender IDs are spoofable, not cryptographic bank authentication. OTP bodies must not reach storage/LLM. Alerts contain amounts and merchants but never raw financial bodies or credentials.
 
 Container runs alembic upgrade head before one uvicorn worker. Preserve existing v2 database and volume during upgrade; baseline supports empty and v2 DB, rejects v1. Do not stamp past migrations or import mutable runtime models into revision definitions. Schema changes require a new revision; never rewrite an applied baseline.
 

@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -22,9 +23,10 @@ from app.db.models import CycleRun, InboxEvent, InboxItem
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
 from app.parsers import normalize_merchant, parse
 from app.security import is_sensitive_code
+from app.security.redaction import redact
 from app.security.sender_trust import evaluate_email
 from app.services import alerts as alerting
-from app.services import audit, flags, rules
+from app.services import audit, flags, rules, suggestions
 
 logger = get_logger(__name__)
 
@@ -39,6 +41,20 @@ def _now():
 def _aware(value, zone):
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return (parsed if parsed.tzinfo else parsed.replace(tzinfo=zone)).astimezone(UTC)
+
+
+_FIREFLY_REJECTION = re.compile(r"^Firefly (\d{3}):")
+
+
+def _money(value):
+    """Contract section 14: money is a decimal string with two decimals."""
+    return f"{value:.2f}"
+
+
+def _permanent_message(exc):
+    """Short, bounded text for ``last_error``/``review_reason``; never the Firefly response body (``Firefly 422: <body>``)."""
+    rejected = _FIREFLY_REJECTION.match(str(exc))
+    return f"Firefly rejected the request ({rejected[1]})" if rejected else str(exc)[:200]
 
 
 class Processor:
@@ -57,8 +73,8 @@ class Processor:
             self._categories = await self.firefly.categories()
         missing = [a.firefly_account for a in self.settings.own_accounts if not any(x["name"].casefold() == a.firefly_account.casefold() and x["type"] in {"asset", "liability", "liabilities"} for x in self._accounts)]
         for name in missing:
-            if await alerting.emit(self.session, "system_failure", title="Cuenta propia inexistente en Firefly", body=f"La cuenta «{name}» configurada en OWN_ACCOUNTS no existe en Firefly.", dedupe_key="missing-account:" + name, min_interval_minutes=360):
-                await self.session.commit()
+            # No commit here: sync() also runs in the middle of review() corrections; the caller owns the transaction.
+            await alerting.emit(self.session, "system_failure", title="Cuenta propia inexistente en Firefly", body=f"La cuenta «{name}» configurada en OWN_ACCOUNTS no existe en Firefly.", dedupe_key="missing-account:" + name, min_interval_minutes=360)
         return {"accounts": len(self._accounts), "categories": len(self._categories), "missing_accounts": missing}
 
     async def accounts(self):
@@ -139,7 +155,8 @@ class Processor:
         known = bool(self._source_accounts(source, identity))
         occurred, reason = self._notification_date(payload)
         sensitive = is_sensitive_code(content, payload.title)
-        item, inserted = await self._insert(ref, source=source, app=payload.app, sender=payload.sender, subject_or_title="" if sensitive else payload.title, raw_text=None if sensitive else content[:4000], occurred_at=occurred, status="ignored" if sensitive or not known else "pending", review_reason="sensitive_code" if sensitive else reason, template_id="ignore.sensitive_code" if sensitive else None)
+        keep = known and not sensitive  # B6: nothing from an unknown source is stored beyond its identity
+        item, inserted = await self._insert(ref, source=source, app=payload.app, sender=payload.sender, subject_or_title=payload.title if keep else "", raw_text=content[:4000] if keep else None, occurred_at=occurred, status="ignored" if sensitive or not known else "pending", review_reason="sensitive_code" if sensitive else reason, template_id="ignore.sensitive_code" if sensitive else None)
         return item, inserted and known and not sensitive
 
     async def poll_mail(self, since=None, account_name=None):
@@ -196,7 +213,8 @@ class Processor:
         self._accounts.append(account)
         return account
 
-    async def manual(self, payload):
+    async def manual(self, payload, hold=None):
+        """Record an owner entry and write it to Firefly; ``hold`` (a review reason) stores it as ``needs_review`` instead."""
         ref = "manual:" + payload.client_ref
         existing = await self.inbox.by_ref(ref)
         if existing:
@@ -222,8 +240,10 @@ class Processor:
         merchant = normalize_merchant(payload.merchant or ("Ingreso manual" if payload.type in {"deposit", "refund"} else "Gasto manual"))
         if not merchant or len(merchant) > 60 or "$" in merchant:
             raise ValueError("Merchant is not clean")
-        item, inserted = await self._insert(ref, source="manual", sender="owner", raw_text=payload.description[:4000], subject_or_title=payload.description, occurred_at=occurred, status="pending", method="manual", amount=payload.amount.quantize(Decimal("0.01")), currency="COP", merchant=merchant, category=category, asset_account=asset["name"], destination_account=destination["name"] if destination else None, transaction_type=payload.type)
-        return await self.process(item) if inserted else item
+        item, inserted = await self._insert(ref, source="manual", sender="owner", raw_text=payload.description[:4000], subject_or_title=payload.description, occurred_at=occurred, status="needs_review" if hold else "pending", review_reason=hold, method="manual", amount=payload.amount.quantize(Decimal("0.01")), currency="COP", merchant=merchant, category=category, asset_account=asset["name"], destination_account=destination["name"] if destination else None, transaction_type=payload.type)
+        if not inserted:
+            return item
+        return await self._finish(item, None) if hold else await self.process(item)
 
     async def _extract(self, item, cycle_id):
         if item.template_id == "ignore.sensitive_code" or is_sensitive_code(item.raw_text or "", item.subject_or_title or ""):
@@ -238,22 +258,29 @@ class Processor:
         item.method = "parser"
         if extraction is None:
             item.method = "llm"
-            extraction = await self.llm.analyze("\n".join([item.subject_or_title or "", text]), cycle_id=cycle_id or uuid4().hex)
+            # M1: the provider only receives redacted text; verify_llm below still checks the amount against the local original.
+            extraction = await self.llm.analyze("\n".join([redact(item.subject_or_title or ""), redact(text)]), cycle_id=cycle_id or uuid4().hex)
         item.template_id = extraction.template_id
+        # M3: the LLM reason is free text that may quote the message; keep it redacted and bounded.
+        llm_reason = redact(extraction.reason)[:200] if extraction.reason else None
         if extraction.kind == "ignore":
             item.status = "ignored"
-            item.review_reason = extraction.reason
+            item.review_reason = llm_reason
             return
         reasons = [item.review_reason] if item.review_reason else []
         if extraction.kind == "review":
-            reasons.append(extraction.reason or "parser requests review")
+            reasons.append(llm_reason or "parser requests review")
         if item.method == "llm":
             reasons.extend(verify_llm(text, extraction))
         item.amount = extraction.amount.quantize(Decimal("0.01")) if extraction.amount is not None else None
         if item.method == "llm" and (not item.amount or self.settings.llm_auto_approve_max_cop == 0 or item.amount > self.settings.llm_auto_approve_max_cop):
             reasons.append("LLM extraction requires human review")
-        if item.source == "sms" and item.method == "parser" and (not item.amount or self.settings.sms_auto_approve_max_cop == 0 or item.amount > self.settings.sms_auto_approve_max_cop):
-            reasons.append("SMS extraction requires human review")
+        # A1: SMS sender IDs and notification package names are spoofable and the ingest key sits on the phone: both need an explicit cap.
+        phone_caps = {"sms": ("SMS", self.settings.sms_auto_approve_max_cop), "notification": ("Notification", self.settings.notification_auto_approve_max_cop)}
+        if item.method == "parser" and item.source in phone_caps:
+            label, cap = phone_caps[item.source]
+            if not item.amount or cap == 0 or item.amount > cap:
+                reasons.append(f"{label} extraction requires human review")
         item.currency, item.merchant = extraction.currency, extraction.merchant
         item.transaction_type = extraction.kind
         item.original_kind = extraction.kind
@@ -296,6 +323,9 @@ class Processor:
         source, destination = (other, asset) if kind in {"deposit", "refund"} else (asset, other)
         automatic = ["manual"] if item.source == "manual" else ["auto", item.source]
         split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str(item.amount.quantize(Decimal("0.01"))), "currency_code": item.currency, "description": item.description or item.subject_or_title or item.merchant, "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref, "tags": automatic + [tag for tag in item.tags or [] if tag not in automatic]}
+        if item.status == "created" and not (item.description or item.subject_or_title):
+            # Editing an item whose title was purged by retention: keep Firefly's description instead of overwriting it with the merchant.
+            del split["description"]
         if item.category:
             split["category_name"] = item.category
         return {"apply_rules": True, "error_if_duplicate_hash": True, "transactions": [split]}
@@ -344,7 +374,7 @@ class Processor:
                 found = await self.firefly.find_by_external_id("fa:" + item.source_ref)
                 if found:
                     item.firefly_transaction_id, item.status = str(found), "created"
-                    return await self._finish(item, old_status)
+                    return await self._finish(item, old_status, approved)
                 duplicate = await self.inbox.find_duplicate(item, self.settings.dedup_window_minutes)
                 if duplicate and not approved:
                     if item.source == "manual" or duplicate.source == "manual":
@@ -358,16 +388,22 @@ class Processor:
                     if paired and not approved:
                         item.status, item.duplicate_of_id = "duplicate", paired.id
                         return await self._finish(item, old_status)
+                if not approved:
+                    # B8: the pause also holds items already extracted that retry after a Firefly outage.
+                    paused = await flags.policy_reasons(self.session, item)
+                    if paused:
+                        item.status, item.review_reason = "needs_review", "; ".join(paused)
+                        return await self._finish(item, old_status)
                 item.status = "submitting"
                 await self.session.commit()
                 payload = await self._split(item)
                 item.firefly_transaction_id = str(await self.firefly.create_transaction(payload))
                 item.status, item.last_error, item.next_attempt_at = "created", None, None
                 # Commit before releasing the economic guard: another channel must see it.
-                return await self._finish(item, old_status)
+                return await self._finish(item, old_status, approved)
         except PermanentError as exc:
             item.status = "failed" if item.source == "manual" else "needs_review"
-            item.review_reason = item.last_error = str(exc)[:1000]
+            item.review_reason = item.last_error = _permanent_message(exc)
         except Exception:
             if item.amount is None:
                 item.method = None
@@ -380,11 +416,12 @@ class Processor:
                 item.next_attempt_at = _now() + timedelta(minutes=min(720, 5 * 2 ** min(item.attempts - 1, 8)))
         return await self._finish(item, old_status)
 
-    async def _finish(self, item, old_status):
+    async def _finish(self, item, old_status, approved=False):
         item.claim_token = item.claim_until = None
         self.session.add(InboxEvent(inbox_id=item.id, action=item.status, detail=item.review_reason or item.last_error))
         await self.session.commit()
         await self._announce(item, old_status)
+        await self._new_charge(item, old_status, approved)
         return item
 
     async def _announce(self, item, old_status):
@@ -395,6 +432,24 @@ class Processor:
             await self.session.commit()
         except Exception as exc:
             logger.error("item_alert_failed", inbox_id=item.id, error_type=type(exc).__name__)
+
+    async def _new_charge(self, item, old_status, approved):
+        """Origin alert for «Fui yo / No lo reconozco»: an automatic item that reached Firefly with nobody approving it. Best-effort."""
+        if item.status != "created" or old_status == "created" or approved or item.source == "manual":
+            return
+        try:
+            async with self.session.begin_nested():
+                place = f" en {item.merchant}" if item.merchant else ""
+                await alerting.emit(
+                    self.session, "new_charge", title="Nuevo cobro registrado",
+                    body=f"Se registró automáticamente un movimiento de {alerting.money(item.amount, item.currency)}{place}. Si no fuiste tú, usa «No lo reconozco».",
+                    item_id=item.id, amount=item.amount, currency=item.currency,
+                    suggested_categories=await suggestions.suggest(self.session, item),
+                    dedupe_key=f"new_charge:{item.id}", min_interval_minutes=alerting.ONCE_MINUTES,
+                )
+            await self.session.commit()
+        except Exception as exc:
+            logger.error("new_charge_alert_failed", inbox_id=item.id, error_type=type(exc).__name__)
 
     async def cycle(self, dry_run=False):
         poll = {"skipped": True} if dry_run else await self.poll_mail()
@@ -465,9 +520,11 @@ class Processor:
 
     async def _purge(self):
         from sqlalchemy import update
-        # Raw text lives RAW_TEXT_RETENTION_DAYS in every status (contract section 10); only rows that still hold text are touched.
-        await self.session.execute(update(InboxItem).where(InboxItem.created_at < _now() - timedelta(days=self.settings.raw_text_retention_days), InboxItem.raw_text.is_not(None)).values(raw_text=None))
-        await self.session.execute(update(InboxItem).where(InboxItem.status.in_(["ignored", "rejected"]), InboxItem.created_at < _now() - timedelta(days=self.settings.raw_text_retention_days)).values(subject_or_title=""))
+        # Raw text and the title derived from it (e-mail subject, notification title, manual description) live
+        # RAW_TEXT_RETENTION_DAYS in every status (contract section 10); only rows that still hold text are touched.
+        cutoff = _now() - timedelta(days=self.settings.raw_text_retention_days)
+        await self.session.execute(update(InboxItem).where(InboxItem.created_at < cutoff, InboxItem.raw_text.is_not(None)).values(raw_text=None))
+        await self.session.execute(update(InboxItem).where(InboxItem.created_at < cutoff, InboxItem.subject_or_title != "").values(subject_or_title=""))
 
     async def learn_senders(self):
         candidates, errors = set(), {}
@@ -521,7 +578,12 @@ class Processor:
             item.status = "rejected"
         elif action == "void":
             if item.firefly_transaction_id:
-                await self.firefly.delete_transaction(item.firefly_transaction_id)
+                try:
+                    await self.firefly.delete_transaction(item.firefly_transaction_id)
+                except PermanentError as exc:
+                    # Already gone in Firefly (404): the void is idempotent.
+                    if not str(exc).startswith("Firefly 404"):
+                        raise
             changes["status"] = {"old": item.status, "new": "voided"}
             item.status = "voided"
         else:
@@ -567,8 +629,7 @@ class Processor:
             else:
                 item.method = item.method or "review"
                 item.status = "needs_review"
-                if changes:
-                    await self._audit_review(item, action, changes, principal)
+                await self._audit_review(item, action, changes, principal)
                 await self.session.commit()
                 return await self.process(item, approved=True)
         await self._audit_review(item, action, changes, principal)
@@ -612,7 +673,7 @@ class Processor:
             totals[row.transaction_type] = totals.get(row.transaction_type, Decimal(0)) + amount
             for mapping, key in [(categories, row.category or "Sin categoría"), (accounts, row.asset_account or "Sin cuenta"), (merchants, row.merchant or "Sin comercio")]:
                 mapping[key] = mapping.get(key, Decimal(0)) + amount
-        result = {"period": period, "start": start.isoformat(), "end": end.isoformat(), "totals": {k: str(v) for k, v in totals.items()}, "by_category": {k: str(v) for k, v in categories.items()}, "by_account": {k: str(v) for k, v in accounts.items()}, "top_merchants": [{"merchant": k, "amount": str(v)} for k, v in sorted(merchants.items(), key=lambda pair: pair[1], reverse=True)[:5]]}
+        result = {"period": period, "start": start.isoformat(), "end": end.isoformat(), "totals": {k: _money(v) for k, v in totals.items()}, "by_category": {k: _money(v) for k, v in categories.items()}, "by_account": {k: _money(v) for k, v in accounts.items()}, "top_merchants": [{"merchant": k, "amount": _money(v)} for k, v in sorted(merchants.items(), key=lambda pair: pair[1], reverse=True)[:5]]}
         if insight and hasattr(self.firefly, "insight"):
             try:
                 result["firefly_insight"] = await self.firefly.insight(start, end - timedelta(days=1))

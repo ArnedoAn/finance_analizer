@@ -94,7 +94,8 @@ async def test_subscriptions_detect_new_and_price_increase(client, db):
         add(db, local(11, day), "5000.00", "Bus")
     add(db, local(11, 1), "9000.00", "Irregular")  # 10-day gap: not a known cadence
     add(db, local(11, 11), "9000.00", "Irregular")
-    add(db, local(10, 3), "10000.00", "Variable")  # monthly but price swings over 20 %
+    add(db, local(9, 3), "10000.00", "Variable")  # monthly but the earlier prices swing over 20 %
+    add(db, local(10, 3), "20000.00", "Variable")
     add(db, local(11, 3), "20000.00", "Variable")
     add(db, local(11, 8), "7000.00", "Una vez")
     await db.commit()
@@ -296,3 +297,31 @@ async def test_report_endpoints_require_read_scope(client):
         assert (await client.get("/api/v1" + path, headers={"X-API-Key": PHONE_KEY})).status_code == 403, path
         assert (await client.get("/api/v1" + path)).status_code == 401, path
         assert (await client.get("/api/v1" + path, headers=ADMIN)).status_code == 200, path
+
+
+async def test_jump_above_twenty_percent_on_the_last_charge_is_price_increase(client, db):
+    for month in (8, 9, 10):
+        add(db, local(month, 15), "10000.00", "Streaming")
+    add(db, local(11, 15), "13000.00", "Streaming")
+    await db.commit()
+
+    item, = (await get(client, "/reports/subscriptions", date="2026-11-20")).json()["items"]
+    assert item["merchant"] == "Streaming" and item["status"] == "price_increase"
+    assert (item["previous_amount"], item["amount"], item["change_pct"]) == ("10000.00", "13000.00", "30.00")
+
+
+async def test_alert_check_emits_price_increase_for_jump_above_twenty_percent(db, settings, monkeypatch):
+    for month in (8, 9, 10):
+        add(db, local(month, 15), "10000.00", "Streaming")
+    add(db, local(11, 15), "13000.00", "Streaming")
+    await db.commit()
+    monkeypatch.setattr(reports, "now_utc", lambda: datetime(2026, 11, 20, 17, 0, tzinfo=UTC))
+    calls = []
+
+    async def emit(session, type, **kwargs):
+        calls.append((type, kwargs["dedupe_key"]))
+        return object()
+
+    monkeypatch.setitem(sys.modules, "app.services.alerts", types.SimpleNamespace(emit=emit, ONCE_MINUTES=525600))
+    assert await reports.alert_check(db, settings, None) == 1
+    assert calls == [("price_increase", "price_increase:streaming:10000.00:13000.00")]

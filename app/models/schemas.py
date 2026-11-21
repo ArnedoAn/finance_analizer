@@ -6,6 +6,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# Column sizes (app 255, sender 512) and a body ceiling well above the 4000 chars that are stored: an oversized
+# value must be a 422, not a database error that the phone outbox would retry forever.
+MAX_BODY_CHARS = 20000
+
 
 class WebhookPayload(BaseModel):
     model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
@@ -14,12 +18,12 @@ class WebhookPayload(BaseModel):
     post_time: int | None = None
     id: str = ""
     type: Literal["notification", "sms"] = "notification"
-    app: str = ""
-    sender: str = ""
-    title: str = ""
-    message: str = ""
-    text: str = ""
-    big_text: str = ""
+    app: str = Field(default="", max_length=255)
+    sender: str = Field(default="", max_length=512)
+    title: str = Field(default="", max_length=500)
+    message: str = Field(default="", max_length=MAX_BODY_CHARS)
+    text: str = Field(default="", max_length=MAX_BODY_CHARS)
+    big_text: str = Field(default="", max_length=MAX_BODY_CHARS)
     timestamp: str = ""
     date: str = ""
     category: str = ""

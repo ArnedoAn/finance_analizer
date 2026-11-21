@@ -47,7 +47,7 @@ async def _audit(db, principal, action, target_type, target_id, detail):
 
 
 @router.get("/merchants", dependencies=[READ])
-async def list_merchants(db: DB, q: str | None = None, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+async def list_merchants(db: DB, q: str | None = None, limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
     query = select(Merchant)
     if q:
         query = query.where(func.lower(Merchant.name).contains(q.strip().lower(), autoescape=True))
@@ -116,9 +116,11 @@ async def pending_transfers(db: DB, service: Service):
 @router.post("/transfers/pair")
 async def pair_transfer(body: TransferPair, db: DB, service: Service, principal: ReviewPrincipal):
     try:
-        out, incoming = await transfers.pair(service, body.out_id, body.in_id)
+        out, incoming = await transfers.pair(service, body.out_id, body.in_id, principal=principal)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except transfers.PairConflictError as exc:
+        raise HTTPException(409, {"detail": str(exc), "code": "conflict"}) from exc
     except ValueError as exc:  # includes PermanentError (unknown Firefly account)
         raise HTTPException(422, str(exc)) from exc
     result = {"out_item": item_data(out), "in_item": item_data(incoming)}

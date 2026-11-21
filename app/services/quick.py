@@ -1,7 +1,7 @@
 """Quick free-text entry such as "25k taxi" (contract section 13).
 
-``parse`` is pure; ``create_entry`` wires it to ``Processor.manual`` so the entry is the
-owner's own, approved and written to Firefly, and idempotent by ``client_ref``.
+``parse`` is pure; ``create_entry`` wires it to ``Processor.manual`` so the entry is the owner's own, approved and
+written to Firefly, and idempotent by ``client_ref``; above ``REVIEW_AMOUNT_COP`` it stays ``needs_review`` instead.
 """
 import re
 from dataclasses import dataclass
@@ -20,6 +20,8 @@ NUMBER = re.compile(
     re.IGNORECASE,
 )
 MULTIPLIERS = {"k": 1_000, "mil": 1_000, "m": 1_000_000, "millon": 1_000_000, "millones": 1_000_000}
+
+AMBIGUOUS_AMOUNT = "Indica el monto con $ o k"
 
 
 class UnparseableError(ValueError):
@@ -60,8 +62,8 @@ def _number(raw: str, scaled: bool) -> Decimal | None:
 
 
 def _find_amount(text: str):
-    """Best amount token: explicit ``$`` first, then a k/mil/m suffix, then the largest value."""
-    best, best_key = None, None
+    """Best amount token: explicit ``$`` first, then a k/mil/m suffix. Several bare numbers are ambiguous."""
+    best, best_key, candidates = None, None, 0
     for match in NUMBER.finditer(text):
         suffix = (match["short"] or match["word"] or "").casefold()
         value = _number(match["number"], bool(suffix))
@@ -70,9 +72,13 @@ def _find_amount(text: str):
         amount = (value * MULTIPLIERS.get(suffix, 1)).quantize(Decimal("0.01"), ROUND_HALF_UP)
         if amount <= 0 or amount > MAX_AMOUNT:
             continue
+        candidates += 1
         key = (bool(match["currency"]), bool(suffix), amount)
         if best_key is None or key > best_key:
             best, best_key = (match, amount), key
+    if best_key is not None and not (best_key[0] or best_key[1]) and candidates > 1:
+        # "pago 45.000 ref 2000000": guessing the largest would write a reference number as the amount.
+        raise UnparseableError(AMBIGUOUS_AMOUNT)
     return best
 
 
@@ -131,7 +137,10 @@ async def create_entry(service, *, text, client_ref, account=None, principal=Non
         client_ref=ref, amount=entry.amount, description=entry.description, type="withdrawal",
         category=category, account=account or entry.account, merchant=entry.merchant,
     )
-    item = await service.manual(payload)
+    # An unusually large figure typed fast is more likely a typo or a reference number than a deliberate amount:
+    # above the review threshold the entry waits for approval instead of being written to Firefly.
+    hold = "quick entry over the review threshold" if entry.amount > service.settings.review_amount_cop else None
+    item = await service.manual(payload, hold=hold)
     await audit.record(
         service.session, action="transactions.quick", target_type="inbox_item", target_id=item.id,
         detail={"client_ref": client_ref, "amount": str(entry.amount), "category": category, "status": item.status},

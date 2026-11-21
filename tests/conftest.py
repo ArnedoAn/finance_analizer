@@ -36,8 +36,10 @@ def settings(monkeypatch):
             firefly_account="Nequi", bank="nequi", kind="wallet", last4=["1234"],
             aliases=["nequi"], sources=["app:com.nequi.MobileApp", "sms:85954", "email:nequi.com.co"],
         )],
-        # Pipeline tests exercise SMS auto-creation; production default is 0 (see test_sms_default_requires_review).
-        manual_default_account="Nequi", sms_auto_approve_max_cop=Decimal("2000000"), _env_file=None,
+        # Pipeline tests exercise SMS/notification auto-creation; the production defaults are 0 (see test_sms_default_requires_review
+        # and test_fixes_pipeline).
+        manual_default_account="Nequi", sms_auto_approve_max_cop=Decimal("2000000"),
+        notification_auto_approve_max_cop=Decimal("2000000"), _env_file=None,
     )
     monkeypatch.setattr("app.api.dependencies.get_settings", lambda: config)
     yield config
@@ -126,6 +128,7 @@ async def client(db, settings, service, monkeypatch) -> AsyncGenerator[AsyncClie
         yield db
 
     _auth_failures.clear()
+    ingest._recent_events.clear()
     app.dependency_overrides[get_db] = isolated_db
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_processor] = lambda: service
@@ -135,3 +138,4 @@ async def client(db, settings, service, monkeypatch) -> AsyncGenerator[AsyncClie
     finally:
         app.dependency_overrides.clear()
         _auth_failures.clear()
+        ingest._recent_events.clear()

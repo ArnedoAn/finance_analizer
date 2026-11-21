@@ -3,7 +3,7 @@
 ``apply`` is called by ``Processor._extract`` after merchant normalization and before the
 review decision. It may set ``item.category`` from a matching rule; it never changes status.
 """
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.db.models_rules import Merchant, MerchantItem, Rule
 from app.parsers import normalize_merchant
@@ -32,7 +32,10 @@ def normalize_pattern(match: str, pattern: str) -> str:
 
 
 async def _count_item(session, item, name: str) -> Merchant:
-    """Upsert the merchant and count ``item`` once, however many times it is reprocessed."""
+    """Upsert the merchant and count ``item`` once, however many times it is reprocessed.
+
+    The counter is incremented in SQL (``count = count + 1``) so concurrent workers never lose an update.
+    """
     merchant = await session.scalar(select(Merchant).where(Merchant.name == name))
     if merchant is None:
         merchant = Merchant(name=name, count=0)
@@ -40,7 +43,12 @@ async def _count_item(session, item, name: str) -> Merchant:
         await session.flush()
     if await session.get(MerchantItem, item.id) is None:
         session.add(MerchantItem(item_id=item.id, merchant_id=merchant.id))
-        merchant.count += 1
+        await session.flush()
+        await session.execute(
+            update(Merchant).where(Merchant.id == merchant.id).values(count=Merchant.count + 1)
+            .execution_options(synchronize_session=False)
+        )
+        await session.refresh(merchant, ["count"])
     if merchant.last_seen_at is None or item.occurred_at > merchant.last_seen_at:
         merchant.last_seen_at = item.occurred_at
     await session.flush()
@@ -55,8 +63,8 @@ def _matches(rule: Rule, name: str, text: str) -> bool:
     return rule.pattern in text
 
 
-async def _first_rule(session, name: str, subject: str) -> Rule | None:
-    text = _squash(subject.casefold())
+async def _first_rule(session, name: str, text: str) -> Rule | None:
+    text = _squash(text.casefold())
     rules = [rule for rule in (await session.scalars(select(Rule))).all() if rule.pattern and _matches(rule, name, text)]
     # Priority: exact > contains > text; then manual before learned; then most recent.
     rules.sort(key=lambda r: (_PRIORITY.get(r.match, len(MATCHES)), r.source != "manual", -r.created_at.timestamp(), -r.id))
@@ -70,10 +78,14 @@ async def apply(session, item) -> None:
     merchant = await _count_item(session, item, name) if name else None
     if item.category:
         return
-    rule = await _first_rule(session, name, item.subject_or_title or "")
+    # text_contains looks at the subject/title and the original text, not only the subject.
+    rule = await _first_rule(session, name, f"{item.subject_or_title or ''} {item.raw_text or ''}")
     if rule is not None:
         item.category = rule.category
-        rule.hits += 1
+        await session.execute(
+            update(Rule).where(Rule.id == rule.id).values(hits=Rule.hits + 1).execution_options(synchronize_session=False)
+        )
+        await session.refresh(rule, ["hits"])
     elif merchant is not None and merchant.default_category:
         item.category = merchant.default_category
 

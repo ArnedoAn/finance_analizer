@@ -4,6 +4,15 @@
 table (``key``, ``last_sent_at``) under the ``alert:`` prefix: a repeated ``dedupe_key`` (or type,
 when none is given) inside the interval is suppressed. Titles and bodies are Spanish, carry full
 amounts and never include raw message text.
+
+Ordering and ``after_id``: the app polls ``GET /alerts?after_id=<last_id>`` and keeps the highest id it saw.
+That is only safe if ids become visible in order. On PostgreSQL a sequence hands out ids at insert time but
+rows become visible at commit, so a transaction holding id 7 could commit after another already committed
+id 8, and a client at ``after_id=8`` would never see 7. ``emit`` therefore takes a transaction-level advisory
+lock (``pg_advisory_xact_lock``, fixed key ``ALERT_ORDER_LOCK``) before anything else; it is released at
+commit/rollback, so concurrent emitters commit their alerts one at a time and in id order. SQLite
+already serializes writers and needs no lock. Callers should commit soon after ``emit``: the lock is held
+until then.
 """
 import hashlib
 from datetime import date, datetime, timedelta
@@ -27,6 +36,12 @@ DAILY_MINUTES = 60 * 24
 KEY_REMINDER_MINUTES = 60 * 24 * 3
 KEY_EXPIRY_WINDOW = timedelta(days=7)
 OLD_PENDING_SECONDS = 7200
+ALERT_ORDER_LOCK = 7_424_001  # fixed pg_advisory_xact_lock key serializing alert emission on PostgreSQL
+
+
+def _is_postgres(session) -> bool:
+    return session.get_bind().dialect.name == "postgresql"
+
 
 _MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 _SOURCES = {"sms": "un SMS", "notification": "una notificación del teléfono", "email": "un correo", "manual": "un registro manual"}
@@ -85,7 +100,12 @@ async def emit(session, type: str, *, title: str, body: str, item_id=None, amoun
                suggested_categories=None, question=None, options=None, dedupe_key: str | None = None,
                min_interval_minutes: int | None = None) -> Alert | None:
     """Insert an alert unless the same ``dedupe_key`` (default: the type) fired within the interval
-    (default ``NOTIFY_MIN_INTERVAL_MINUTES``). Returns the flushed row, or None when suppressed."""
+    (default ``NOTIFY_MIN_INTERVAL_MINUTES``). Returns the flushed row, or None when suppressed.
+    On PostgreSQL the call first takes ``ALERT_ORDER_LOCK`` (see the module docstring)."""
+    if _is_postgres(session):
+        # First thing, before the anti-noise claim: a transaction that waits here holds no claim rows,
+        # so two emitters can never deadlock on each other's ``notifications`` keys.
+        await session.execute(select(func.pg_advisory_xact_lock(ALERT_ORDER_LOCK)))
     if min_interval_minutes is None:
         min_interval_minutes = get_settings().notify_min_interval_minutes
     dedupe = dedupe_key or type
@@ -172,12 +192,13 @@ async def check_old_pending(session, stats) -> Alert | None:
 
 
 async def check_phone_silence(session, settings) -> Alert | None:
+    """Alert when the phone has been silent for ``phone_silence_hours``. No phone event ever recorded means
+    there is nothing to compare against, so it does not alert (same rule as ``GET /system/capture``)."""
     last = await session.scalar(select(func.max(InboxItem.created_at)).where(InboxItem.source.in_(["sms", "notification"])))
-    if last is not None and now_utc() - last <= timedelta(hours=settings.phone_silence_hours):
+    if last is None or now_utc() - last <= timedelta(hours=settings.phone_silence_hours):
         return None
-    since = f"desde el {_local(last, ZoneInfo(settings.timezone))}" if last else "todavía"
     return await emit(session, "phone_silence", title="Sin eventos del teléfono", dedupe_key="phone_silence",
-                      body=f"El teléfono no ha enviado eventos {since} (límite: {settings.phone_silence_hours} h). Revisa que la app Cofre siga activa.",
+                      body=f"El teléfono no ha enviado eventos desde el {_local(last, ZoneInfo(settings.timezone))} (límite: {settings.phone_silence_hours} h). Revisa que la app Cofre siga activa.",
                       min_interval_minutes=settings.phone_silence_hours * 60)
 
 

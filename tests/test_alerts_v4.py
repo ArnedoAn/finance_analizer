@@ -177,9 +177,10 @@ async def test_big_amount_alert_above_review_threshold(service, db, extraction, 
     assert len(await rows(db, "big_amount")) == 1
 
 
-async def test_ordinary_created_item_emits_nothing(service, db):
+async def test_ordinary_created_item_emits_only_new_charge(service, db):
     row = await service.process(await make_item(service))
-    assert row.status == "created" and not await rows(db)
+    assert row.status == "created"
+    assert [alert.type for alert in await rows(db)] == ["new_charge"]
 
 
 async def test_duplicate_item_emits_duplicate_suspect(service, db):
@@ -231,7 +232,12 @@ async def test_healthy_backup_emits_nothing(service, db, settings, tmp_path):
     assert not await rows(db, "backup_failed")
 
 
+async def stale_phone_event(service, hours=48):
+    return await make_item(service, source="sms", sender="85954", created_at=datetime.now(UTC) - timedelta(hours=hours))
+
+
 async def test_phone_silence_alert_only_without_recent_phone_events(service, db):
+    await stale_phone_event(service)
     await service.alerts()
     alert, = await rows(db, "phone_silence")
     assert "24 h" in alert.body
@@ -239,6 +245,37 @@ async def test_phone_silence_alert_only_without_recent_phone_events(service, db)
     await make_item(service, source="sms", sender="85954")
     await service.alerts()
     assert len(await rows(db, "phone_silence")) == 1
+
+
+async def test_phone_silence_without_any_phone_event_does_not_alert(service, db):
+    # Same rule as GET /system/capture: nothing to compare against is not "silent".
+    await make_item(service, source="email")  # email is not a phone source
+    assert await alerting.check_phone_silence(db, service.settings) is None
+    await service.alerts()
+    assert not await rows(db, "phone_silence")
+
+
+async def test_emit_takes_advisory_lock_first_only_on_postgres(db, monkeypatch):
+    statements = []
+    real_execute = db.execute
+
+    async def spy(statement, *args, **kwargs):
+        text = str(statement)
+        if "pg_advisory_xact_lock" in text:
+            statements.append(statement.compile().params)
+            return None
+        statements.append(text.split()[0])
+        return await real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", spy)
+    assert alerting._is_postgres(db) is False
+    assert await alerting.emit(db, "system_failure", title="t", body="b", dedupe_key="sqlite-1")
+    assert not any(isinstance(entry, dict) for entry in statements)
+
+    statements.clear()
+    monkeypatch.setattr(alerting, "_is_postgres", lambda session: True)
+    assert await alerting.emit(db, "system_failure", title="t", body="b", dedupe_key="pg-1")
+    assert list(statements[0].values()) == [alerting.ALERT_ORDER_LOCK]  # first: before the claim and the insert
 
 
 async def test_key_expiring_alerts_only_for_active_keys_expiring_within_seven_days(service, db, settings):
@@ -323,12 +360,14 @@ async def test_periodic_checks_run_external_checks_in_order_and_survive_failures
 
     monkeypatch.setattr(reports, "alert_check", failing)
     monkeypatch.setattr(anomalies, "alert_check", recording)
+    await stale_phone_event(service)
     await service.alerts()
     assert calls == ["reports", "anomalies"]
     assert await rows(db, "phone_silence")
 
 
 async def test_budget_failure_does_not_abort_the_other_checks(service, db, clients):
+    await stale_phone_event(service)
     clients[0].budget_progress.side_effect = RuntimeError("firefly down")
     await service.alerts()
     assert await rows(db, "phone_silence") and not await rows(db, "budget_80")

@@ -2,6 +2,7 @@
 import json
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -246,16 +247,17 @@ async def test_corrections_limits(client, service):
         assert response.status_code == 422 and response.json()["code"] == "validation_error"
 
 
-async def test_approve_audits_only_when_it_changes_something(client, service):
+async def test_every_approve_is_audited_with_or_without_changes(client, service):
     unchanged = await pending_review(service)
     changed = await pending_review(service)
     unchanged_id, changed_id = unchanged.id, changed.id
     assert (await client.post(f"/api/v1/inbox/{unchanged_id}/approve", headers=ADMIN, json={})).json()["status"] == "created"
-    assert (await audit_entries(client, "inbox.approve"))["total"] == 0
+    entries = (await audit_entries(client, "inbox.approve"))["items"]
+    assert len(entries) == 1 and entries[0]["target_id"] == str(unchanged_id) and entries[0]["detail"] == {"changes": {}}
     response = await client.post(f"/api/v1/inbox/{changed_id}/approve", headers=ADMIN, json={"merchant": "OTRA TIENDA", "tags": ["viaje"]})
     assert response.status_code == 200 and response.json()["status"] == "created"
     entries = (await audit_entries(client, "inbox.approve"))["items"]
-    assert len(entries) == 1 and entries[0]["target_id"] == str(changed_id)
+    assert len(entries) == 2 and entries[0]["target_id"] == str(changed_id)
     assert entries[0]["detail"]["changes"]["merchant"] == {"old": "TIENDA UNO", "new": "OTRA TIENDA"}
     assert entries[0]["detail"]["changes"]["tags"] == {"old": [], "new": ["viaje"]}
 
@@ -279,3 +281,91 @@ async def test_review_routes_audit_the_device_and_enforce_scope(client, service,
     assert (await client.patch(f"/api/v1/inbox/{item_id}", headers=reviewer, json={"description": "x"})).status_code == 200
     entry = (await audit_entries(client, "inbox.edit"))["items"][0]
     assert entry["actor"] == "reviewer" and entry["device_id"] == reviewer_id
+
+
+async def test_inbox_filters_by_exact_source_ref(client, service):
+    target = await make(service, source_ref="sms:abc-1")
+    await make(service, source_ref="sms:abc-10")
+    await make(service, source_ref="other")
+    assert await ids_for(client, source_ref="sms:abc-1") == {target.id}
+    assert await ids_for(client, source_ref="missing") == set()
+
+
+# --- suspicious reports on auto-approved charges ---------------------------------------------------
+
+
+async def test_reject_suspicious_on_a_created_item_voids_it_and_pauses_auto_approval(client, service, clients, db):
+    item = await make(service, firefly_transaction_id="tx-auto")
+    item_id = item.id
+    plain = await client.post(f"/api/v1/inbox/{item_id}/reject", headers=ADMIN)
+    assert plain.status_code == 422
+    clients[0].delete_transaction.assert_not_awaited()
+    assert (await flags.status(db))["auto_approve_paused"] is False
+
+    response = await client.post(f"/api/v1/inbox/{item_id}/reject", headers=ADMIN, json={"suspicious": True})
+    assert response.status_code == 200 and response.json()["status"] == "voided"
+    clients[0].delete_transaction.assert_awaited_once_with("tx-auto")
+    assert (await flags.status(db))["auto_approve_paused"] is True
+    assert (await audit_entries(client, "inbox.void"))["total"] == 1
+    assert (await audit_entries(client, "flags.suspicious"))["items"][0]["target_id"] == str(item_id)
+
+
+async def test_reject_suspicious_failure_is_reported_and_retry_is_safe(client, service, clients, db, monkeypatch):
+    item = await make(service, firefly_transaction_id="tx-auto")
+    item_id = item.id
+    real, calls = flags.mark_suspicious, []
+
+    async def flaky(session, target, principal=None):
+        calls.append(target.id)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        await real(session, target, principal)
+
+    monkeypatch.setattr(flags, "mark_suspicious", flaky)
+    first = await client.post(f"/api/v1/inbox/{item_id}/reject", headers=ADMIN, json={"suspicious": True})
+    assert first.status_code == 503 and first.json()["code"] == "suspicious_not_marked" and "retry" in first.json()["detail"]
+    assert (await service.inbox.get(item_id)).status == "voided"
+    assert (await flags.status(db))["auto_approve_paused"] is False
+
+    second = await client.post(f"/api/v1/inbox/{item_id}/reject", headers=ADMIN, json={"suspicious": True})
+    assert second.status_code == 200 and second.json()["status"] == "voided"
+    clients[0].delete_transaction.assert_awaited_once_with("tx-auto")
+    assert calls == [item_id, item_id] and (await flags.status(db))["auto_approve_paused"] is True
+
+
+# --- audit of reprocess, retry-failed and raw reads ------------------------------------------------
+
+
+async def test_reprocess_and_retry_failed_are_audited(client, service, monkeypatch):
+    monkeypatch.setattr(service, "process", AsyncMock())
+    first = await make(service, status="failed", firefly_transaction_id=None)
+    second = await make(service, status="failed", firefly_transaction_id=None)
+    first_id = first.id
+    assert (await client.post(f"/api/v1/inbox/{first_id}/reprocess", headers=ADMIN)).status_code == 200
+    entry = (await audit_entries(client, "inbox.reprocess"))["items"][0]
+    assert entry["target_id"] == str(first_id) and entry["actor"] == "admin" and entry["detail"] == {"previous_status": "failed"}
+
+    assert (await client.post("/api/v1/inbox/retry-failed", headers=ADMIN)).json() == {"requeued": 1}
+    entry = (await audit_entries(client, "inbox.retry_failed"))["items"][0]
+    assert entry["actor"] == "admin" and entry["detail"] == {"requeued": 1}
+    assert second.id and (await audit_entries(client, "inbox.reprocess"))["total"] == 1
+
+
+async def test_reading_the_raw_text_is_audited_without_the_content(client, service, db):
+    reviewer, reviewer_id = await device(db, "reviewer", ["read", "review"])
+    reader, _ = await device(db, "reader", ["read"])
+    item = await make(service, raw_text="Compra con tarjeta 1234567890123 token-ultra-secreto")
+    item_id = item.id
+    assert (await client.get(f"/api/v1/inbox/{item_id}", headers=ADMIN)).status_code == 200
+    assert (await audit_entries(client, "inbox.raw_view"))["total"] == 0
+    assert (await client.get(f"/api/v1/inbox/{item_id}", headers=reader, params={"include_raw": "true"})).status_code == 403
+    assert (await audit_entries(client, "inbox.raw_view"))["total"] == 0
+
+    response = await client.get(f"/api/v1/inbox/{item_id}", headers=reviewer, params={"include_raw": "true"})
+    assert response.status_code == 200 and "token-ultra-secreto" in response.json()["raw_text"]
+    listing = await audit_entries(client, "inbox.raw_view")
+    assert listing["total"] == 1
+    entry = listing["items"][0]
+    assert entry["target_type"] == "inbox_item" and entry["target_id"] == str(item_id)
+    assert entry["actor"] == "reviewer" and entry["device_id"] == reviewer_id
+    assert "token-ultra-secreto" not in json.dumps(entry) and "1234567890123" not in json.dumps(entry)

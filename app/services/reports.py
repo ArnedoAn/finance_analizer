@@ -103,9 +103,11 @@ def _recurrence(charges: list[InboxItem], zone: ZoneInfo, day: date) -> dict | N
     while start > 0 and _cadence(gaps[start - 1]) == kind:
         start -= 1
     run, run_dates, run_gaps = charges[start:], dates[start:], gaps[start:]
-    amounts = [charge.amount for charge in run]
-    low = min(amounts)
-    if low <= 0 or (max(amounts) - low) / low > MAX_VARIATION:
+    # MAX_VARIATION bounds the amounts *before* the last one; the last is judged against
+    # PRICE_INCREASE_RATIO so a jump above 20 % is reported as ``price_increase`` instead of hiding the series.
+    prior = [charge.amount for charge in run[:-1]]
+    low = min(prior)
+    if low <= 0 or (max(prior) - low) / low > MAX_VARIATION:
         return None
     last, previous = run[-1], run[-2]
     last_date = run_dates[-1]

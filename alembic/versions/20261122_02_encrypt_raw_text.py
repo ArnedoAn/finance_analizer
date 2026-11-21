@@ -1,5 +1,9 @@
 """Encrypt existing inbox_items.raw_text with AES-256-GCM (v4 phase 2).
 
+Rows already carrying the ``enc:v1:`` prefix are left alone (idempotent rerun); every other non-null row is
+plaintext and is sealed as ``enc:v1:<kid>:<base64>`` with the active key. The prefix is compared with
+``substr`` so the check is case-sensitive on every dialect.
+
 Revision ID: 20261122_02
 Revises: 20261122_01
 """
@@ -37,7 +41,10 @@ def _load_key() -> bytes:
 def upgrade():
     connection = op.get_bind()
     inbox = sa.table("inbox_items", sa.column("id", sa.Integer), sa.column("raw_text", sa.Text))
-    plaintext = sa.and_(inbox.c.raw_text.is_not(None), sa.not_(inbox.c.raw_text.startswith(VERSION_PREFIX)))
+    plaintext = sa.and_(
+        inbox.c.raw_text.is_not(None),
+        sa.func.substr(inbox.c.raw_text, 1, len(VERSION_PREFIX)) != VERSION_PREFIX,
+    )
     if not connection.scalar(sa.select(sa.func.count()).select_from(inbox).where(plaintext)):
         return
     key = _load_key()

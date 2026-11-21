@@ -132,10 +132,17 @@ async def test_unreasonable_phone_timestamp_requires_review(service, post_time):
     assert before - timedelta(seconds=1) <= row.occurred_at <= datetime.now(UTC)
 
 
-async def test_raw_text_is_retained_even_for_unknown_sources(service):
-    row, accepted = await service.ingest_notification(WebhookPayload(app="unknown.app", message="private" * 1000))
+async def test_known_source_retains_truncated_raw_text_and_title(service):
+    row, accepted = await service.ingest_notification(WebhookPayload(app="com.nequi.MobileApp", title="Compra", message="private" * 1000))
+    assert accepted and row.status == "pending"
+    assert row.raw_text == ("private" * 1000)[:4000] and row.subject_or_title == "Compra"
+
+
+async def test_unknown_source_stores_neither_raw_text_nor_title(service):
+    # B6: a sender that matches no own account is only an identity; its content is never kept.
+    row, accepted = await service.ingest_notification(WebhookPayload(app="unknown.app", sender="unknown.app", title="Título privado", message="private" * 1000))
     assert not accepted and row.status == "ignored"
-    assert row.raw_text == ("private" * 1000)[:4000]
+    assert row.raw_text is None and row.subject_or_title == ""
 
 
 async def test_outage_retries_without_attempt_limit_then_fails_after_72_hours(service, clients):

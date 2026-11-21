@@ -42,6 +42,8 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 | `MAX_AMOUNT_COP`, `REVIEW_AMOUNT_COP` | 50000000, 2000000 |
 | `LLM_AUTO_APPROVE_MAX_COP` | 0: toda extracción LLM requiere revisión humana; elevarlo es un opt-in de riesgo |
 | `SMS_AUTO_APPROVE_MAX_COP` | 0 (todo SMS va a revisión); un valor mayor permite contabilizar automáticamente SMS hasta ese monto si pasan las demás reglas |
+| `NOTIFICATION_AUTO_APPROVE_MAX_COP` | 0 (toda notificación del teléfono va a revisión); un valor mayor permite contabilizar automáticamente notificaciones hasta ese monto si pasan las demás reglas |
+| `INGEST_MAX_EVENTS_PER_HOUR` | 120; límite de eventos de ingesta por hora, contador por proceso (válido con un solo worker) |
 | `FAIL_AFTER_HOURS` | 72 horas para fallos transitorios automáticos |
 | `RAW_TEXT_RETENTION_DAYS` | 30 para todos los estados; el texto crudo se guarda cifrado (AES-GCM) mientras tanto |
 | `SCHEDULER_ENABLED`, `CYCLE_CRON` | true, `0 * * * *` |

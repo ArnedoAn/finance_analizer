@@ -79,12 +79,58 @@ def test_api_key_minimum_length(compose_env, monkeypatch, name, length):
 
     from app.core.config import Settings
 
-    monkeypatch.setenv(name, "k" * length)
+    key = "abcdefghijklmnopqrstuvwxyz012345"[:length]  # production also demands entropy: every character distinct here
+    monkeypatch.setenv(name, key)
     if length < 32:
         with pytest.raises(ValidationError):
             Settings(_env_file=None)
     else:
-        assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == "k" * length
+        assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == key
+
+
+PLACEHOLDERS = {
+    "FINANCE_API_KEY": "replace-with-random-admin-secret-at-least-32-characters",
+    "PHONE_API_KEY": "replace-with-random-phone-secret-at-least-32-characters",
+}
+
+
+@pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY"])
+def test_production_rejects_the_example_placeholder_keys(compose_env, monkeypatch, name):
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    monkeypatch.setenv(name, PLACEHOLDERS[name])
+    with pytest.raises(ValidationError) as caught:
+        Settings(_env_file=None)
+    assert name in str(caught.value) and PLACEHOLDERS[name] not in str(caught.value)
+
+
+@pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY"])
+@pytest.mark.parametrize(("distinct", "accepted"), [(1, False), (15, False), (16, True), (32, True)])
+def test_production_requires_at_least_16_distinct_characters(compose_env, monkeypatch, name, distinct, accepted):
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    alphabet = "abcdefghijklmnopqrstuvwxyz012345"[:distinct]
+    key = (alphabet * 40)[:48]
+    monkeypatch.setenv(name, key)
+    if accepted:
+        assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == key
+    else:
+        with pytest.raises(ValidationError) as caught:
+            Settings(_env_file=None)
+        assert key not in str(caught.value)
+
+
+@pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY"])
+def test_development_keeps_accepting_placeholder_keys(compose_env, monkeypatch, name):
+    from app.core.config import Settings
+
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(name, PLACEHOLDERS[name])
+    assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == PLACEHOLDERS[name]
 
 
 def test_create_application_with_typical_compose_environment(compose_env, monkeypatch):

@@ -14,6 +14,7 @@ from app.core.timezone import now_utc
 from app.db.models import Notification
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
 from app.models.schemas import SenderInput
+from app.security.redaction import redact
 
 router = APIRouter()
 _scheduler = None
@@ -69,15 +70,29 @@ async def statistics(db: DB):
     return await InboxRepository(db).statistics()
 
 
+def _public_mail_error(account, error: str | None) -> str | None:
+    """Last poll error without the account's login, host or secrets, and without personal data."""
+    if not error:
+        return None
+    for secret in (account.password.get_secret_value(), account.username, account.host):
+        if secret:
+            error = error.replace(secret, "[redacted]")
+    return redact(error)[:300]
+
+
 @router.get("/mail/accounts", dependencies=[READ])
 async def mail_accounts(db: DB):
+    """Read scope sees only name, provider and poll status; login, host and auth ids stay admin-side."""
     states = {row.name: row for row in await MailStateRepository(db).all()}
     result = []
     for account in get_settings().mail_accounts:
-        data = account.model_dump(exclude={"password"})
         state = states.get(account.name)
-        data.update({key: getattr(state, key, None) for key in ("last_poll_at", "last_error", "last_uid", "consecutive_failures")})
-        result.append(data)
+        result.append({
+            "name": account.name, "provider": account.provider,
+            "last_poll_at": getattr(state, "last_poll_at", None),
+            "last_error": _public_mail_error(account, getattr(state, "last_error", None)),
+            "consecutive_failures": getattr(state, "consecutive_failures", None),
+        })
     return {"accounts": result}
 
 
@@ -151,8 +166,10 @@ async def sender_learning(service: Service):
 
 
 @router.post("/sync/all", dependencies=[ADMIN])
-async def sync(service: Service):
-    return await service.sync(force=True)
+async def sync(service: Service, db: DB):
+    result = await service.sync(force=True)
+    await db.commit()  # sync no longer commits
+    return result
 
 
 @router.get("/sync/accounts", dependencies=[READ])

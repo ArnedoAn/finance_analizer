@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     llm_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
     # v4: 0 = every SMS goes to human review (SMS sender IDs are spoofable); raise only deliberately.
     sms_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
+    # v4 (security review A1): the ingest key lives on the phone without app lock, so a leaked key must not be able to
+    # post to Firefly unreviewed. 0 = every notification goes to human review (package names are public); raise only deliberately.
+    notification_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
+    # v4 (A1): per ingest device and hour; the 429 + system_failure alert fire past it. Counted in memory per process
+    # (production runs one uvicorn worker), so with N workers the effective limit is N times higher.
+    ingest_max_events_per_hour: int = Field(default=120, ge=1)
     fail_after_hours: int = Field(default=72, gt=0)
     transfer_pair_window_minutes: int = Field(default=30, ge=0)
     raw_text_retention_days: int = Field(default=30, ge=1)
@@ -118,6 +124,18 @@ class Settings(BaseSettings):
         names = [account.name for account in self.mail_accounts]
         if len(names) != len(set(names)):
             raise ValueError("MAIL_ACCOUNTS names must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def check_production_api_keys(self):
+        """B1: the example files ship ``replace-with-...`` placeholders that are long enough to pass min_length."""
+        if not self.is_production:
+            return self
+        for name in ("finance_api_key", "phone_api_key"):
+            secret = getattr(self, name)
+            value = secret.get_secret_value() if secret is not None else None
+            if value is not None and (value.casefold().startswith("replace-with") or len(set(value)) < 16):
+                raise ValueError(f"{name.upper()} must be a random key in production: no 'replace-with' placeholder and at least 16 distinct characters")
         return self
 
     @model_validator(mode="after")

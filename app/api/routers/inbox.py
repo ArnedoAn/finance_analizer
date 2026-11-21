@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
 
-from app.api.dependencies import READ, REVIEW, ReadPrincipal, ReviewPrincipal
+from app.api.dependencies import READ, ReadPrincipal, ReviewPrincipal
 from app.api.routers.common import DB, Service, get_item, item_data
 from app.db.repositories import InboxRepository
 from app.parsers import normalize_merchant
@@ -61,10 +61,11 @@ async def inbox(
     review_reason: str | None = None,
     q: str | None = None,
     tag: str | None = None,
+    source_ref: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    filters = {"since": since, "until": until, "review_reason": review_reason, "q": q, "tag": tag}
+    filters = {"since": since, "until": until, "review_reason": review_reason, "q": q, "tag": tag, "source_ref": source_ref}
     repository = InboxRepository(db)
     rows = await repository.list(status, source, method, limit, offset, **filters)
     return {"items": [item_data(row) for row in rows], "total": await repository.count(status, source, method, **filters)}
@@ -77,8 +78,8 @@ async def inbox_unparsed(db: DB, limit: int = Query(50, ge=1, le=500), offset: i
     return {"items": [item_data(row, redacted_raw=True) for row in rows], "total": await repository.count(unparsed=True)}
 
 
-@router.post("/inbox/retry-failed", dependencies=[REVIEW])
-async def retry_failed(db: DB, service: Service):
+@router.post("/inbox/retry-failed")
+async def retry_failed(db: DB, service: Service, principal: ReviewPrincipal):
     repository = InboxRepository(db)
     item_ids = []
     offset = 0
@@ -89,6 +90,7 @@ async def retry_failed(db: DB, service: Service):
             break
         offset += len(rows)
     requeued = await repository.requeue(failed_only=True)
+    await audit.record(db, action="inbox.retry_failed", target_type="inbox", target_id="failed", detail={"requeued": requeued}, principal=principal)
     await db.commit()
     for item_id in item_ids:
         item = await repository.get(item_id)
@@ -102,15 +104,22 @@ async def retry_failed(db: DB, service: Service):
 async def inbox_detail(item_id: int, db: DB, principal: ReadPrincipal, include_raw: bool = False):
     if include_raw and not principal.allows("review"):
         raise HTTPException(403, "include_raw requires review scope")
-    return item_data(await get_item(db, item_id), redacted_raw=True, include_raw=include_raw)
-
-
-@router.post("/inbox/{item_id}/reprocess", dependencies=[REVIEW])
-async def retry(item_id: int, db: DB, service: Service):
     item = await get_item(db, item_id)
+    if include_raw:
+        # The read itself is audited (never its content).
+        await audit.record(db, action="inbox.raw_view", target_type="inbox_item", target_id=item.id, principal=principal)
+        await db.commit()
+    return item_data(item, redacted_raw=True, include_raw=include_raw)
+
+
+@router.post("/inbox/{item_id}/reprocess")
+async def retry(item_id: int, db: DB, service: Service, principal: ReviewPrincipal):
+    item = await get_item(db, item_id)
+    previous = item.status
     requeued = await InboxRepository(db).requeue(item_id)
     if not requeued:
         raise HTTPException(409, "Inbox item cannot be reprocessed in its current state")
+    await audit.record(db, action="inbox.reprocess", target_type="inbox_item", target_id=item_id, detail={"previous_status": previous}, principal=principal)
     await db.commit()
     await service.process(item)
     await db.commit()
@@ -147,10 +156,22 @@ async def classify(item_id: int, body: ClassifyBody, db: DB, service: Service, p
 
 @router.post("/inbox/{item_id}/reject")
 async def reject(item_id: int, db: DB, service: Service, principal: ReviewPrincipal, body: RejectBody | None = Body(default=None)):
-    item = await _review(db, service, await get_item(db, item_id), "reject", principal)
-    if body is not None and body.suspicious:
+    item = await get_item(db, item_id)
+    if body is None or not body.suspicious:
+        return item_data(await _review(db, service, item, "reject", principal))
+    # "I don't recognize it": a created (auto-approved) charge is voided, anything else rejected; then the
+    # auto-approval pause is raised. Retrying after an interrupted attempt skips the already finished step.
+    if item.status not in {"voided", "rejected"}:
+        item = await _review(db, service, item, "void" if item.status == "created" else "reject", principal)
+    try:
         await flags.mark_suspicious(db, item, principal)
         await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(503, detail={
+            "detail": "The item was removed but the suspicious flag could not be saved; repeat the request (safe to retry)",
+            "code": "suspicious_not_marked",
+        }) from exc
     return item_data(item)
 
 

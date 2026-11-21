@@ -18,7 +18,7 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
 )
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select, update
 
 from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger
@@ -34,9 +34,11 @@ MAX_WINDOW = timedelta(days=31)
 MAX_PROPOSALS = 50
 MAX_SPLIT_PARTS = 20
 REVERT_WINDOW = timedelta(days=7)
+# An ``applying`` proposal older than this lost its worker (crash, cancelled request) and may be claimed again.
+CLAIM_TIMEOUT = timedelta(minutes=10)
 EDIT_FIELDS = frozenset({"category", "merchant", "description", "firefly_account", "destination_account", "occurred_at", "amount", "transaction_type", "tags"})
 ALLOWED_FIELDS = EDIT_FIELDS | {"void", "split"}
-RISKY_FIELDS = frozenset({"amount", "void", "split"})
+RISKY_FIELDS = frozenset({"amount", "void", "split", "transaction_type", "firefly_account", "destination_account", "occurred_at"})
 # Fields whose previous value may be empty and still be restored (to empty).
 RESTORABLE_EMPTY = frozenset({"category", "description", "tags"})
 LEDGER_STATUSES = frozenset({"created", "needs_review"})
@@ -130,6 +132,18 @@ async def get_batch(session, batch_id: int) -> ProposalBatch:
     return batch
 
 
+def _locked_batch_query(batch_id: int):
+    return select(ProposalBatch).where(ProposalBatch.id == batch_id).with_for_update().execution_options(populate_existing=True)
+
+
+async def _lock_batch(session, batch_id: int) -> ProposalBatch:
+    """Reload the batch under ``SELECT ... FOR UPDATE`` (PostgreSQL; SQLite already serializes writers)."""
+    batch = (await session.scalars(_locked_batch_query(batch_id))).one_or_none()
+    if batch is None:
+        raise AssistantError(404, "not_found", "Batch not found")
+    return batch
+
+
 async def proposals_of(session, batch_id: int) -> list[Proposal]:
     query = select(Proposal).where(Proposal.batch_id == batch_id).order_by(Proposal.id).execution_options(populate_existing=True)
     return list((await session.scalars(query)).all())
@@ -167,6 +181,8 @@ async def create_batch(session, *, window_from, window_to, instruction: str, pri
 
 
 async def add_proposal(session, batch, *, target_id: int, field: str, new_value, reason: str, principal) -> Proposal:
+    # The row lock serializes concurrent creators so the 50-proposal cap cannot be overshot.
+    batch = await _lock_batch(session, batch.id)
     if batch.status != "open":
         raise AssistantError(409, "conflict", f"Batch is {batch.status}; proposals can only be added to an open batch")
     if field not in ALLOWED_FIELDS:
@@ -241,27 +257,43 @@ async def _manual_once(processor, payload: ManualTransaction, label: str):
     return item
 
 
-async def _apply_edit(processor, item, proposal, principal):
-    corrections = {proposal.field: proposal.new_value}
+def _require_created(item, verb: str):
     if item.status == "created":
-        await processor.review(item, "edit", corrections, principal=principal)
-    elif item.status == "needs_review":
-        result = await processor.review(item, "approve", corrections, principal=principal)
-        if result.status != "created":
-            raise AssistantError(409, "conflict", f"The item ended as {result.status} after approval")
+        return
+    if item.status == "needs_review":
+        raise AssistantError(409, "conflict", f"The item is pending review and cannot be {verb}: approve it in the inbox first")
+    raise AssistantError(409, "conflict", f"An item in status {item.status} cannot be {verb}")
+
+
+def _check_applicable(item, field: str):
+    """Edits and splits only touch ``created`` items; ``void`` also accepts ``needs_review`` (a rejection)."""
+    if field == "void":
+        if item.status not in LEDGER_STATUSES:
+            raise AssistantError(409, "conflict", f"An item in status {item.status} cannot be voided")
     else:
-        raise AssistantError(409, "conflict", f"An item in status {item.status} cannot be edited")
+        _require_created(item, "split" if field == "split" else "edited")
+
+
+def _already_effective(item, proposal) -> bool:
+    """Whether a reclaimed proposal's work already reached the item (the worker died before the final commit)."""
+    if proposal.field == "void":
+        return item.status in {"voided", "rejected"}
+    if proposal.field == "split":
+        return item.status == "voided"
+    return current_value(item, proposal.field) == proposal.new_value
+
+
+async def _apply_edit(processor, item, proposal, principal):
+    await processor.review(item, "edit", {proposal.field: proposal.new_value}, principal=principal)
 
 
 async def _apply_void(processor, item, principal):
-    if item.status not in LEDGER_STATUSES:
-        raise AssistantError(409, "conflict", f"An item in status {item.status} cannot be voided")
-    await processor.review(item, "void", principal=principal)
+    # An item that never reached the ledger is not voided but rejected.
+    pending = item.status == "needs_review" and not item.firefly_transaction_id
+    await processor.review(item, "reject" if pending else "void", principal=principal)
 
 
 async def _apply_split(processor, item, proposal, principal):
-    if item.status not in LEDGER_STATUSES:
-        raise AssistantError(409, "conflict", f"An item in status {item.status} cannot be split")
     if item.amount is None or not item.asset_account or not item.merchant:
         raise AssistantError(409, "conflict", "The item is incomplete and cannot be split")
     parts = proposal.new_value
@@ -278,20 +310,44 @@ async def _apply_split(processor, item, proposal, principal):
     await processor.review(item, "void", principal=principal)
 
 
-async def _apply_one(processor, proposal, principal):
+async def _claim(session, proposal_id: int) -> bool:
+    """Atomically move a proposal to ``applying``; False when another request holds it or it is not claimable.
+
+    While ``applying``, ``applied_at`` holds the claim time (the stale-claim clock); it becomes the real
+    application time only when all the work is done.
+    """
+    now = now_utc()
+    result = await session.execute(
+        update(Proposal)
+        .where(
+            Proposal.id == proposal_id,
+            or_(Proposal.status.in_(("proposed", "failed")), and_(Proposal.status == "applying", Proposal.applied_at < now - CLAIM_TIMEOUT)),
+        )
+        .values(status="applying", applied_at=now, error=None)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    return result.rowcount == 1
+
+
+async def _apply_one(processor, proposal_id: int, principal, *, resumed: bool):
     session = processor.session
-    item = await processor.inbox.get(proposal.target_id)
+    proposal = await session.get(Proposal, proposal_id, populate_existing=True)
+    item = await session.get(InboxItem, proposal.target_id, populate_existing=True)
     if item is None:
         raise AssistantError(404, "not_found", "Inbox item not found")
-    # Marked applied before the work so the review commit persists both together.
-    proposal.old_value = current_value(item, proposal.field)
+    if not (resumed and _already_effective(item, proposal)):
+        _check_applicable(item, proposal.field)
+        if current_value(item, proposal.field) != proposal.old_value:
+            raise AssistantError(409, "conflict", "The item changed after the proposal was created; the proposal is stale")
+        if proposal.field == "void":
+            await _apply_void(processor, item, principal)
+        elif proposal.field == "split":
+            await _apply_split(processor, item, proposal, principal)
+        else:
+            await _apply_edit(processor, item, proposal, principal)
+    proposal = await session.get(Proposal, proposal_id, populate_existing=True)
     proposal.status, proposal.error, proposal.applied_at = "applied", None, now_utc()
-    if proposal.field == "void":
-        await _apply_void(processor, item, principal)
-    elif proposal.field == "split":
-        await _apply_split(processor, item, proposal, principal)
-    else:
-        await _apply_edit(processor, item, proposal, principal)
     await session.commit()
 
 
@@ -299,7 +355,9 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
     """Apply the approved proposals through the normal review path.
 
     Returns ``(applied, failed)``: ids applied by this call and ``[{"id", "detail"}]`` for the rest.
-    Proposals that are already applied are ignored, which makes retries safe.
+    Each proposal is claimed with an atomic ``proposed|failed -> applying`` update and becomes ``applied``
+    only after all its work finished, so concurrent or repeated requests never run it twice. Proposals
+    that are already applied are ignored, which makes retries safe.
     """
     batch = await get_batch(session, batch_id)
     ids = list(dict.fromkeys(approved_ids))
@@ -310,7 +368,7 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
     if missing:
         raise AssistantError(422, "validation_error", f"Proposals not in this batch: {missing}")
     if len(ids) > 1 and any(known[pid].risky for pid in ids):
-        raise AssistantError(422, "risky_requires_single", "A risky proposal (amount, void, split) must be applied on its own")
+        raise AssistantError(422, "risky_requires_single", "A risky proposal (amount, void, split, type, accounts or date) must be applied on its own")
     if batch.status in {"reverted", "discarded"}:
         raise AssistantError(409, "conflict", f"Batch is {batch.status}")
     applied, failed = [], []
@@ -321,8 +379,14 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
         if proposal.status in {"discarded", "reverted"}:
             failed.append({"id": pid, "detail": f"Proposal is {proposal.status}"})
             continue
+        resumed = proposal.status == "applying"
+        if not await _claim(session, pid):
+            status = (await session.get(Proposal, pid, populate_existing=True)).status
+            if status != "applied":
+                failed.append({"id": pid, "detail": "Proposal is being applied by another request" if status == "applying" else f"Proposal is {status}"})
+            continue
         try:
-            await _apply_one(processor, proposal, principal)
+            await _apply_one(processor, pid, principal, resumed=resumed)
         except Exception as exc:
             logger.warning("assistant_apply_failed", proposal_id=pid, error_type=type(exc).__name__)
             detail = _public_error(exc)
@@ -330,6 +394,7 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
             failed.append({"id": pid, "detail": detail})
         else:
             applied.append(pid)
+    batch = await _lock_batch(session, batch_id)
     proposals = await proposals_of(session, batch_id)
     discarded = []
     if discard_others:
@@ -338,11 +403,11 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
                 proposal.status = "discarded"
                 discarded.append(proposal.id)
     statuses = {proposal.status for proposal in proposals}
-    batch = await get_batch(session, batch_id)
-    if applied:
-        batch.applied_at = now_utc()
+    first = min((proposal.applied_at for proposal in proposals if proposal.status == "applied"), default=None)
+    if first is not None and batch.applied_at is None:
+        batch.applied_at = first  # the revert deadline counts from the first application
     if "applied" in statuses:
-        batch.status = "partially_applied" if statuses & {"proposed", "failed"} else "applied"
+        batch.status = "partially_applied" if statuses & {"proposed", "failed", "applying"} else "applied"
     elif statuses == {"discarded"}:
         batch.status = "discarded"
     await audit.record(
@@ -367,10 +432,11 @@ async def _restore_original(processor, item, proposal, principal):
         await _recreate(processor, item, f"revert:{proposal.id}", principal)
         return
     session = processor.session
-    if item.status == "voided":
+    if item.status in {"voided", "rejected"}:
+        old = item.status
         item.status = "needs_review"
         session.add(InboxEvent(inbox_id=item.id, action="reverted_void"))
-        await audit.record(session, action="inbox.restore", target_type="inbox_item", target_id=item.id, detail={"changes": {"status": {"old": "voided", "new": "needs_review"}}}, principal=principal)
+        await audit.record(session, action="inbox.restore", target_type="inbox_item", target_id=item.id, detail={"changes": {"status": {"old": old, "new": "needs_review"}}}, principal=principal)
 
 
 async def _revert_one(processor, proposal, principal):
@@ -397,20 +463,24 @@ async def _revert_one(processor, proposal, principal):
 
 
 async def revert(session, processor, batch_id: int, *, principal):
-    """Restore the values saved by ``apply`` (newest first) within 7 days of ``applied_at``.
+    """Restore the values saved by ``apply`` (newest first), each within 7 days of its own ``applied_at``.
 
-    Returns ``(reverted, failed)`` like ``apply``. Reverting a reverted batch is a no-op.
+    Returns ``(reverted, failed)`` like ``apply``; proposals past their window are reported in ``failed``.
+    Reverting a reverted batch is a no-op.
     """
     batch = await get_batch(session, batch_id)
     if batch.status == "reverted":
         return [], []
     applied = [proposal for proposal in await proposals_of(session, batch.id) if proposal.status == "applied"]
-    if not applied or batch.applied_at is None:
+    if not applied:
         raise AssistantError(409, "conflict", "The batch has nothing to revert")
-    if now_utc() > batch.applied_at + REVERT_WINDOW:
+    now = now_utc()
+    eligible = [proposal for proposal in applied if now <= proposal.applied_at + REVERT_WINDOW]
+    if not eligible:
         raise AssistantError(409, "revert_expired", "The 7-day revert window has passed")
-    reverted, failed = [], []
-    for pid in [p.id for p in sorted(applied, key=lambda p: (p.applied_at, p.id), reverse=True)]:
+    reverted = []
+    failed = [{"id": proposal.id, "detail": "The 7-day revert window has passed"} for proposal in applied if proposal not in eligible]
+    for pid in [p.id for p in sorted(eligible, key=lambda p: (p.applied_at, p.id), reverse=True)]:
         proposal = await session.get(Proposal, pid, populate_existing=True)
         try:
             await _revert_one(processor, proposal, principal)
@@ -421,7 +491,7 @@ async def revert(session, processor, batch_id: int, *, principal):
             failed.append({"id": pid, "detail": detail})
         else:
             reverted.append(pid)
-    batch = await get_batch(session, batch_id)
+    batch = await _lock_batch(session, batch_id)
     if not any(proposal.status == "applied" for proposal in await proposals_of(session, batch_id)):
         batch.status = "reverted"
     await audit.record(

@@ -1,6 +1,7 @@
 """Runtime policy flags (Phase 5 A7, contract section 13).
 
-``policy_reasons`` is called by ``Processor._extract`` and returns extra review reasons;
+``policy_reasons`` is called by ``Processor._extract`` and again by ``Processor.process`` right before an unapproved item
+is sent to Firefly (items already extracted that retry); it returns extra review reasons;
 while auto-approvals are paused after a ``suspicious`` report every non-manual item
 must go to human review. Functions never commit; callers own the transaction.
 """

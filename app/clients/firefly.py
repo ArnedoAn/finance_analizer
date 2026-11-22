@@ -96,6 +96,24 @@ class FireflyClient:
     async def delete_transaction(self, transaction_id: str) -> None:
         await self._request("DELETE", f"transactions/{transaction_id}")
 
+    async def get_transaction(self, transaction_id: str) -> dict | None:
+        """The transaction group (JSON:API ``data``: ``id`` and ``attributes.transactions``) or None when Firefly has no such id."""
+        try:
+            result = await self._request("GET", f"transactions/{transaction_id}")
+        except PermanentError as exc:
+            if str(exc).startswith("Firefly 404"):
+                return None
+            raise
+        return result.get("data")
+
+    async def budgets(self) -> list[dict]:
+        """Every budget as ``{id, name}``; the ledger editor resolves budgets by name."""
+        return [{"id": str(row["id"]), "name": row["attributes"]["name"]} for row in await self._list("budgets")]
+
+    async def bills(self) -> list[dict]:
+        """Every bill (recurring charge) as ``{id, name}``; the ledger editor resolves bills by name."""
+        return [{"id": str(row["id"]), "name": row["attributes"]["name"]} for row in await self._list("bills")]
+
     async def insight(self, start, end) -> dict:
         return await self._request(
             "GET", "insight/expense/category",

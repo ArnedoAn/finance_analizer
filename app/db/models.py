@@ -111,4 +111,11 @@ class Notification(Base):
 
 # v4 domain tables live in one module per phase so parallel work never shares a file.
 # Imported here so Base.metadata (tests, Alembic autogenerate) always sees them.
-from app.db import models_alerts, models_assistant, models_devices, models_flags, models_rules  # noqa: E402,F401
+from app.db import (  # noqa: E402,F401
+    models_alerts,
+    models_assistant,
+    models_devices,
+    models_flags,
+    models_ledger,
+    models_rules,
+)

@@ -13,6 +13,7 @@ from app.api.routers import (
     devices,
     inbox,
     ingest,
+    ledger,
     reports,
     system,
     widgets,
@@ -21,7 +22,7 @@ from app.db.database import get_db_session
 from app.services.processor import Processor
 
 router = APIRouter()
-for module in (system, ingest, devices, inbox, alerts, assistant, reports, catalog, widgets):
+for module in (system, ingest, devices, inbox, alerts, assistant, reports, catalog, widgets, ledger):
     router.include_router(module.router)
 
 

@@ -30,6 +30,7 @@ from app.core.config import MailAccount
 from app.db.models import MailAccountState
 from app.db.models_rules import Merchant, Rule
 from app.services import alerts as alerting
+from tests.test_ledger_v4 import FireflyLedger
 
 ADMIN = {"X-API-Key": "test-admin-key-01234567890123456789"}
 API = "/api/v1"
@@ -63,13 +64,15 @@ def _normalize(value, started, key=None):
         return value
     if key == "key" and value.startswith("cofre_"):
         return "cofre_" + "x" * 43
+    if key == "group_id":
+        return "0" * 32
     if ISO_INSTANT.match(value):
         try:
             moment = datetime.fromisoformat(value)
         except ValueError:
             return value
         if moment.tzinfo is not None:
-            if key == "revert_deadline":
+            if key in ("revert_deadline", "undo_deadline"):
                 return (FROZEN + REVERT_WINDOW).isoformat()
             if abs(moment - started) <= NEAR_NOW:
                 return FROZEN.isoformat()
@@ -475,5 +478,62 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     assert resumed == {"paused": False}
     audit = await rec.call("list_audit", "GET", "/audit", reviewer, params={"limit": 100, "offset": 0})
     assert audit["items"]
+
+    # -- Ledger editing (section 15): a stateful Firefly stands in for the transaction endpoints -----------------------
+    FireflyLedger(firefly, list(await service.accounts()), budgets={"11": "Mercado"}, bills={"21": "Internet"})
+    created = await rec.call(
+        "create_ledger_transaction", "POST", "/ledger/transactions", reviewer, status=201,
+        json={
+            "client_ref": "ledger-contract-1", "type": "withdrawal", "date": "2026-11-06T12:00:00-05:00",
+            "description": "Compras de la semana", "notes": "Pagado con Nequi",
+            "splits": [
+                {
+                    "amount": "54000.00", "source_account": "Nequi", "destination_account": "SUPERMERCADO CENTRAL",
+                    "category": "Alimentación", "budget": "Mercado", "bill": "Internet", "tags": ["casa"],
+                },
+                {
+                    "amount": "20000.00", "source_account": "Nequi", "destination_account": "TAXI LIBRE", "category": "Transporte",
+                    "foreign_amount": "5.00", "foreign_currency": "USD", "description": "Taxi", "notes": "Carrera nocturna",
+                },
+            ],
+        },
+    )
+    ledger_id = created["transaction"]["id"]
+    await rec.call("get_ledger_transaction", "GET", f"/ledger/transactions/{ledger_id}", reviewer)
+    await rec.call(
+        "update_ledger_transaction", "PUT", f"/ledger/transactions/{ledger_id}", reviewer,
+        json={
+            "type": "withdrawal", "date": "2026-11-06T12:00:00-05:00", "description": "Compras de la semana y taxi",
+            "splits": [
+                {
+                    "amount": "54000.00", "source_account": "Nequi", "destination_account": "SUPERMERCADO CENTRAL",
+                    "category": "Alimentación", "budget": "Mercado", "tags": ["casa", "mercado"],
+                },
+                {
+                    "amount": "20000.00", "source_account": "Nequi", "destination_account": "TAXI LIBRE", "category": "Transporte",
+                    "foreign_amount": "5.00", "foreign_currency": "USD", "description": "Taxi",
+                },
+            ],
+        },
+    )
+    lunch = {
+        "type": "withdrawal", "date": "2026-11-05T13:00:00-05:00", "description": "Almuerzo",
+        "splits": [{"amount": "18000.00", "source_account": "Nequi", "destination_account": "SUPERMERCADO CENTRAL", "tags": ["viejo"]}],
+    }
+    lunch_id = (await rec.call(None, "POST", "/ledger/transactions", reviewer, status=201, json={**lunch, "client_ref": "ledger-contract-2"}))["transaction"]["id"]
+    dinner_id = (await rec.call(None, "POST", "/ledger/transactions", reviewer, status=201, json={**lunch, "client_ref": "ledger-contract-3", "description": "Cena"}))["transaction"]["id"]
+    bulk = await rec.call(
+        "bulk_ledger_edit", "POST", "/ledger/bulk", reviewer,
+        json={"ids": [lunch_id, dinner_id, "999999"], "set": {"category": "Transporte", "tags_add": ["lote"], "tags_remove": ["viejo"]}},
+    )
+    assert bulk["changed"] == [lunch_id, dinner_id] and [row["id"] for row in bulk["failed"]] == ["999999"], bulk
+    deleted = await rec.call("delete_ledger_transaction", "DELETE", f"/ledger/transactions/{dinner_id}", reviewer)
+    changes = await rec.call("list_ledger_changes", "GET", "/ledger/changes", reviewer, params={"limit": 50, "offset": 0})
+    assert changes["total"] == 7 and changes["items"][0]["id"] == deleted["change"]["id"], changes
+    restored = await rec.call("undo_ledger_change", "POST", f"/ledger/changes/{deleted['change']['id']}/undo", reviewer)
+    assert restored["transaction"]["id"] != dinner_id, restored
+    # The dinner came back with a new id, so only the lunch edit of the bulk group can still be undone.
+    group = await rec.call("undo_ledger_group", "POST", f"/ledger/groups/{bulk['group_id']}/undo", reviewer)
+    assert len(group["undone"]) == 1 and len(group["failed"]) == 1, group
 
     _finish(rec.bodies)

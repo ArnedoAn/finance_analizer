@@ -1,12 +1,12 @@
 """Health, mail, senders, sync, processing, scheduler and reconciliation (contract sections 6, 7, 11)."""
 from datetime import date as calendar_date
 from datetime import timedelta
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 
-from app.api.dependencies import ADMIN, READ, get_firefly, get_llm
+from app.api.dependencies import ADMIN, READ, REVIEW, Principal, get_firefly, get_llm
 from app.api.routers.common import DB, Service
 from app.clients.imap import IMAPClient
 from app.core.config import get_settings
@@ -129,34 +129,46 @@ async def repoll_mail(name: str, service: Service, since: calendar_date = Query(
     return await service.poll_mail(since=since, account_name=name)
 
 
-@router.get("/senders", dependencies=[ADMIN])
+# Trusted e-mail senders: the owner manages them from the phone (``review``), every change is audited.
+@router.get("/senders", dependencies=[REVIEW])
 async def senders(db: DB):
     return {"senders": jsonable_encoder(await KnownSenderRepository(db).all(include_inactive=True))}
 
 
-@router.post("/senders", dependencies=[ADMIN])
-async def add_sender(payload: SenderInput, db: DB):
+@router.post("/senders")
+async def add_sender(payload: SenderInput, db: DB, principal: Annotated[Principal, REVIEW]):
+    from app.services import audit
+
     try:
-        return jsonable_encoder(await KnownSenderRepository(db).add(**payload.model_dump()))
+        row = await KnownSenderRepository(db).add(**payload.model_dump())
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
+    await audit.record(db, action="sender.add", target_type="sender", target_id=row.id,
+                       detail={"keyword": row.keyword, "require_auth": row.require_auth}, principal=principal)
+    return jsonable_encoder(row)
 
 
-@router.delete("/senders/{sender_id}", dependencies=[ADMIN])
-async def delete_sender(sender_id: int, db: DB):
+@router.delete("/senders/{sender_id}")
+async def delete_sender(sender_id: int, db: DB, principal: Annotated[Principal, REVIEW]):
+    from app.services import audit
+
     if not await KnownSenderRepository(db).delete(sender_id):
         raise HTTPException(404, "Sender not found")
+    await audit.record(db, action="sender.delete", target_type="sender", target_id=sender_id, principal=principal)
     return {"deleted": True}
 
 
-@router.post("/senders/{sender_id}/approve", dependencies=[ADMIN])
-async def approve_sender(sender_id: int, db: DB):
+@router.post("/senders/{sender_id}/approve")
+async def approve_sender(sender_id: int, db: DB, principal: Annotated[Principal, REVIEW]):
+    from app.services import audit
+
     try:
         row = await KnownSenderRepository(db).approve(sender_id)
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     if row is None:
         raise HTTPException(404, "Sender not found")
+    await audit.record(db, action="sender.approve", target_type="sender", target_id=row.id, detail={"keyword": row.keyword}, principal=principal)
     return jsonable_encoder(row)
 
 

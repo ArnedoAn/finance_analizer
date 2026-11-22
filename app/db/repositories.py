@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timezone import now_utc
 from app.db.models import CycleRun, InboxItem, KnownSender, MailAccountState
+from app.security.sender_trust import domain_matches, sender_rule
 
 
 class InboxRepository:
@@ -152,9 +153,10 @@ class KnownSenderRepository:
         return list((await self.session.scalars(query)).all())
 
     async def add(self, keyword, name="", source="manual", status="active", require_auth=True):
-        keyword = keyword.strip().casefold().removeprefix("email:")
-        if "." not in keyword or "@" in keyword or keyword in {"gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com", "live.com", "aol.com"}:
-            raise ValueError("An exact non-generic email domain is required")
+        parsed = sender_rule(keyword)
+        if parsed is None:
+            raise ValueError("An exact sender address or a non-generic email domain is required")
+        keyword = parsed[0] or parsed[1]
         row = await self.session.scalar(select(KnownSender).where(KnownSender.keyword == keyword))
         if row is None:
             row = KnownSender(keyword=keyword, name=name, source=source, status=status, require_auth=require_auth)
@@ -178,5 +180,11 @@ class KnownSenderRepository:
         return True
 
     async def matches(self, sender):
-        domain = sender.casefold().rsplit("@", 1)[-1]
-        return any(domain == row.keyword or domain.endswith("." + row.keyword) for row in await self.all(False))
+        """True when an active rule (exact address or domain) already covers ``sender``."""
+        address = sender.casefold()
+        domain = address.rsplit("@", 1)[-1]
+        for row in await self.all(False):
+            parsed = sender_rule(row.keyword)
+            if parsed and (parsed[0] == address if parsed[0] else domain_matches(domain, parsed[1])):
+                return True
+        return False

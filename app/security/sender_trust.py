@@ -95,19 +95,48 @@ def authentication_result(message, from_address: str, authserv_ids) -> AuthResul
     return AuthResult()
 
 
+_LOCAL_PART = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}")
+
+
+def sender_rule(raw: str) -> tuple[str | None, str] | None:
+    """Parse a rule keyword: an exact address (``alertas@bank.com``) or a domain (``bank.com``).
+
+    Returns ``(address, domain)`` with ``address=None`` for a domain rule, or None when invalid
+    or on a generic mailbox provider (anyone can get an address there).
+    """
+    raw = raw.strip().casefold().removeprefix("email:")
+    local, at, rest = raw.rpartition("@")
+    domain = normalize_domain(rest)
+    if not domain or domain in GENERIC_DOMAINS:
+        return None
+    if not at:
+        return None, domain
+    if not _LOCAL_PART.fullmatch(local) or local.startswith(".") or local.endswith("."):
+        return None
+    return f"{local}@{domain}", domain
+
+
 def evaluate_email(header, rules) -> TrustDecision:
+    """An address rule trusts only that exact sender; a domain rule trusts the domain and its subdomains.
+
+    Both require an aligned DKIM/DMARC pass unless the rule opts out (``require_auth=False``).
+    """
     domain = address_domain(header.from_address)
     if not domain:
         return TrustDecision(False, None, "invalid_from_address")
+    address = parseaddr(header.from_address)[1].casefold()
     for rule in rules:
         if getattr(rule, "status", "active") != "active":
             continue
-        raw = getattr(rule, "domain", None) or getattr(rule, "keyword", "")
-        raw = raw.removeprefix("email:")
-        candidate = normalize_domain(raw)
-        if not candidate or candidate in GENERIC_DOMAINS or not domain_matches(domain, candidate):
+        parsed = sender_rule(getattr(rule, "domain", None) or getattr(rule, "keyword", ""))
+        if parsed is None:
+            continue
+        rule_address, rule_domain = parsed
+        if rule_address is not None and rule_address != address:
+            continue
+        if rule_address is None and not domain_matches(domain, rule_domain):
             continue
         if getattr(rule, "require_auth", True) and not header.auth.trusted:
             return TrustDecision(False, rule, "authentication_failed")
-        return TrustDecision(True, rule, "approved_domain")
+        return TrustDecision(True, rule, "approved_sender" if rule_address else "approved_domain")
     return TrustDecision(False, None, "unknown_sender")

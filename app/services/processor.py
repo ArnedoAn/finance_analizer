@@ -24,14 +24,21 @@ from app.db.repositories import InboxRepository, KnownSenderRepository, MailStat
 from app.parsers import normalize_merchant, parse
 from app.security import is_sensitive_code
 from app.security.redaction import redact
-from app.security.sender_trust import evaluate_email
+from app.security.sender_trust import evaluate_email, sender_rule
 from app.services import alerts as alerting
 from app.services import audit, flags, rules, suggestions
 
 logger = get_logger(__name__)
 
 _ECONOMIC_LOCKS = WeakValueDictionary()
+# A movement that reaches the inbox this long after it happened (history import, first mailbox poll)
+# is not news: it lands in the inbox without a push alert, so an import never floods the phone.
+HISTORIC_AGE = timedelta(hours=48)
 
+
+def _sms_ref(sender, millis, body):
+    """One SMS, one reference, whether it arrives live or from a history import of the phone's inbox."""
+    return "sms:" + hashlib.sha256(json.dumps([sender.casefold(), int(millis), body]).encode()).hexdigest()
 
 
 def _now():
@@ -150,7 +157,10 @@ class Processor:
         content = payload.big_text or payload.message or payload.text
         source = payload.type
         stamp = payload.post_time if payload.post_time is not None else payload.timestamp or payload.date
-        ref = "evt:" + str(payload.event_id) if payload.event_id else ("phone:" + hashlib.sha256(json.dumps([source, payload.app, payload.sender, content, stamp]).encode()).hexdigest() if stamp else "phone:" + uuid4().hex)
+        if source == "sms" and payload.post_time is not None:
+            ref = _sms_ref(payload.sender, payload.post_time, content)
+        else:
+            ref = "evt:" + str(payload.event_id) if payload.event_id else ("phone:" + hashlib.sha256(json.dumps([source, payload.app, payload.sender, content, stamp]).encode()).hexdigest() if stamp else "phone:" + uuid4().hex)
         identity = payload.app if source == "notification" else payload.sender
         known = bool(self._source_accounts(source, identity))
         occurred, reason = self._notification_date(payload)
@@ -200,6 +210,111 @@ class Processor:
                 if await alerting.emit(self.session, "system_failure", title="Buzón de correo con fallos", body=f"No se pudo consultar el buzón «{account.name}» en {state.consecutive_failures} intentos seguidos. Revisa sus credenciales y la conexión.", dedupe_key="mail:" + account.name, min_interval_minutes=360):
                     await self.session.commit()
         return result
+
+    @staticmethod
+    def _history_counts():
+        return {"found": 0, "untrusted": 0, "auth_failed": 0, "sensitive": 0, "known": 0, "errors": 0, "new": 0, "parser": 0, "llm": 0}
+
+    @staticmethod
+    def _count_new(counts, text, subject, sender):
+        """A local parser costs nothing; everything else will be sent to the LLM when processed."""
+        counts["new"] += 1
+        counts["parser" if parse(text, subject, sender) is not None else "llm"] += 1
+
+    async def history_mail(self, since, until, dry_run=True, progress=None):
+        """Import trusted mail between two Bogota dates without touching the live poll's cursor.
+
+        Only trusted senders are searched and stored; a message already in the inbox (same Message-ID
+        or reference) is counted as known. ``dry_run`` only counts. Returns the counts and the new ids.
+        """
+        counts, ids, seen = self._history_counts(), [], set()
+        rules = list(await self.senders.all(False))
+        rules += [SimpleNamespace(keyword=s.split(":", 1)[1], status="active", require_auth=True) for a in self.settings.own_accounts for s in a.sources if s.startswith("email:")]
+        senders = sorted({parsed[0] or parsed[1] for rule in rules if (parsed := sender_rule(rule.keyword))})
+        errors = {}
+        for account in self.settings.mail_accounts:
+            try:
+                validity, messages = await IMAPClient(account).history(since, until, senders, want_body=lambda h: evaluate_email(h, rules).trusted)
+            except Exception:
+                errors[account.name] = "Mail history failed; check account credentials/connectivity"
+                continue
+            for message in messages:
+                if message.error:
+                    counts["found"] += 1
+                    counts["errors"] += 1
+                    continue
+                occurred = message.occurred_at or _now()
+                if not since <= occurred.astimezone(self.zone).date() <= until:
+                    continue
+                counts["found"] += 1
+                decision = evaluate_email(message, rules)
+                if decision.reason == "authentication_failed":
+                    counts["auth_failed"] += 1
+                    continue
+                if not decision.trusted:
+                    counts["untrusted"] += 1
+                    continue
+                text = (message.body or message.subject or "")[:4000]
+                if is_sensitive_code(message.body or "", message.subject):
+                    counts["sensitive"] += 1
+                    continue
+                ref = f"mail:{account.name}:{validity}:{message.uid}"
+                known = message.message_id in seen or await self.inbox.by_ref(ref) is not None or (
+                    message.message_id is not None and await self.session.scalar(select(InboxItem.id).where(InboxItem.message_id == message.message_id).limit(1)) is not None)
+                if message.message_id:
+                    seen.add(message.message_id)
+                if known:
+                    counts["known"] += 1
+                    continue
+                self._count_new(counts, text, message.subject, message.from_address)
+                if not dry_run:
+                    item, inserted = await self._insert(ref, source="email", account_name=account.name, message_id=message.message_id, sender=message.from_address, subject_or_title=message.subject, raw_text=text, occurred_at=occurred, status="pending")
+                    if inserted:
+                        ids.append(item.id)
+                if progress:
+                    progress(counts)
+        return {"counts": counts, "errors": errors}, ids
+
+    async def history_sms(self, items, dry_run=True):
+        """Import SMS read from the phone's inbox. Same reference as the live capture, so nothing doubles."""
+        counts, ids = self._history_counts(), []
+        for sms in items:
+            counts["found"] += 1
+            if not self._source_accounts("sms", sms.sender):
+                counts["untrusted"] += 1
+                continue
+            try:
+                occurred = datetime.fromtimestamp(sms.date / 1000, UTC)
+            except (ValueError, OverflowError, OSError):
+                occurred = None
+            if occurred is None or occurred < datetime(2020, 1, 1, tzinfo=UTC) or occurred > _now() + timedelta(days=1):
+                counts["errors"] += 1
+                continue
+            if is_sensitive_code(sms.body, sms.sender):
+                counts["sensitive"] += 1
+                continue
+            ref = _sms_ref(sms.sender, sms.date, sms.body)
+            if await self.inbox.by_ref(ref) is not None:
+                counts["known"] += 1
+                continue
+            self._count_new(counts, sms.body[:4000], sms.sender, sms.sender)
+            if not dry_run:
+                item, inserted = await self._insert(ref, source="sms", app="sms", sender=sms.sender, subject_or_title=sms.sender, raw_text=sms.body[:4000], occurred_at=occurred, status="pending")
+                if inserted:
+                    ids.append(item.id)
+        return counts, ids
+
+    async def process_ids(self, ids, progress=None):
+        """Process imported items right away, one by one; a claimed or finished item is skipped safely."""
+        done = 0
+        for item_id in ids:
+            item = await self.inbox.get(item_id)
+            if item is not None and item.status == "pending":
+                await self.process(item)
+            done += 1
+            if progress:
+                progress(done)
+        return done
 
     async def _merchant(self, merchant, kind):
         name = normalize_merchant(merchant or "")
@@ -420,8 +535,9 @@ class Processor:
         item.claim_token = item.claim_until = None
         self.session.add(InboxEvent(inbox_id=item.id, action=item.status, detail=item.review_reason or item.last_error))
         await self.session.commit()
-        await self._announce(item, old_status)
-        await self._new_charge(item, old_status, approved)
+        if item.occurred_at is None or item.created_at is None or item.created_at - item.occurred_at < HISTORIC_AGE:
+            await self._announce(item, old_status)
+            await self._new_charge(item, old_status, approved)
         return item
 
     async def _announce(self, item, old_status):

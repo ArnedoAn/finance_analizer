@@ -128,14 +128,18 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check_production_api_keys(self):
-        """B1: the example files ship ``replace-with-...`` placeholders that are long enough to pass min_length."""
+        """B1: the example files ship ``replace-with-...`` placeholders that are long enough to pass min_length.
+
+        The variety floor only catches hand-typed or repeated keys: a random hex key (64 chars, 256 bits)
+        uses at most 16 symbols and often shows 14 or 15 of them, so the threshold stays well below that.
+        """
         if not self.is_production:
             return self
         for name in ("finance_api_key", "phone_api_key"):
             secret = getattr(self, name)
             value = secret.get_secret_value() if secret is not None else None
-            if value is not None and (value.casefold().startswith("replace-with") or len(set(value)) < 16):
-                raise ValueError(f"{name.upper()} must be a random key in production: no 'replace-with' placeholder and at least 16 distinct characters")
+            if value is not None and (value.casefold().startswith("replace-with") or len(set(value)) < 10):
+                raise ValueError(f"{name.upper()} must be a random key in production: no 'replace-with' placeholder and at least 10 distinct characters")
         return self
 
     @model_validator(mode="after")

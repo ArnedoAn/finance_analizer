@@ -107,8 +107,8 @@ def test_production_rejects_the_example_placeholder_keys(compose_env, monkeypatc
 
 
 @pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY"])
-@pytest.mark.parametrize(("distinct", "accepted"), [(1, False), (15, False), (16, True), (32, True)])
-def test_production_requires_at_least_16_distinct_characters(compose_env, monkeypatch, name, distinct, accepted):
+@pytest.mark.parametrize(("distinct", "accepted"), [(1, False), (9, False), (10, True), (15, True), (32, True)])
+def test_production_rejects_low_variety_keys(compose_env, monkeypatch, name, distinct, accepted):
     from pydantic import ValidationError
 
     from app.core.config import Settings
@@ -122,6 +122,17 @@ def test_production_requires_at_least_16_distinct_characters(compose_env, monkey
         with pytest.raises(ValidationError) as caught:
             Settings(_env_file=None)
         assert key not in str(caught.value)
+
+
+@pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY"])
+def test_production_accepts_a_real_hex_key_with_15_distinct_symbols(compose_env, monkeypatch, name):
+    # Regression: a 64-char hex key (256 bits) that happens to use 15 of its 16 symbols was refused in production.
+    from app.core.config import Settings
+
+    key = ("0123456789abcde" * 5)[:64]
+    assert len(set(key)) == 15
+    monkeypatch.setenv(name, key)
+    assert getattr(Settings(_env_file=None), name.lower()).get_secret_value() == key
 
 
 @pytest.mark.parametrize("name", ["FINANCE_API_KEY", "PHONE_API_KEY"])

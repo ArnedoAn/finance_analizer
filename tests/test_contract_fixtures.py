@@ -25,10 +25,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.api.routers import system, widgets
+from app.api.routers import history, system, widgets
 from app.core.config import MailAccount
 from app.db.models import MailAccountState
 from app.db.models_rules import Merchant, Rule
+from app.db.repositories import KnownSenderRepository
 from app.services import alerts as alerting
 from tests.test_ledger_v4 import FireflyLedger
 
@@ -478,6 +479,68 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     assert resumed == {"paused": False}
     audit = await rec.call("list_audit", "GET", "/audit", reviewer, params={"limit": 100, "offset": 0})
     assert audit["items"]
+
+    # -- Own accounts (the audit list above is already recorded, so these writes do not change it) -----------------------
+    bancolombia = await rec.call(
+        "add_own_account", "POST", "/own-accounts", reviewer, status=201,
+        json={
+            "firefly_account": "Bancolombia", "bank": "bancolombia", "kind": "savings", "last4": ["5678"], "aliases": ["bancolombia"],
+            "sources": ["sms:87400", "app:com.demo.BancoApp", "email:Alertas@Banco-Demo.co"],
+        },
+    )
+    assert bancolombia["firefly_exists"] is True and bancolombia["sources"] == ["sms:87400", "app:com.demo.BancoApp", "email:alertas@banco-demo.co"]
+    await rec.call(
+        "update_own_account", "PATCH", f"/own-accounts/{bancolombia['id']}", reviewer,
+        json={
+            "firefly_account": "Bancolombia", "bank": "bancolombia", "kind": "savings", "last4": ["5678"], "aliases": ["bancolombia", "ahorros"],
+            "sources": ["sms:87400", "sms:87401", "app:com.demo.BancoApp", "email:alertas@banco-demo.co"],
+        },
+    )
+    owned = await rec.call("list_own_accounts", "GET", "/own-accounts", reviewer)
+    assert [account["firefly_account"] for account in owned["items"]] == ["Bancolombia", "Nequi"]
+    await rec.call("delete_own_account", "DELETE", f"/own-accounts/{bancolombia['id']}", reviewer)
+
+    # -- Trusted mail senders: one learned and waiting for approval, one added by the owner ----------------------------
+    learned = await KnownSenderRepository(db).add("notificaciones@nu.com.co", name="Nu Colombia", source="learned", status="pending_approval")
+    await db.commit()
+    owner_sender = await rec.call(
+        "add_sender", "POST", "/senders", reviewer,
+        json={"keyword": "alertasynotificaciones@bancolombia.com.co", "name": "Bancolombia", "require_auth": True},
+    )
+    listed = await rec.call("list_senders", "GET", "/senders", reviewer)
+    assert [sender["status"] for sender in listed["senders"]] == ["active", "pending_approval"], listed
+    accepted = await rec.call("approve_sender", "POST", f"/senders/{learned.id}/approve", reviewer)
+    assert accepted["status"] == "active" and accepted["source"] == "learned", accepted
+    await rec.call("delete_sender", "DELETE", f"/senders/{owner_sender['id']}", reviewer)
+
+    # -- History import: the mail job runs on the application's own engine and both it and the SMS queue are process
+    # globals, so they are stubbed to keep the bodies deterministic (a running job with an empty SMS queue, then the queue).
+    async def idle(*args):
+        return None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(history, "get_settings", lambda: settings)
+        patch.setattr(history, "_mail_job", None)
+        patch.setattr(history, "_mail_task", None)
+        patch.setattr(history, "_sms_progress", {"queued": 0, "processed": 0})
+        patch.setattr(history, "_sms_windows", {})
+        patch.setattr(history, "_run_mail", idle)
+        patch.setattr(history, "_process_sms", idle)
+        job = await rec.call(
+            "start_mail_history", "POST", "/history/mail", reviewer, status=202,
+            json={"since": "2026-11-01", "until": "2026-11-05", "dry_run": True},
+        )
+        assert job["job"]["state"] == "running" and job["job"]["dry_run"] is True, job
+        sms_at = int(datetime(2026, 11, 5, 15, 0, tzinfo=UTC).timestamp() * 1000)
+        sms_batch = [
+            {"sender": "85954", "body": "Pagaste $12.000 en TIENDA DEMO", "date": sms_at},
+            {"sender": "85954", "body": "Recibiste $40.000 de JUAN PEREZ", "date": sms_at + 60_000},
+            {"sender": "12345", "body": "Promo: 2x1 este fin de semana", "date": sms_at},
+        ]
+        imported = await rec.call("import_sms", "POST", "/history/sms", reviewer, json={"dry_run": False, "items": sms_batch})
+        assert imported["queued"] == 2 and imported["counts"]["untrusted"] == 1, imported
+        status = await rec.call("history_status", "GET", "/history", reviewer)
+        assert status["mail"]["state"] == "running" and status["sms"] == {"queued": 2, "processed": 0}, status
 
     # -- Ledger editing (section 15): a stateful Firefly stands in for the transaction endpoints -----------------------
     FireflyLedger(firefly, list(await service.accounts()), budgets={"11": "Mercado"}, bills={"21": "Internet"})

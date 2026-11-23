@@ -29,6 +29,7 @@ class MailAccount(BaseModel):
 
 
 class OwnAccount(BaseModel):
+    """One entry of the OWN_ACCOUNTS seed file; the runtime model is the ``own_accounts`` table (``OwnAccountRow``)."""
     firefly_account: str = Field(min_length=1)
     bank: str
     kind: str = Field(pattern="^(savings|checking|credit|wallet|pocket|cash)$")
@@ -57,6 +58,9 @@ class Settings(BaseSettings):
     manual_default_account: str = "Efectivo"
     firefly_cache_ttl_minutes: int = Field(default=360, ge=0)
     mail_accounts: list[MailAccount] = Field(default_factory=list)
+    # INITIAL SEED ONLY. At startup, if the ``own_accounts`` table is empty, these are imported once (audited as
+    # ``own_account.seed``); afterwards the table, managed through /api/v1/own-accounts, is the only source and this
+    # file is never read for accounts again. Editing it on a deployed system has no effect.
     own_accounts: list[OwnAccount] = Field(default_factory=list)
     expose_docs: bool = False
     max_amount_cop: Decimal = Decimal("50000000")

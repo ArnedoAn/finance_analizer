@@ -1,10 +1,10 @@
 """Validated owner and phone API inputs."""
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 # Column sizes (app 255, sender 512) and a body ceiling well above the 4000 chars that are stored: an oversized
 # value must be a 422, not a database error that the phone outbox would retry forever.
@@ -82,3 +82,53 @@ class HistorySmsBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     dry_run: bool = True
     items: list[HistorySms] = Field(min_length=1, max_length=200)
+
+
+OwnAccountKind = Literal["savings", "checking", "credit", "wallet", "pocket", "cash"]
+_Last4 = Annotated[str, StringConstraints(pattern=r"^[0-9]{4}$")]
+_Alias = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
+
+
+class OwnAccountIn(BaseModel):
+    """Create body. Sources are validated and normalized by ``app.services.own_accounts`` (422 ``invalid_source``)."""
+    model_config = ConfigDict(extra="forbid")
+    firefly_account: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+    bank: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
+    kind: OwnAccountKind
+    last4: list[_Last4] = Field(default_factory=list, max_length=10)
+    aliases: list[_Alias] = Field(default_factory=list, max_length=20)
+    sources: list[str] = Field(default_factory=list, max_length=30)
+
+
+class OwnAccountPatch(BaseModel):
+    """Partial update: only the fields sent change; none of them may be null."""
+    model_config = ConfigDict(extra="forbid")
+    firefly_account: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)] | None = None
+    bank: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)] | None = None
+    kind: OwnAccountKind | None = None
+    last4: list[_Last4] | None = Field(default=None, max_length=10)
+    aliases: list[_Alias] | None = Field(default=None, max_length=20)
+    sources: list[str] | None = Field(default=None, max_length=30)
+
+    @model_validator(mode="after")
+    def no_nulls(self):
+        for name in self.model_fields_set:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} must not be null")
+        return self
+
+
+class OwnAccountOut(BaseModel):
+    id: int
+    firefly_account: str
+    bank: str
+    kind: str
+    last4: list[str]
+    aliases: list[str]
+    sources: list[str]
+    firefly_exists: bool | None
+    updated_at: datetime
+
+
+class OwnAccountList(BaseModel):
+    items: list[OwnAccountOut]

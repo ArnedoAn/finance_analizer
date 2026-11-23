@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
-from app.core.config import OwnAccount, Settings
+from app.core.config import Settings
 from app.core.exceptions import PermanentError
 from app.db.models import InboxItem
 from app.models.schemas import ManualTransaction, WebhookPayload
@@ -217,11 +217,11 @@ async def test_manual_failure_never_enters_automatic_retry(service, clients):
     assert row.id not in {due.id for due in await service.inbox.due()}
 
 
-async def test_transfer_pairs_opposite_leg_without_second_create(service, clients, extraction, monkeypatch):
-    service.settings.own_accounts.append(OwnAccount(
-        firefly_account="Bancolombia", bank="bancolombia", kind="savings", last4=["5678"],
+async def test_transfer_pairs_opposite_leg_without_second_create(service, clients, extraction, monkeypatch, add_own_account):
+    await add_own_account(
+        "Bancolombia", bank="bancolombia", kind="savings", last4=["5678"],
         aliases=["bancolombia"], sources=["sms:87400"],
-    ))
+    )
     monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", counterparty_hint="5678"))
     outgoing = await service.process(await item(service))
     assert outgoing.status == "created" and outgoing.transaction_type == "transfer"

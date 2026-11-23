@@ -2,7 +2,18 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -107,6 +118,28 @@ class Notification(Base):
     __tablename__ = "notifications"
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
     last_sent_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+
+
+class OwnAccountRow(Base):
+    """Owner's own account: which Firefly asset/liability a bank maps to and which sources feed it.
+
+    Runtime source of truth for the ingest pipeline (``app.services.own_accounts``); ``OWN_ACCOUNTS`` only seeds it once.
+    ``last4``, ``aliases`` and ``sources`` are JSON lists replaced wholesale on update.
+    """
+    __tablename__ = "own_accounts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    firefly_account: Mapped[str] = mapped_column(String(255))
+    bank: Mapped[str] = mapped_column(String(255))
+    kind: Mapped[str] = mapped_column(String(20))
+    last4: Mapped[list[str]] = mapped_column(JSON, default=list)
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    sources: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+
+
+# Case-insensitive uniqueness of the Firefly name, enforced by the database on SQLite and PostgreSQL alike.
+Index("uq_own_accounts_firefly_account_lower", func.lower(OwnAccountRow.firefly_account), unique=True)
 
 
 # v4 domain tables live in one module per phase so parallel work never shares a file.

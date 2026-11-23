@@ -15,6 +15,7 @@ from app.db.models import Notification
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
 from app.models.schemas import SenderInput
 from app.security.redaction import redact
+from app.services import own_accounts
 
 router = APIRouter()
 _scheduler = None
@@ -49,11 +50,11 @@ async def health(db: DB):
             "consecutive_failures": failures,
         }
     services = {"database": True, "firefly": await get_firefly().check_connection(), "llm": await get_llm().check_connection(), "mail": mail}
-    configured = get_settings().own_accounts
+    configured = await own_accounts.load(db)
     missing = []
     if services["firefly"]:
-        available = {row["name"] for row in await get_firefly().accounts() if row["type"] in {"asset", "liability", "liabilities"}}
-        missing = [account.firefly_account for account in configured if account.firefly_account not in available]
+        available = {row["name"].casefold() for row in await get_firefly().accounts() if row["type"] in {"asset", "liability", "liabilities"}}
+        missing = [account.firefly_account for account in configured if account.firefly_account.casefold() not in available]
     else:
         missing = [account.firefly_account for account in configured]
     services["missing_own_accounts"] = missing

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.api.routers import ingest
-from app.core.config import OwnAccount, Settings
+from app.core.config import Settings
 from app.core.exceptions import PermanentError
 from app.core.timezone import now_utc
 from app.db.models import InboxItem
@@ -251,8 +251,8 @@ async def test_pause_does_not_block_explicit_approval_or_manual_entries(service,
 
 # --- CR: sync, report, new_charge, 502 -----------------------------------------------------------------
 
-async def test_sync_emits_the_missing_account_alert_without_committing(service, db, monkeypatch):
-    service.settings.own_accounts = [*service.settings.own_accounts, OwnAccount(firefly_account="Fantasma", bank="x", kind="wallet")]
+async def test_sync_emits_the_missing_account_alert_without_committing(service, db, monkeypatch, add_own_account):
+    await add_own_account("Fantasma")
     commits = []
     real_commit = db.commit
 

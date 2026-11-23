@@ -4,10 +4,11 @@ from datetime import timedelta
 from uuid import uuid4
 
 from sqlalchemy import String, cast, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timezone import now_utc
-from app.db.models import CycleRun, InboxItem, KnownSender, MailAccountState
+from app.db.models import CycleRun, InboxItem, KnownSender, MailAccountState, OwnAccountRow
 from app.security.sender_trust import domain_matches, sender_rule
 
 
@@ -188,3 +189,57 @@ class KnownSenderRepository:
             if parsed and (parsed[0] == address if parsed[0] else domain_matches(domain, parsed[1])):
                 return True
         return False
+
+
+class OwnAccountExistsError(Exception):
+    """Another own account already uses this Firefly name (ignoring case)."""
+
+
+class OwnAccountRepository:
+    """Own accounts; the table holds a handful of rows, so name comparisons happen in Python with ``casefold``."""
+
+    def __init__(self, session):
+        self.session = session
+
+    async def all(self):
+        return list((await self.session.scalars(select(OwnAccountRow).order_by(OwnAccountRow.firefly_account, OwnAccountRow.id))).all())
+
+    async def get(self, account_id):
+        return await self.session.get(OwnAccountRow, account_id, populate_existing=True)
+
+    async def count(self):
+        return await self.session.scalar(select(func.count()).select_from(OwnAccountRow))
+
+    async def taken(self, name, exclude_id=None):
+        wanted = name.casefold()
+        return any(row.id != exclude_id and row.firefly_account.casefold() == wanted for row in await self.all())
+
+    async def _ensure_free(self, name, exclude_id=None):
+        if await self.taken(name, exclude_id):
+            raise OwnAccountExistsError(name)
+
+    async def _flush(self, name):
+        try:
+            async with self.session.begin_nested():
+                await self.session.flush()
+        except IntegrityError as exc:  # concurrent insert of the same name slipped past the check
+            raise OwnAccountExistsError(name) from exc
+
+    async def add(self, *, firefly_account, bank, kind, last4, aliases, sources):
+        await self._ensure_free(firefly_account)
+        row = OwnAccountRow(firefly_account=firefly_account, bank=bank, kind=kind, last4=list(last4), aliases=list(aliases), sources=list(sources))
+        self.session.add(row)
+        await self._flush(firefly_account)
+        return row
+
+    async def update(self, row, **fields):
+        if "firefly_account" in fields:
+            await self._ensure_free(fields["firefly_account"], exclude_id=row.id)
+        for name, value in fields.items():
+            setattr(row, name, list(value) if isinstance(value, list | tuple) else value)
+        await self._flush(row.firefly_account)
+        return row
+
+    async def delete(self, row):
+        await self.session.delete(row)
+        await self.session.flush()

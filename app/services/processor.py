@@ -6,7 +6,6 @@ import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
 from uuid import uuid4
 from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
@@ -26,7 +25,7 @@ from app.security import is_sensitive_code
 from app.security.redaction import redact
 from app.security.sender_trust import evaluate_email, sender_rule
 from app.services import alerts as alerting
-from app.services import audit, flags, rules, suggestions
+from app.services import audit, flags, own_accounts, rules, suggestions
 
 logger = get_logger(__name__)
 
@@ -78,10 +77,11 @@ class Processor:
         if force or self._accounts is None:
             self._accounts = await self.firefly.accounts()
             self._categories = await self.firefly.categories()
-        missing = [a.firefly_account for a in self.settings.own_accounts if not any(x["name"].casefold() == a.firefly_account.casefold() and x["type"] in {"asset", "liability", "liabilities"} for x in self._accounts)]
+        own = await self._own()
+        missing = [a.firefly_account for a in own if not any(x["name"].casefold() == a.firefly_account.casefold() and x["type"] in {"asset", "liability", "liabilities"} for x in self._accounts)]
         for name in missing:
             # No commit here: sync() also runs in the middle of review() corrections; the caller owns the transaction.
-            await alerting.emit(self.session, "system_failure", title="Cuenta propia inexistente en Firefly", body=f"La cuenta «{name}» configurada en OWN_ACCOUNTS no existe en Firefly.", dedupe_key="missing-account:" + name, min_interval_minutes=360)
+            await alerting.emit(self.session, "system_failure", title="Cuenta propia inexistente en Firefly", body=f"La cuenta propia «{name}» no existe en Firefly como cuenta de activo o pasivo.", dedupe_key="missing-account:" + name, min_interval_minutes=360)
         return {"accounts": len(self._accounts), "categories": len(self._categories), "missing_accounts": missing}
 
     async def accounts(self):
@@ -98,32 +98,26 @@ class Processor:
                 return account
         raise PermanentError("Firefly account does not exist: " + str(name))
 
-    def _source_accounts(self, source, identity):
-        prefix = {"notification": "app", "sms": "sms", "email": "email"}[source]
-        result = []
-        for account in self.settings.own_accounts:
-            for configured in account.sources:
-                kind, _, value = configured.casefold().partition(":")
-                address = identity.casefold()
-                domain = address.rsplit("@", 1)[-1]
-                if kind == prefix and (value == address or (kind == "email" and (domain == value or domain.endswith("." + value)))):
-                    result.append(account)
-                    break
-        return result
+    async def _own(self):
+        """Current own accounts (database rows behind a per-process snapshot); loaded on first use, never assumed."""
+        return await own_accounts.load(self.session)
 
-    def _resolve(self, item, hint=None):
-        candidates = self._source_accounts(item.source, item.app or "" if item.source == "notification" else item.sender)
+    async def _source_accounts(self, source, identity):
+        return own_accounts.for_source(await self._own(), source, identity)
+
+    async def _resolve(self, item, hint=None):
+        candidates = await self._source_accounts(item.source, item.app or "" if item.source == "notification" else item.sender)
         if hint:
-            matched = [a for a in candidates if hint.casefold().lstrip("*") in [v.casefold().lstrip("*") for v in a.last4 + a.aliases + [a.firefly_account]]]
+            matched = [a for a in candidates if hint.casefold().lstrip("*") in [v.casefold().lstrip("*") for v in (*a.last4, *a.aliases, a.firefly_account)]]
             if matched:
                 candidates = matched
         return candidates[0] if len(candidates) == 1 else None
 
-    def _counterparty(self, hint, exclude):
+    async def _counterparty(self, hint, exclude):
         if not hint:
             return None
         hint = hint.casefold().strip().lstrip("*")
-        matched = [a for a in self.settings.own_accounts if a.firefly_account != exclude and any(v.casefold().lstrip("*") in hint for v in a.aliases + a.last4 + [a.firefly_account] if v)]
+        matched = [a for a in await self._own() if a.firefly_account != exclude and any(v.casefold().lstrip("*") in hint for v in (*a.aliases, *a.last4, a.firefly_account) if v)]
         return matched[0] if len(matched) == 1 else None
 
     def _notification_date(self, payload):
@@ -162,7 +156,7 @@ class Processor:
         else:
             ref = "evt:" + str(payload.event_id) if payload.event_id else ("phone:" + hashlib.sha256(json.dumps([source, payload.app, payload.sender, content, stamp]).encode()).hexdigest() if stamp else "phone:" + uuid4().hex)
         identity = payload.app if source == "notification" else payload.sender
-        known = bool(self._source_accounts(source, identity))
+        known = bool(await self._source_accounts(source, identity))
         occurred, reason = self._notification_date(payload)
         sensitive = is_sensitive_code(content, payload.title)
         keep = known and not sensitive  # B6: nothing from an unknown source is stored beyond its identity
@@ -172,7 +166,7 @@ class Processor:
     async def poll_mail(self, since=None, account_name=None):
         result = {"queued": 0, "ignored": 0, "duplicates": 0, "needs_review": 0, "errors": {}}
         rules = list(await self.senders.all(False))
-        rules += [SimpleNamespace(keyword=s.split(":", 1)[1], status="active", require_auth=True) for a in self.settings.own_accounts for s in a.sources if s.startswith("email:")]
+        rules += own_accounts.email_rules(await self._own())
         for account in self.settings.mail_accounts:
             if account_name and account.name != account_name:
                 continue
@@ -229,7 +223,7 @@ class Processor:
         """
         counts, ids, seen = self._history_counts(), [], set()
         rules = list(await self.senders.all(False))
-        rules += [SimpleNamespace(keyword=s.split(":", 1)[1], status="active", require_auth=True) for a in self.settings.own_accounts for s in a.sources if s.startswith("email:")]
+        rules += own_accounts.email_rules(await self._own())
         senders = sorted({parsed[0] or parsed[1] for rule in rules if (parsed := sender_rule(rule.keyword))})
         errors = {}
         for account in self.settings.mail_accounts:
@@ -280,7 +274,7 @@ class Processor:
         counts, ids = self._history_counts(), []
         for sms in items:
             counts["found"] += 1
-            if not self._source_accounts("sms", sms.sender):
+            if not await self._source_accounts("sms", sms.sender):
                 counts["untrusted"] += 1
                 continue
             try:
@@ -399,11 +393,11 @@ class Processor:
         item.currency, item.merchant = extraction.currency, extraction.merchant
         item.transaction_type = extraction.kind
         item.original_kind = extraction.kind
-        own = self._resolve(item, extraction.account_hint)
+        own = await self._resolve(item, extraction.account_hint)
         item.asset_account = own.firefly_account if own else None
         if not own:
             reasons.append("source has no unambiguous own account")
-        counterparty = self._counterparty(extraction.counterparty_hint or extraction.merchant, item.asset_account)
+        counterparty = await self._counterparty(extraction.counterparty_hint or extraction.merchant, item.asset_account)
         if counterparty:
             if extraction.kind in {"deposit", "refund"}:
                 item.destination_account, item.asset_account = item.asset_account, counterparty.firefly_account

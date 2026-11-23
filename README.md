@@ -29,7 +29,7 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 | `DATABASE_URL`, `DATABASE_URL_FILE` | `sqlite+aiosqlite:///./data/finance_v3.db`; PostgreSQL usa `postgresql+asyncpg://`; `_FILE` evita exponer la contraseña en el entorno |
 | `TIMEZONE` | America/Bogota |
 | `FIREFLY_BASE_URL`, `FIREFLY_API_TOKEN` | Ledger y personal access token |
-| `OWN_ACCOUNTS` | Lista JSON de cuentas propias, fuentes, aliases y últimos cuatro dígitos |
+| `OWN_ACCOUNTS` | Semilla inicial: lista JSON de cuentas propias (fuentes, aliases, últimos cuatro dígitos). Se importa una sola vez si la tabla `own_accounts` está vacía; después se administran con `/api/v1/own-accounts` y el archivo ya no se lee |
 | `MANUAL_DEFAULT_ACCOUNT` | Efectivo; solo registro manual, nunca fallback de fuentes bancarias |
 | `FIREFLY_CACHE_TTL_MINUTES` | 360 |
 | `MAIL_ACCOUNTS` | Lista JSON, `[]` desactiva correo |
@@ -56,7 +56,7 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 
 ### Cuentas propias y confianza
 
-`OWN_ACCOUNTS` reemplaza por completo `ACCOUNT_MAP`. Ejemplo:
+`OWN_ACCOUNTS` reemplaza por completo `ACCOUNT_MAP` y solo siembra la tabla `own_accounts` en el primer arranque (se audita como `own_account.seed`); desde entonces las cuentas y sus fuentes se editan desde la app (`/api/v1/own-accounts`) y los cambios aplican sin reiniciar. Ejemplo del archivo semilla:
 
 ```json
 [{"firefly_account":"Nequi","bank":"nequi","kind":"wallet","last4":[],"aliases":["nequi"],"sources":["app:com.nequi.MobileApp","sms:85954","email:nequi.com.co"]}]
@@ -68,7 +68,7 @@ IMAP usa usuario/contraseña de aplicación (`gmail`, `yahoo`, `icloud`, `custom
 
 Se leen primero cabeceras con BODY.PEEK y cuerpo solo si corresponde. Se persisten UIDVALIDITY, UID, errores y fallos consecutivos; un mensaje roto no bloquea los siguientes. Aprender remitentes solo propone reglas `pending_approval`; aprobarlas exige revisión humana. Tras la migración v2 todas las reglas antiguas quedan pendientes, incluso las semillas: revisarlas y aprobarlas antes de reactivar el scheduler.
 
-**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con `OWN_ACCOUNTS.sources` no es prueba criptográfica. Por defecto `SMS_AUTO_APPROVE_MAX_COP=0`: todo SMS queda para revisión; subirlo permite contabilización automática hasta ese monto solo si pasan también las demás comprobaciones. Por defecto `LLM_AUTO_APPROVE_MAX_COP=0`: incluso una extracción coherente con el texto queda para revisión humana; subir el límite acepta el riesgo de texto malicioso o saldos confundidos con gastos.
+**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con las fuentes (`sources`) de una cuenta propia no es prueba criptográfica. Por defecto `SMS_AUTO_APPROVE_MAX_COP=0`: todo SMS queda para revisión; subirlo permite contabilización automática hasta ese monto solo si pasan también las demás comprobaciones. Por defecto `LLM_AUTO_APPROVE_MAX_COP=0`: incluso una extracción coherente con el texto queda para revisión humana; subir el límite acepta el riesgo de texto malicioso o saldos confundidos con gastos.
 
 ### Secretos por archivo
 

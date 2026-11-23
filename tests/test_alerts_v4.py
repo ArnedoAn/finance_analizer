@@ -8,7 +8,6 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select, update
 
-from app.core.config import OwnAccount
 from app.db.models import Notification
 from app.db.models_alerts import Alert
 from app.db.models_devices import Device
@@ -330,8 +329,8 @@ async def test_digest_summarizes_with_full_amounts(db):
     assert (await alerting.digest(db, report, previous, stats, weekly=False)) is None
 
 
-async def test_missing_own_account_emits_system_failure(service, db):
-    service.settings.own_accounts = [*service.settings.own_accounts, OwnAccount(firefly_account="Fantasma", bank="x", kind="wallet")]
+async def test_missing_own_account_emits_system_failure(service, db, add_own_account):
+    await add_own_account("Fantasma")
     await service.sync(force=True)
     await service.sync(force=True)
     alert, = await rows(db, "system_failure")

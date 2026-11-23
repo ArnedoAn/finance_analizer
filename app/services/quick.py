@@ -7,10 +7,9 @@ import re
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from app.core.config import get_settings
 from app.models.schemas import ManualTransaction
 from app.parsers import normalize_merchant
-from app.services import suggestions
+from app.services import own_accounts, suggestions
 
 MAX_AMOUNT = Decimal("9999999999.99")  # ManualTransaction allows 12 digits, 2 decimals
 THOUSANDS = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
@@ -91,16 +90,14 @@ def _find_account(text: str, accounts):
     return None, None
 
 
-def parse(text: str, accounts=None) -> QuickEntry:
-    """Interpret "25k taxi", "taxi 25.000", "$1.2m arriendo" or "25000 almuerzo nequi"."""
+def parse(text: str, accounts) -> QuickEntry:
+    """Interpret "25k taxi", "taxi 25.000", "$1.2m arriendo" or "25000 almuerzo nequi"; ``accounts`` are the own accounts whose aliases may name the account."""
     text = " ".join((text or "").split())
     found = _find_amount(text)
     if found is None:
         raise UnparseableError("No amount found in the text")
     match, amount = found
     rest = f"{text[:match.start()]} {text[match.end():]}"
-    if accounts is None:
-        accounts = get_settings().own_accounts
     account, span = _find_account(rest, accounts)
     if span:
         rest = f"{rest[:span[0]]} {rest[span[1]:]}"
@@ -124,7 +121,7 @@ async def create_entry(service, *, text, client_ref, account=None, principal=Non
     existing = await service.inbox.by_ref(f"manual:{ref}")
     if existing is not None:
         return existing
-    entry = parse(text, service.settings.own_accounts)
+    entry = parse(text, await own_accounts.load(service.session))
     category = None
     suggested = await suggestions.suggest_for_merchant(service.session, entry.merchant, text=entry.description, limit=1, overall_fallback=False)
     if suggested:

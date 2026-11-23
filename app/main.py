@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger, setup_logging
 from app.db.database import close_db, get_db_session, init_db
+from app.services import own_accounts
 from app.services.processor import Processor
 from app.services.scheduler import SchedulerService
 
@@ -30,6 +31,9 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     setup_logging()
     await init_db()
+    # One-time import of OWN_ACCOUNTS into the table (only when it is empty); runs before anything reads the accounts.
+    async with get_db_session() as db:
+        await own_accounts.seed(db, settings)
     async with get_db_session() as db:
         try:
             await Processor(db, get_firefly(), get_llm()).sync(force=True)

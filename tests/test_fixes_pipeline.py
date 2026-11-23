@@ -51,47 +51,43 @@ def webhook_body(**changes):
     return body
 
 
-# --- A1: notification auto-approval cap -------------------------------------------------------------
+# --- A1: the auto-approval policy replaced the per-source environment caps -----------------------------
 
-def test_notification_auto_approval_and_ingest_limit_defaults():
-    assert Settings.model_fields["notification_auto_approve_max_cop"].default == Decimal("0")
+def test_ingest_limit_default_and_the_removed_caps():
     assert Settings.model_fields["ingest_max_events_per_hour"].default == 120
+    assert not [name for name in Settings.model_fields if name.endswith("auto_approve_max_cop")]
 
 
-async def test_notification_with_known_template_needs_review_by_default(service, clients):
-    service.settings.notification_auto_approve_max_cop = Decimal("0")
+def test_an_environment_that_still_sets_the_removed_caps_starts_and_ignores_them(monkeypatch):
+    for name in ("LLM", "SMS", "NOTIFICATION"):
+        monkeypatch.setenv(f"{name}_AUTO_APPROVE_MAX_COP", "5000000")
+    config = Settings(finance_api_key="test-admin-key-01234567890123456789", _env_file=None)
+    assert config.review_amount_cop == Decimal("2000000")
+    assert not [name for name in vars(config) if name.endswith("auto_approve_max_cop")]
+
+
+async def test_notification_with_known_template_registers_by_default(service, clients):
     row = await service.process(await item(service))
-    assert row.method == "parser" and row.status == "needs_review"
-    assert "Notification extraction requires human review" in row.review_reason
-    clients[0].create_transaction.assert_not_awaited()
+    assert row.method == "parser" and row.status == "created"
+    clients[0].create_transaction.assert_awaited_once()
 
 
-@pytest.mark.parametrize(("cap", "expected"), [("0", "needs_review"), ("11999", "needs_review"), ("12000", "created")])
+@pytest.mark.parametrize(("cap", "expected"), [("11999", "needs_review"), ("12000", "created")])
 async def test_notification_cap_bounds(service, clients, cap, expected):
-    service.settings.notification_auto_approve_max_cop = Decimal(cap)
+    await flags.set_policy(service.session, True, Decimal(cap))
+    await service.session.commit()
     row = await service.process(await item(service))
     assert row.status == expected
     assert clients[0].create_transaction.await_count == (expected == "created")
 
 
-@pytest.mark.parametrize(("source", "sms_cap", "notification_cap", "expected"), [
-    ("notification", "2000000", "0", "needs_review"),
-    ("sms", "0", "2000000", "needs_review"),
-    ("sms", "2000000", "0", "created"),
-    ("notification", "0", "2000000", "created"),
-])
-async def test_phone_caps_are_source_scoped(service, source, sms_cap, notification_cap, expected):
-    service.settings.sms_auto_approve_max_cop = Decimal(sms_cap)
-    service.settings.notification_auto_approve_max_cop = Decimal(notification_cap)
-    assert (await service.process(await item(service, source=source))).status == expected
-
-
-async def test_leaked_ingest_key_cannot_create_a_notification_charge_unreviewed(client, clients, service):
-    service.settings.notification_auto_approve_max_cop = Decimal("0")
+async def test_leaked_ingest_key_cannot_create_a_charge_above_the_cap_unreviewed(client, clients, service):
+    await flags.set_policy(service.session, True, Decimal("10000"))
+    await service.session.commit()
     response = await client.post(f"{API}/notifications/webhook", headers=PHONE, json=webhook_body(message="Compraste $1.900.000 en SUPERMERCADO CENTRAL"))
     assert response.status_code == 202
     row = await service.inbox.get(response.json()["inbox_id"])
-    assert row.status == "needs_review"
+    assert row.status == "needs_review" and "amount over auto-approval limit" in row.review_reason
     clients[0].create_transaction.assert_not_awaited()
 
 
@@ -296,7 +292,8 @@ async def test_automatic_created_item_emits_new_charge_with_suggested_categories
 async def test_no_new_charge_for_manual_entries_or_owner_approvals(service, db):
     manual = await service.manual(ManualTransaction(client_ref="m-1", amount=7000, description="Lunch", merchant="SUPERMERCADO CENTRAL", account="Nequi"))
     assert manual.status == "created"
-    service.settings.notification_auto_approve_max_cop = Decimal("0")
+    await flags.set_policy(db, False, Decimal("2000000"))
+    await db.commit()
     held = await service.process(await item(service))
     assert held.status == "needs_review"
     assert (await service.review(held, "approve")).status == "created"

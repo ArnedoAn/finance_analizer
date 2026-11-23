@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.core.exceptions import PermanentError
 from app.db.models import InboxItem
 from app.models.schemas import ManualTransaction, WebhookPayload
+from app.services import flags
 from app.services import processor as pipeline
 
 
@@ -168,7 +169,7 @@ async def test_permanent_firefly_error_needs_review_without_retry(service, clien
 
 @pytest.mark.parametrize("changes", [
     {"kind": "review", "reason": "two transactions"},
-    {"merchant": None}, {"currency": "USD"}, {"amount": Decimal("2000001")},
+    {"merchant": None}, {"currency": "USD"}, {"amount": Decimal("2000001")}, {"amount": None}, {"amount": Decimal("0")},
     {"occurred_at": datetime.now(UTC) - timedelta(days=4)},
     {"occurred_at": datetime.now(UTC) + timedelta(days=1)},
 ])
@@ -299,11 +300,73 @@ async def test_failed_outage_emits_system_failure_alert(service, clients):
     assert alert.item_id == row.id and alert.dedupe_key == f"failed:{row.id}"
 
 
-async def test_ambiguous_transfer_requires_review(service, clients, extraction, monkeypatch):
-    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", counterparty_hint="unknown bank"))
+async def test_transfer_without_any_counterparty_name_requires_review(service, clients, extraction, monkeypatch):
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", merchant=None, counterparty_hint=None))
     row = await service.process(await item(service))
-    assert row.status == "needs_review" and row.review_reason
+    assert row.status == "needs_review" and "ambiguous transfer counterparty" in row.review_reason
     clients[0].create_transaction.assert_not_awaited()
+
+
+def named_accounts(clients):
+    """Firefly stand-in that answers ``create_account`` with the account it was asked for."""
+    created = []
+
+    def create(name, kind):
+        created.append((name, kind))
+        return {"id": str(100 + len(created)), "name": name, "type": kind}
+
+    clients[0].create_account.side_effect = create
+    return created
+
+
+async def test_transfer_to_an_unknown_person_is_an_expense_with_that_person_as_merchant(service, clients, extraction, monkeypatch):
+    created = named_accounts(clients)
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", merchant=None, counterparty_hint="Juan Perez"))
+    row = await service.process(await item(service))
+    assert row.status == "created" and row.transaction_type == "withdrawal" and row.original_kind == "transfer"
+    assert row.merchant == "JUAN PEREZ" and row.tags == ["transferencia"] and row.destination_account is None
+    assert created == [("JUAN PEREZ", "expense")]
+    split = clients[0].create_transaction.call_args.args[0]["transactions"][0]
+    assert split["type"] == "withdrawal" and split["source_id"] == "1" and split["destination_id"] == "101"
+    assert "transferencia" in split["tags"]
+
+
+async def test_received_transfer_from_an_unknown_person_is_an_income(service, clients, extraction, monkeypatch):
+    created = named_accounts(clients)
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", merchant="Juan Perez", counterparty_hint=None))
+    row = await service.process(await item(service, raw_text="Recibiste $12.000 transferidos por Juan Perez"))
+    assert row.status == "created" and row.transaction_type == "deposit" and row.original_kind == "transfer"
+    assert row.merchant == "JUAN PEREZ" and "transferencia" in row.tags
+    assert created == [("JUAN PEREZ", "revenue")]
+    split = clients[0].create_transaction.call_args.args[0]["transactions"][0]
+    assert split["type"] == "deposit" and split["source_id"] == "101" and split["destination_id"] == "1"
+
+
+async def test_two_transfers_to_the_same_person_create_the_counterparty_account_once(service, clients, extraction, monkeypatch):
+    created = named_accounts(clients)
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", merchant=None, counterparty_hint="Juan  Perez"))
+    first = await service.process(await item(service))
+    second = await service.process(await item(service))
+    assert first.status == second.status == "created"
+    assert created == [("JUAN PEREZ", "expense")]
+    destinations = {call.args[0]["transactions"][0]["destination_id"] for call in clients[0].create_transaction.await_args_list}
+    assert destinations == {"101"} and clients[0].create_transaction.await_count == 2
+
+
+async def test_transfer_to_an_existing_expense_account_reuses_it(service, clients, extraction, monkeypatch):
+    clients[0].accounts.return_value.append({"id": "77", "name": "Juan Perez", "type": "expense"})
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", merchant=None, counterparty_hint="JUAN PEREZ"))
+    row = await service.process(await item(service))
+    assert row.status == "created"
+    clients[0].create_account.assert_not_awaited()
+    assert clients[0].create_transaction.call_args.args[0]["transactions"][0]["destination_id"] == "77"
+
+
+async def test_dirty_merchant_is_normalized_and_clipped_instead_of_reviewed(service, clients, extraction, monkeypatch):
+    dirty = "tienda   del barrio " + "x" * 60 + " ref 123456789"
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, merchant=dirty))
+    row = await service.process(await item(service))
+    assert row.status == "created" and len(row.merchant) == 60 and row.merchant.startswith("TIENDA DEL BARRIO X")
 
 
 async def test_committed_claim_prevents_second_worker_submission(service, clients):
@@ -349,27 +412,47 @@ async def test_manual_default_merchant_is_fixed_not_free_text(service, clients):
 
 
 @pytest.mark.parametrize("source", ["email", "notification", "sms"])
-async def test_llm_extractions_require_review_by_default(service, clients, monkeypatch, source):
+async def test_verified_llm_extraction_registers_without_review(service, clients, monkeypatch, source):
     monkeypatch.setattr(pipeline, "parse", lambda *args: None)
-    assert service.settings.llm_auto_approve_max_cop == 0
     row = await service.process(await item(service, source=source))
-    assert row.method == "llm" and row.status == "needs_review" and row.review_reason
+    assert row.method == "llm" and row.status == "created" and row.review_reason is None
     clients[1].analyze.assert_awaited_once()
+    clients[0].create_transaction.assert_awaited_once()
+
+
+async def test_policy_defaults_to_enabled_with_the_review_amount(db, settings):
+    assert await flags.policy(db, settings) == {"enabled": True, "max_amount_cop": Decimal("2000000.00")}
+    for removed in ("llm_auto_approve_max_cop", "sms_auto_approve_max_cop", "notification_auto_approve_max_cop"):
+        assert removed not in Settings.model_fields
+
+
+@pytest.mark.parametrize("cap,expected", [("11999", "needs_review"), ("12000", "created"), ("12001", "created")])
+@pytest.mark.parametrize("llm", [False, True])
+@pytest.mark.parametrize("source", ["email", "notification", "sms"])
+async def test_policy_cap_bounds_every_source_and_method(service, clients, monkeypatch, source, llm, cap, expected):
+    if llm:
+        monkeypatch.setattr(pipeline, "parse", lambda *args: None)
+    await flags.set_policy(service.session, True, Decimal(cap))
+    await service.session.commit()
+    row = await service.process(await item(service, source=source))
+    assert row.method == ("llm" if llm else "parser") and row.status == expected
+    assert clients[0].create_transaction.await_count == (expected == "created")
+    if expected == "needs_review":
+        assert "amount over auto-approval limit" in row.review_reason
+
+
+@pytest.mark.parametrize("source", ["email", "notification", "sms"])
+async def test_disabled_policy_sends_everything_to_review(service, clients, source):
+    await flags.set_policy(service.session, False, Decimal("2000000"))
+    await service.session.commit()
+    row = await service.process(await item(service, source=source))
+    assert row.status == "needs_review" and "auto-approval disabled" in row.review_reason
     clients[0].create_transaction.assert_not_awaited()
 
 
-@pytest.mark.parametrize("threshold,expected", [(0, "needs_review"), (11999, "needs_review"), (12000, "created"), (12001, "created")])
-@pytest.mark.parametrize("source", ["email", "notification", "sms"])
-async def test_explicit_llm_threshold_bounds_verified_extractions(service, clients, monkeypatch, source, threshold, expected):
-    monkeypatch.setattr(pipeline, "parse", lambda *args: None)
-    service.settings.llm_auto_approve_max_cop = Decimal(threshold)
-    row = await service.process(await item(service, source=source))
-    assert row.method == "llm" and row.status == expected
-    assert clients[0].create_transaction.await_count == (expected == "created")
-
-
-async def test_llm_threshold_never_overrides_verification(service, clients, monkeypatch):
-    service.settings.llm_auto_approve_max_cop = Decimal("1000000")
+async def test_policy_never_overrides_llm_verification(service, clients, monkeypatch):
+    await flags.set_policy(service.session, True, Decimal("1000000000"))
+    await service.session.commit()
     monkeypatch.setattr(pipeline, "parse", lambda *args: None)
     monkeypatch.setattr(pipeline, "verify_llm", lambda *args: ["merchant absent"])
     row = await service.process(await item(service))
@@ -377,38 +460,12 @@ async def test_llm_threshold_never_overrides_verification(service, clients, monk
     clients[0].create_transaction.assert_not_awaited()
 
 
-async def test_sms_default_requires_review(service, clients):
-    assert Settings.model_fields["sms_auto_approve_max_cop"].default == Decimal("0")
-    service.settings.sms_auto_approve_max_cop = Decimal("0")
-    row = await service.process(await item(service, source="sms"))
-    assert row.status == "needs_review" and "SMS extraction requires human review" in row.review_reason
-    clients[0].create_transaction.assert_not_awaited()
-
-
 @pytest.mark.parametrize("amount,expected", [("2000000", "created"), ("2000001", "needs_review")])
-async def test_sms_parser_limit_when_raised(service, clients, extraction, monkeypatch, amount, expected):
-    service.settings.sms_auto_approve_max_cop = Decimal("2000000")
+async def test_default_cap_is_the_review_amount_for_phone_sources(service, clients, extraction, monkeypatch, amount, expected):
     monkeypatch.setattr(pipeline, "parse", lambda *args: replace(extraction, amount=Decimal(amount)))
     row = await service.process(await item(service, source="sms"))
     assert row.method == "parser" and row.status == expected
     assert clients[0].create_transaction.await_count == (expected == "created")
-
-
-@pytest.mark.parametrize("source,expected", [("sms", "needs_review"), ("email", "created"), ("notification", "created")])
-async def test_lower_sms_parser_threshold_is_source_scoped(service, clients, source, expected):
-    service.settings.sms_auto_approve_max_cop = Decimal("10000")
-    row = await service.process(await item(service, source=source))
-    assert row.status == expected
-    assert clients[0].create_transaction.await_count == (expected == "created")
-
-
-async def test_sms_llm_never_uses_permissive_sms_parser_threshold(service, clients, monkeypatch):
-    service.settings.sms_auto_approve_max_cop = Decimal("2000000")
-    service.settings.llm_auto_approve_max_cop = Decimal("10000")
-    monkeypatch.setattr(pipeline, "parse", lambda *args: None)
-    row = await service.process(await item(service, source="sms"))
-    assert row.method == "llm" and row.status == "needs_review"
-    clients[0].create_transaction.assert_not_awaited()
 
 
 @pytest.mark.parametrize("source", ["sms", "notification"])

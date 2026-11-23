@@ -763,6 +763,7 @@ async def delete(db, processor, firefly_id: str, principal) -> LedgerChange:
     if item is not None:
         inbox_before = _inbox_snapshot(item)
         item.status = "voided"
+        await processor.compact(item)
         db.add(InboxEvent(inbox_id=item.id, action="ledger_delete"))
     change = await _record(db, principal, action="delete", firefly_id=firefly_id, before=before, after=None, group_id=None, item=item, inbox_before=inbox_before)
     await db.commit()

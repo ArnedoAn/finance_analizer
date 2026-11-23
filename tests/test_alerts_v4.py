@@ -137,7 +137,7 @@ async def test_alerts_endpoint_validation_and_scopes(client):
 
 
 async def test_pending_review_alert_has_suggestions_and_question(service, db, extraction, monkeypatch, fake_suggestions):
-    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", counterparty_hint="unknown bank"))
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="review", reason="two transactions"))
     row = await service.process(await make_item(service))
     assert row.status == "needs_review"
     review, = await rows(db, "pending_review")
@@ -157,7 +157,7 @@ async def test_pending_review_survives_suggestion_failure(service, db, extractio
 
     monkeypatch.setattr(suggestions, "suggest", broken)
     monkeypatch.setattr(suggestions, "question_for", broken)
-    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="transfer", counterparty_hint="unknown bank"))
+    monkeypatch.setattr(pipeline, "parse", lambda *a, **kw: replace(extraction, kind="review", reason="two transactions"))
     await service.process(await make_item(service))
     review, = await rows(db, "pending_review")
     assert review.suggested_categories == [] or review.suggested_categories is None

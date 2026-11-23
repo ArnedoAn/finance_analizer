@@ -14,6 +14,7 @@ Only values that change on every run are normalized: server-stamped instants clo
 ``at``, ``applied_at``...) become ``FROZEN``, ``revert_deadline`` becomes ``FROZEN`` + 7 days and the enrollment key a
 fixed placeholder. Seeded data uses absolute dates, so everything else is deterministic.
 """
+import asyncio
 import difflib
 import json
 import os
@@ -26,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.api.routers import history, system, widgets
+from app.api.routers import inbox as inbox_router
 from app.core.config import MailAccount
 from app.db.models import MailAccountState
 from app.db.models_rules import Merchant, Rule
@@ -48,7 +50,7 @@ ISO_INSTANT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
 DECIMAL_TEXT = re.compile(r"^-?\d+\.\d{2}$")
 MONEY_KEYS = frozenset({
     "amount", "previous_amount", "income", "spent", "balance", "projected_spent", "projected_balance",
-    "daily_available", "spent_today", "expenses", "limit", "available", "diff",
+    "daily_available", "spent_today", "expenses", "limit", "available", "diff", "max_amount_cop",
 })
 MONEY_MAPS = frozenset({"totals", "by_category", "by_account"})
 
@@ -541,6 +543,24 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
         assert imported["queued"] == 2 and imported["counts"]["untrusted"] == 1, imported
         status = await rec.call("history_status", "GET", "/history", reviewer)
         assert status["mail"]["state"] == "running" and status["sms"] == {"queued": 2, "processed": 0}, status
+
+    # -- Auto-approval policy and inbox auto-resolve. The re-evaluation runs on the application's own engine, so it is stubbed like
+    # the history import: a task that waits for a gate keeps the "already running" answer deterministic.
+    await rec.call("update_auto_approve", "PUT", "/settings/auto-approve", reviewer, json={"enabled": True, "max_amount_cop": "5000000.00"})
+    assert (await rec.call("get_auto_approve", "GET", "/settings/auto-approve", reviewer)) == {"enabled": True, "max_amount_cop": "5000000.00"}
+    gate = asyncio.Event()
+
+    async def hold(ids):
+        await gate.wait()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(inbox_router, "_resolve_task", None)
+        patch.setattr(inbox_router, "_run_auto_resolve", hold)
+        queued = await rec.call("auto_resolve_inbox", "POST", "/inbox/auto-resolve", reviewer, status=202)
+        assert queued["queued"] >= 1, queued
+        await rec.error("error_409_auto_resolve_running", "POST", "/inbox/auto-resolve", reviewer, 409, "auto_resolve_running")
+        gate.set()
+        await inbox_router._resolve_task
 
     # -- Ledger editing (section 15): a stateful Firefly stands in for the transaction endpoints -----------------------
     FireflyLedger(firefly, list(await service.accounts()), budgets={"11": "Mercado"}, bills={"21": "Internet"})

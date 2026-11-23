@@ -33,10 +33,7 @@ def settings(monkeypatch):
         phone_api_key="test-phone-key-01234567890123456789", scheduler_enabled=False,
         database_url=os.getenv("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:"),
         firefly_base_url="", firefly_api_token="", llm_api_key="", mail_accounts=[], own_accounts=[],
-        # Pipeline tests exercise SMS/notification auto-creation; the production defaults are 0 (see test_sms_default_requires_review
-        # and test_fixes_pipeline).
-        manual_default_account="Nequi", sms_auto_approve_max_cop=Decimal("2000000"),
-        notification_auto_approve_max_cop=Decimal("2000000"), _env_file=None,
+        manual_default_account="Nequi", _env_file=None,
     )
     monkeypatch.setattr("app.api.dependencies.get_settings", lambda: config)
     own_accounts.invalidate()  # the process snapshot must never leak from one test's database into the next

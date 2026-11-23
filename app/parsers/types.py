@@ -20,3 +20,5 @@ class Extraction:
     counterparty_hint: str | None = None
     template_id: str = "unknown"
     reason: str | None = None
+    # Short Spanish description written by the LLM only (stored instead of the e-mail body once the item is final).
+    summary: str | None = None

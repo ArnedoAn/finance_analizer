@@ -106,6 +106,50 @@ async def test_learning_proposes_exact_domain_only():
         await client.close()
 
 
+async def test_prompt_asks_for_a_bounded_spanish_summary():
+    from app.clients.llm import _PROMPT
+
+    assert "summary" in _PROMPT and "300" in _PROMPT and "español" in _PROMPT
+
+
+async def test_summary_is_collapsed_and_bounded_to_300_characters():
+    client = LLMClient(settings())
+    long = "Compra  de $12.500\nen TIENDA " + "con detalle " * 60
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content)["messages"][0]["content"])
+        return completion({"kind": "withdrawal", "amount": 12500, "merchant": "TIENDA", "summary": long})
+
+    await mock_http(client, handler)
+    try:
+        result = await client.analyze("Pagaste $12.500 en TIENDA", "cycle")
+        assert result.summary == " ".join(long.split())[:300] and len(result.summary) == 300
+        assert "summary" in seen[0]
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("summary", [None, "", "   "])
+async def test_summary_is_optional(summary):
+    client = LLMClient(settings())
+    await mock_http(client, lambda r: completion({"kind": "withdrawal", "amount": 12500, "merchant": "TIENDA", "summary": summary}))
+    try:
+        assert (await client.analyze("Pagaste $12.500 en TIENDA", "cycle")).summary is None
+    finally:
+        await client.close()
+
+
+async def test_summary_must_be_a_string():
+    client = LLMClient(settings())
+    await mock_http(client, lambda r: completion({"kind": "withdrawal", "amount": 12500, "merchant": "TIENDA", "summary": 5}))
+    try:
+        with pytest.raises(RuntimeError):
+            await client.analyze("Pagaste $12.500 en TIENDA", "cycle")
+    finally:
+        await client.close()
+
+
 async def test_health_without_inference_and_unconfigured_chain():
     client = LLMClient(settings())
     def handler(request):

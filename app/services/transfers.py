@@ -97,6 +97,7 @@ async def pair(service, out_id: int, in_id: int, principal=None):
         await service.review(incoming, "void", principal=principal)
     incoming.status, incoming.duplicate_of_id = "duplicate", out.id
     incoming.review_reason = None
+    await service.compact(incoming)
     session.add(InboxEvent(inbox_id=incoming.id, action="paired", detail=f"transfer pair with {out.id}"))
     await session.commit()
     return out, incoming

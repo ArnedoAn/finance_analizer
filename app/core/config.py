@@ -64,13 +64,9 @@ class Settings(BaseSettings):
     own_accounts: list[OwnAccount] = Field(default_factory=list)
     expose_docs: bool = False
     max_amount_cop: Decimal = Decimal("50000000")
+    # Alert threshold for big_amount and the default max_amount_cop of the auto-approval policy (app.services.flags).
+    # The three *_AUTO_APPROVE_MAX_COP variables are gone: an environment that still sets them is ignored (extra="ignore").
     review_amount_cop: Decimal = Decimal("2000000")
-    llm_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
-    # v4: 0 = every SMS goes to human review (SMS sender IDs are spoofable); raise only deliberately.
-    sms_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
-    # v4 (security review A1): the ingest key lives on the phone without app lock, so a leaked key must not be able to
-    # post to Firefly unreviewed. 0 = every notification goes to human review (package names are public); raise only deliberately.
-    notification_auto_approve_max_cop: Decimal = Field(default=Decimal("0"), ge=0)
     # v4 (A1): per ingest device and hour; the 429 + system_failure alert fire past it. Counted in memory per process
     # (production runs one uvicorn worker), so with N workers the effective limit is N times higher.
     ingest_max_events_per_hour: int = Field(default=120, ge=1)

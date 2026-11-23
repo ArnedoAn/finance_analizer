@@ -1,4 +1,4 @@
-"""Widget summary, category suggestions, quick entry and auto-approval flags (contract sections 13, 14). Owner: Phase 5 (A7)."""
+"""Widget summary, category suggestions, quick entry, auto-approval flags and policy (contract sections 3, 13, 14). Owner: Phase 5 (A7)."""
 import asyncio
 import calendar
 from datetime import timedelta
@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import func, select
 
 from app.api.dependencies import READ, ReviewPrincipal, get_firefly
@@ -22,6 +22,13 @@ router = APIRouter()
 PHONE_SOURCES = ("sms", "notification")
 STALE_REVIEW = timedelta(hours=2)
 BUDGET_TIMEOUT_SECONDS = 5
+
+
+class AutoApproveBody(BaseModel):
+    """Auto-approval policy (contract section 3): ``enabled`` is required; the cap is a COP amount in (0, 1.000.000.000]."""
+    model_config = ConfigDict(extra="forbid")
+    enabled: StrictBool
+    max_amount_cop: Decimal = Field(gt=0, le=flags.MAX_POLICY_AMOUNT, decimal_places=2)
 
 
 class QuickRequest(BaseModel):
@@ -140,3 +147,26 @@ async def resume_auto_approve(principal: ReviewPrincipal, db: DB):
     )
     await db.commit()
     return {"paused": False}
+
+
+def _policy_body(policy: dict) -> dict:
+    return {"enabled": policy["enabled"], "max_amount_cop": f"{policy['max_amount_cop']:.2f}"}
+
+
+@router.get("/settings/auto-approve", dependencies=[READ])
+async def get_auto_approve(db: DB, service: Service):
+    return _policy_body(await flags.policy(db, service.settings))
+
+
+@router.put("/settings/auto-approve")
+async def put_auto_approve(body: AutoApproveBody, principal: ReviewPrincipal, db: DB, service: Service):
+    from app.services import audit
+
+    previous = await flags.policy(db, service.settings)
+    current = await flags.set_policy(db, body.enabled, body.max_amount_cop)
+    await audit.record(
+        db, action="settings.auto_approve", target_type="settings", target_id="auto_approve", principal=principal,
+        detail={"enabled": current["enabled"], "max_amount_cop": current["max_amount_cop"], "previous": _policy_body(previous)},
+    )
+    await db.commit()
+    return _policy_body(current)

@@ -1,4 +1,5 @@
 """Inbox and review (contract sections 3 and 14)."""
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
@@ -6,13 +7,22 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
 
-from app.api.dependencies import READ, ReadPrincipal, ReviewPrincipal
+from app.api.dependencies import READ, ReadPrincipal, ReviewPrincipal, get_firefly, get_llm
 from app.api.routers.common import DB, Service, get_item, item_data
+from app.core.logging import get_logger
+from app.db.database import get_db_session
 from app.db.repositories import InboxRepository
 from app.parsers import normalize_merchant
 from app.services import audit, flags
+from app.services.processor import Processor
+
+logger = get_logger(__name__)
 
 router = APIRouter()
+
+# One re-evaluation at a time. Per process: production runs a single uvicorn worker; a restart loses only this handle,
+# never items, and the request can simply be repeated.
+_resolve_task: asyncio.Task | None = None
 
 Tag = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
 
@@ -98,6 +108,37 @@ async def retry_failed(db: DB, service: Service, principal: ReviewPrincipal):
             await service.process(item)
     await db.commit()
     return {"requeued": requeued}
+
+
+def _resolve_running() -> bool:
+    return _resolve_task is not None and not _resolve_task.done()
+
+
+async def _run_auto_resolve(ids: list[int]) -> None:
+    try:
+        async with get_db_session() as db:
+            counts = await Processor(db, get_firefly(), get_llm()).reevaluate_ids(ids)
+        logger.info("auto_resolve_done", processed=sum(counts.values()), created=counts.get("created", 0))
+    except Exception as exc:
+        logger.error("auto_resolve_failed", error_type=type(exc).__name__)
+
+
+@router.post("/inbox/auto-resolve", status_code=202)
+async def auto_resolve(db: DB, service: Service, principal: ReviewPrincipal):
+    """Decide again, in the background and with the current policy, every automatic ``needs_review`` item."""
+    global _resolve_task
+    busy = HTTPException(409, detail={"detail": "Ya hay una reevaluación de la bandeja en curso.", "code": "auto_resolve_running"})
+    if _resolve_running():
+        raise busy
+    ids = await service.reevaluation_ids()
+    if not ids:
+        return {"queued": 0}
+    await audit.record(db, action="inbox.auto_resolve", target_type="inbox", target_id="needs_review", detail={"queued": len(ids)}, principal=principal)
+    await db.commit()
+    if _resolve_running():  # another request started one while this one was committing
+        raise busy
+    _resolve_task = asyncio.create_task(_run_auto_resolve(ids))
+    return {"queued": len(ids)}
 
 
 @router.get("/inbox/{item_id}")

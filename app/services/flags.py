@@ -1,10 +1,13 @@
-"""Runtime policy flags (Phase 5 A7, contract section 13).
+"""Runtime policy flags (Phase 5 A7, contract section 13) and the auto-approval policy (contract section 3).
 
 ``policy_reasons`` is called by ``Processor._extract`` and again by ``Processor.process`` right before an unapproved item
 is sent to Firefly (items already extracted that retry); it returns extra review reasons;
 while auto-approvals are paused after a ``suspicious`` report every non-manual item
-must go to human review. Functions never commit; callers own the transaction.
+must go to human review. ``policy`` / ``set_policy`` hold the owner's auto-approval policy (enabled + amount cap) in the
+same key/value table. Functions never commit; callers own the transaction.
 """
+from decimal import Decimal
+
 from sqlalchemy import select
 
 from app.core.timezone import now_utc
@@ -12,7 +15,9 @@ from app.db.models_flags import RuntimeFlag
 from app.services import suggestions
 
 AUTO_APPROVE_PAUSED = "auto_approve_paused"
+AUTO_APPROVE_POLICY = "auto_approve_policy"
 PAUSED_REASON = "auto-approval paused after suspicious report"
+MAX_POLICY_AMOUNT = Decimal("1000000000")
 
 
 async def _state(session) -> dict:
@@ -20,13 +25,31 @@ async def _state(session) -> dict:
     return value if value and value.get("paused") else {"paused": False}
 
 
-async def _write(session, value):
-    row = await session.get(RuntimeFlag, AUTO_APPROVE_PAUSED, populate_existing=True)
+async def _write(session, value, key=AUTO_APPROVE_PAUSED):
+    row = await session.get(RuntimeFlag, key, populate_existing=True)
     if row is None:
-        session.add(RuntimeFlag(key=AUTO_APPROVE_PAUSED, value=value))
+        session.add(RuntimeFlag(key=key, value=value))
     else:
         row.value = value
     await session.flush()
+
+
+async def policy(session, settings) -> dict:
+    """The auto-approval policy: ``{"enabled": bool, "max_amount_cop": Decimal}``.
+
+    Without a stored row the default is enabled with ``settings.review_amount_cop`` as the cap.
+    """
+    stored = await session.scalar(select(RuntimeFlag.value).where(RuntimeFlag.key == AUTO_APPROVE_POLICY))
+    if not stored:
+        return {"enabled": True, "max_amount_cop": Decimal(settings.review_amount_cop).quantize(Decimal("0.01"))}
+    return {"enabled": bool(stored["enabled"]), "max_amount_cop": Decimal(stored["max_amount_cop"])}
+
+
+async def set_policy(session, enabled: bool, max_amount_cop: Decimal) -> dict:
+    """Store the policy (the caller validates 0 < max <= MAX_POLICY_AMOUNT, audits and commits)."""
+    amount = Decimal(max_amount_cop).quantize(Decimal("0.01"))
+    await _write(session, {"enabled": bool(enabled), "max_amount_cop": str(amount)}, AUTO_APPROVE_POLICY)
+    return {"enabled": bool(enabled), "max_amount_cop": amount}
 
 
 async def policy_reasons(session, item) -> list[str]:

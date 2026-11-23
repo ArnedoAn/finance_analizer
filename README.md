@@ -39,10 +39,7 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 | `LLM_USER_AGENT` | finance-analyzer/3.0 |
 | `LLM_FALLBACK_BASE_URL`, `LLM_FALLBACK_API_KEY`, `LLM_FALLBACK_MODEL` | https://api.deepseek.com/v1, secreto opcional, deepseek-chat |
 | `DEDUP_WINDOW_MINUTES`, `TRANSFER_PAIR_WINDOW_MINUTES` | 60, 30 |
-| `MAX_AMOUNT_COP`, `REVIEW_AMOUNT_COP` | 50000000, 2000000 |
-| `LLM_AUTO_APPROVE_MAX_COP` | 0: toda extracción LLM requiere revisión humana; elevarlo es un opt-in de riesgo |
-| `SMS_AUTO_APPROVE_MAX_COP` | 0 (todo SMS va a revisión); un valor mayor permite contabilizar automáticamente SMS hasta ese monto si pasan las demás reglas |
-| `NOTIFICATION_AUTO_APPROVE_MAX_COP` | 0 (toda notificación del teléfono va a revisión); un valor mayor permite contabilizar automáticamente notificaciones hasta ese monto si pasan las demás reglas |
+| `MAX_AMOUNT_COP`, `REVIEW_AMOUNT_COP` | 50000000, 2000000; `REVIEW_AMOUNT_COP` es además el tope por defecto de la política de aprobación automática (la política vive en la base, no en el entorno; ver «Aprobación automática») |
 | `INGEST_MAX_EVENTS_PER_HOUR` | 120; límite de eventos de ingesta por hora, contador por proceso (válido con un solo worker) |
 | `FAIL_AFTER_HOURS` | 72 horas para fallos transitorios automáticos |
 | `RAW_TEXT_RETENTION_DAYS` | 30 para todos los estados; el texto crudo se guarda cifrado (AES-GCM) mientras tanto |
@@ -68,7 +65,19 @@ IMAP usa usuario/contraseña de aplicación (`gmail`, `yahoo`, `icloud`, `custom
 
 Se leen primero cabeceras con BODY.PEEK y cuerpo solo si corresponde. Se persisten UIDVALIDITY, UID, errores y fallos consecutivos; un mensaje roto no bloquea los siguientes. Aprender remitentes solo propone reglas `pending_approval`; aprobarlas exige revisión humana. Tras la migración v2 todas las reglas antiguas quedan pendientes, incluso las semillas: revisarlas y aprobarlas antes de reactivar el scheduler.
 
-**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con las fuentes (`sources`) de una cuenta propia no es prueba criptográfica. Por defecto `SMS_AUTO_APPROVE_MAX_COP=0`: todo SMS queda para revisión; subirlo permite contabilización automática hasta ese monto solo si pasan también las demás comprobaciones. Por defecto `LLM_AUTO_APPROVE_MAX_COP=0`: incluso una extracción coherente con el texto queda para revisión humana; subir el límite acepta el riesgo de texto malicioso o saldos confundidos con gastos.
+**SMS no autentica al banco.** Un remitente alfanumérico/código corto puede ser suplantado; una coincidencia con las fuentes (`sources`) de una cuenta propia no es prueba criptográfica. Con la política de aprobación automática activa (valor por defecto), un SMS o una notificación de una fuente propia que pase las comprobaciones se registra sin revisión humana; el riesgo se acota con el tope por monto, la pausa por «No lo reconozco», el deshacer y la auditoría (ver `docs/FINANCE-SECURITY.md`).
+
+### Aprobación automática
+
+La política es `{enabled, max_amount_cop}`, se guarda en la tabla `runtime_flags` (clave `auto_approve_policy`) y se cambia desde la app con `GET/PUT /api/v1/settings/auto-approve` (`read` / `review`, el `PUT` se audita como `settings.auto_approve`). Sin fila guardada vale `enabled=true` y `max_amount_cop=REVIEW_AMOUNT_COP`. Sustituye a `LLM_AUTO_APPROVE_MAX_COP`, `SMS_AUTO_APPROVE_MAX_COP` y `NOTIFICATION_AUTO_APPROVE_MAX_COP`: esas variables ya no existen y, si el entorno las trae, se ignoran.
+
+Con `enabled=true`, un elemento de una fuente confiable (remitente de correo o cuenta propia) se registra solo si tiene monto válido ≤ `max_amount_cop`, cuenta propia resuelta, COP, fecha coherente y, si se usó el LLM, `verify_llm` sin discrepancias. Quedan en revisión solo los motivos duros: `sender_auth_failed`, extracción `review`, sin monto, monto sobre el tope, moneda extranjera, fecha incoherente, pausa por «No lo reconozco», posible duplicado manual/automático, cuenta propia no resuelta (y, con `enabled=false`, todo). Un comercio sucio ya no es motivo: se normaliza y se recorta a 60 caracteres; sin ningún nombre utilizable queda en revisión (`merchant absent`).
+
+Una transferencia (`kind=transfer`) sin contraparte propia se registra como gasto (`withdrawal`) o ingreso (`deposit`, si el texto dice que se recibió) cuyo comercio es el nombre de la contraparte; `_merchant` crea la cuenta de gasto/ingreso en Firefly o reutiliza la existente. El elemento guarda `original_kind=transfer` y la etiqueta `transferencia`. Sin ningún nombre de contraparte sigue en revisión («ambiguous transfer counterparty»).
+
+`POST /api/v1/inbox/auto-resolve` (`review`) vuelve a decidir en segundo plano todos los `needs_review` de fuentes automáticas (no manuales, no `sender_auth_failed`, no los que el dueño ya tocó): el parser local se ejecuta de nuevo y una extracción LLM guardada (monto, comercio y tipo) no vuelve a enviarse al proveedor; si falta la extracción, se extrae. Responde 202 `{queued}`; una sola reevaluación a la vez (409 `auto_resolve_running`).
+
+**Correo compacto.** Al llegar a un estado final (created, ignored, duplicate, rejected, voided) un correo reemplaza `raw_text` por un extracto de máximo 600 caracteres: el asunto más las líneas que mencionan monto, comercio, cuenta o fecha; si el LLM se usó en esa misma pasada, su campo `summary` (≤ 300 caracteres, en español) lo sustituye. Mientras esté pending o needs_review conserva el texto completo. SMS y notificaciones no cambian.
 
 ### Secretos por archivo
 
@@ -92,6 +101,8 @@ Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready` y `P
 | PATCH | `/inbox/{id}` | Corregir creado y actualizar Firefly |
 | POST | `/inbox/{id}/void` | Eliminar en Firefly y marcar voided |
 | POST | `/inbox/{id}/reprocess`, `/inbox/retry-failed` | Reencolar para nueva evaluación |
+| GET/PUT | `/settings/auto-approve` | Política de aprobación automática (`read` / `review`) |
+| POST | `/inbox/auto-resolve` | Reevaluar en segundo plano la revisión con la política actual (`review`, 202 `{queued}`) |
 | GET | `/mail/accounts` | Configuración sin secretos, cursor y fallos consecutivos |
 | POST | `/mail/accounts/{name}/test` | Prueba IMAP con error enmascarado |
 | POST | `/mail/accounts/{name}/repoll?since=YYYY-MM-DD` | Releer rango histórico deliberadamente |
@@ -137,8 +148,8 @@ El texto financiero original no aparece en respuestas de detalle por defecto. Us
 
 ## Garantías del pipeline
 
-1. Inbox durable antes de red: pending → submitting → created / needs_review / failed / ignored / duplicate / rejected / voided. raw_text se conserva truncado a 4000 y sujeto a retención; jamás se loguea.
-2. Parsers por banco producen extracción común y montos Decimal a 0.01. Reversos son refund; transacciones rechazadas son ignore. Eventos mezclados, merchant sucio, USD, monto alto, fecha sospechosa o transferencia ambigua van a revisión. El LLM no autoriza nuevas fuentes y su resultado se verifica determinísticamente contra texto/monto/dirección/comercio; aun si pasa, requiere revisión por defecto (`LLM_AUTO_APPROVE_MAX_COP=0`).
+1. Inbox durable antes de red: pending → submitting → created / needs_review / failed / ignored / duplicate / rejected / voided. raw_text se conserva truncado a 4000 y sujeto a retención; un correo en estado final guarda solo un extracto; jamás se loguea.
+2. Parsers por banco producen extracción común y montos Decimal a 0.01. Reversos son refund; transacciones rechazadas son ignore. Eventos mezclados, USD, monto sobre el tope, fecha sospechosa o transferencia sin nombre de contraparte van a revisión. El LLM no autoriza nuevas fuentes y su resultado se verifica determinísticamente contra texto/monto/dirección/comercio; si no hay discrepancias y cumple la política de aprobación automática, se registra sin revisión.
 3. `submitting` se confirma antes del POST. Cada intento consulta `external_id=fa:<source_ref>` y adopta el ID existente antes de crear: una respuesta perdida no implica otro gasto. PostgreSQL usa claim por fila y líder de scheduler con advisory lock; SQLite serializa claims. No se mantiene lock global durante red.
 4. Dedup entre canales distintos usa cuenta propia, monto, moneda y kind en ±60 min; compras iguales del mismo canal no se fusionan. Email también usa Message-ID normalizado entre buzones. Manual↔automático dudoso va a revisión. Las dos patas de una transferencia propia se emparejan en 30 min.
 5. Errores permanentes (validación/cuenta/datos) van a revisión con motivo. Transitorios tienen backoff y solo pasan a failed tras 72 h, con alerta. Conciliación busca creados borrados y transacciones auto sin item.

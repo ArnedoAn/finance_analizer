@@ -10,17 +10,18 @@ from uuid import uuid4
 from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.clients.imap import IMAPClient
-from app.clients.llm import verify_llm
+from app.clients.llm import SUMMARY_MAX_CHARS, verify_llm
 from app.core.config import get_settings
 from app.core.exceptions import PermanentError
 from app.core.logging import get_logger
 from app.db.models import CycleRun, InboxEvent, InboxItem
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
-from app.parsers import normalize_merchant, parse
+from app.parsers import Extraction, normalize_merchant, parse, parse_amount
+from app.parsers.common import fold
 from app.security import is_sensitive_code
 from app.security.redaction import redact
 from app.security.sender_trust import evaluate_email, sender_rule
@@ -33,6 +34,19 @@ _ECONOMIC_LOCKS = WeakValueDictionary()
 # A movement that reaches the inbox this long after it happened (history import, first mailbox poll)
 # is not news: it lands in the inbox without a push alert, so an import never floods the phone.
 HISTORIC_AGE = timedelta(hours=48)
+# States in which an item is finished: an e-mail then keeps a short extract instead of the whole message (``Processor.compact``).
+FINAL_STATES = frozenset({"created", "ignored", "duplicate", "rejected", "voided"})
+EXCERPT_CHARS = 600
+# Tag of a transfer to or from someone who is not an own account, so it can be consolidated later.
+TRANSFER_TAG = "transferencia"
+# Review reasons that cannot be recomputed from a stored row (the extraction's date, the phone's timestamp).
+PHONE_TIMESTAMP_REASON = "invalid phone timestamp"
+DATE_FUTURE_REASON = "transaction date is future or differs by more than 3 days"
+DATE_ONLY_REASON = "date-only extraction differs from receipt date"
+_KINDS = frozenset({"withdrawal", "deposit", "transfer", "refund", "review"})
+_INCOMING = re.compile(r"\b(?:recibiste|recibio|te\s+llegaron|te\s+(?:transfirieron|enviaron|consignaron|giraron)|abono|consignacion|deposito)\b")
+_OUTGOING = re.compile(r"\b(?:enviaste|transferiste|giraste|pagaste|retiraste|compraste|debito)\b")
+_MONTHS = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
 
 
 def _sms_ref(sender, millis, body):
@@ -63,6 +77,22 @@ def _permanent_message(exc):
     return f"Firefly rejected the request ({rejected[1]})" if rejected else str(exc)[:200]
 
 
+def _clean_merchant(value):
+    """Canonical merchant name, clipped to 60 characters instead of rejected; empty when nothing usable is left."""
+    name = normalize_merchant(value or "")
+    if name:
+        return name
+    # normalize_merchant refuses (rather than trims) a long name, a "$" or a long digit run: trim those and try again.
+    trimmed = re.sub(r"\d{5,}", " ", (value or "").replace("$", " "))
+    return normalize_merchant(" ".join(trimmed.split())[:60])
+
+
+def _received(text):
+    """True when the message says the owner received the money (a transfer in), not sent it."""
+    folded = fold(text)
+    return bool(_INCOMING.search(folded)) and not _OUTGOING.search(folded)
+
+
 class Processor:
     def __init__(self, session, firefly, llm, settings=None):
         self.session, self.firefly, self.llm = session, firefly, llm
@@ -72,6 +102,8 @@ class Processor:
         self.senders = KnownSenderRepository(session)
         self.mail_states = MailStateRepository(session)
         self._accounts = self._categories = None
+        # LLM summaries of e-mails, by item id, from extraction until the item reaches a final status (see ``compact``).
+        self._summaries = {}
 
     async def sync(self, force=False):
         if force or self._accounts is None:
@@ -133,7 +165,7 @@ class Processor:
                 raise ValueError("Timestamp outside allowed range")
             return occurred, None
         except (ValueError, TypeError, OverflowError, OSError):
-            return _now(), "invalid phone timestamp"
+            return _now(), PHONE_TIMESTAMP_REASON
 
     async def _insert(self, ref, **values):
         existing = await self.inbox.by_ref(ref)
@@ -184,6 +216,8 @@ class Processor:
                     status = "ignored" if sensitive else "needs_review" if auth_failed or message.error else "duplicate" if duplicate else "pending" if trusted else "ignored"
                     reason = "sensitive_code" if sensitive else "sender_auth_failed" if auth_failed else message.error
                     item, inserted = await self._insert(ref, source="email", account_name=account.name, message_id=message.message_id, sender=message.from_address, subject_or_title="" if sensitive else message.subject, raw_text=None if sensitive or auth_failed else (message.body or message.subject or "")[:4000], occurred_at=message.occurred_at or _now(), status=status, review_reason=reason, duplicate_of_id=duplicate.id if duplicate else None, template_id="ignore.sensitive_code" if sensitive else None)
+                    if inserted and item.status in FINAL_STATES:
+                        await self.compact(item)
                     if inserted:
                         await self._announce(item, None)
                     if not inserted and auth_failed and not sensitive and item.status in {"ignored", "pending", "needs_review"}:
@@ -310,6 +344,33 @@ class Processor:
                 progress(done)
         return done
 
+    async def reevaluation_ids(self):
+        """Ids of the ``needs_review`` items of automatic sources that ``reevaluate_ids`` may decide again.
+
+        Not manual entries, not mail whose sender failed authentication, and not items the owner already touched (``review``).
+        """
+        query = select(InboxItem.id).where(
+            InboxItem.status == "needs_review", InboxItem.source != "manual",
+            or_(InboxItem.review_reason.is_(None), InboxItem.review_reason != "sender_auth_failed"),
+            or_(InboxItem.method.is_(None), InboxItem.method != "review"),
+        ).order_by(InboxItem.id)
+        return list((await self.session.scalars(query)).all())
+
+    async def reevaluate_ids(self, ids, progress=None):
+        """Decide again, with the current policy, every item of ``ids`` that is still resolvable; returns counts by final status.
+
+        An item that already has an extraction is not sent to the LLM again (``_extract`` with ``reuse``).
+        """
+        counts, eligible = {}, set(await self.reevaluation_ids())
+        for done, item_id in enumerate(ids, 1):
+            item = await self.inbox.get(item_id)
+            if item is not None and item.status == "needs_review" and item_id in eligible:
+                status = (await self.process(item, reevaluate=True)).status
+                counts[status] = counts.get(status, 0) + 1
+            if progress:
+                progress(done)
+        return counts
+
     async def _merchant(self, merchant, kind):
         name = normalize_merchant(merchant or "")
         if not name or len(name) > 60 or "$" in name:
@@ -354,7 +415,28 @@ class Processor:
             return item
         return await self._finish(item, None) if hold else await self.process(item)
 
-    async def _extract(self, item, cycle_id):
+    @staticmethod
+    def _stored_extraction(item):
+        """The extraction an already processed row carries (kind, amount, merchant), or None when it lacks one."""
+        kind = item.original_kind or item.transaction_type
+        if kind not in _KINDS or item.amount is None or not item.merchant or not item.transaction_type:
+            return None
+        # An own-account transfer keeps both accounts on the row; hand them back as the counterparty hint.
+        both = " ".join(filter(None, (item.asset_account, item.destination_account))) if item.transaction_type == "transfer" else None
+        return Extraction(
+            kind=kind, amount=item.amount, currency=item.currency or "COP", merchant=item.merchant, account_hint=item.asset_account,
+            counterparty_hint=both, template_id=item.template_id or "unknown",
+        )
+
+    async def _extract(self, item, cycle_id, reuse=False):
+        """Extract the item and decide whether it may reach Firefly unreviewed; otherwise it becomes ``needs_review``.
+
+        An item of a trusted source is registered on its own unless it has a hard reason (policy in ``flags.policy``):
+        extraction asked for review, no valid amount or over the policy cap, foreign currency, incoherent date, auto-approval
+        paused or disabled, unresolved own account, no counterparty name for a transfer, an LLM result that fails ``verify_llm``.
+        ``reuse`` decides an already extracted row again: the local parser runs again (it is free) and an LLM row keeps
+        its stored extraction, so the provider is never called twice for the same message.
+        """
         if item.template_id == "ignore.sensitive_code" or is_sensitive_code(item.raw_text or "", item.subject_or_title or ""):
             item.status, item.raw_text, item.subject_or_title = "ignored", None, ""
             item.method, item.template_id, item.review_reason = "sensitive_code", "ignore.sensitive_code", "sensitive_code"
@@ -362,13 +444,18 @@ class Processor:
         if item.review_reason == "sender_auth_failed":
             item.status = "needs_review"
             return
-        text = item.raw_text or ""
-        extraction = parse(text, item.subject_or_title or "", item.sender or "")
-        item.method = "parser"
-        if extraction is None:
+        text, subject, previous = item.raw_text or "", item.subject_or_title or "", item.review_reason or ""
+        extraction = parse(text, subject, item.sender or "")
+        stored = None
+        if extraction is not None:
+            item.method = "parser"
+        elif reuse and (stored := self._stored_extraction(item)) is not None:
+            extraction = stored
+            item.method = item.method if item.method in {"parser", "llm"} else "llm"
+        else:
             item.method = "llm"
             # M1: the provider only receives redacted text; verify_llm below still checks the amount against the local original.
-            extraction = await self.llm.analyze("\n".join([redact(item.subject_or_title or ""), redact(text)]), cycle_id=cycle_id or uuid4().hex)
+            extraction = await self.llm.analyze("\n".join([redact(subject), redact(text)]), cycle_id=cycle_id or uuid4().hex)
         item.template_id = extraction.template_id
         # M3: the LLM reason is free text that may quote the message; keep it redacted and bounded.
         llm_reason = redact(extraction.reason)[:200] if extraction.reason else None
@@ -376,23 +463,33 @@ class Processor:
             item.status = "ignored"
             item.review_reason = llm_reason
             return
-        reasons = [item.review_reason] if item.review_reason else []
+        if reuse:
+            # What a stored row cannot tell again (the extraction's own date, the phone's timestamp) is carried over.
+            carried = (PHONE_TIMESTAMP_REASON, *((DATE_FUTURE_REASON, DATE_ONLY_REASON) if stored is not None else ()))
+            reasons = [reason for reason in carried if reason in previous]
+        else:
+            reasons = [previous] if previous else []
         if extraction.kind == "review":
             reasons.append(llm_reason or "parser requests review")
         if item.method == "llm":
             reasons.extend(verify_llm(text, extraction))
+            if extraction.summary and item.source == "email":
+                self._summaries[item.id] = extraction.summary
+        policy = await flags.policy(self.session, self.settings)
         item.amount = extraction.amount.quantize(Decimal("0.01")) if extraction.amount is not None else None
-        if item.method == "llm" and (not item.amount or self.settings.llm_auto_approve_max_cop == 0 or item.amount > self.settings.llm_auto_approve_max_cop):
-            reasons.append("LLM extraction requires human review")
-        # A1: SMS sender IDs and notification package names are spoofable and the ingest key sits on the phone: both need an explicit cap.
-        phone_caps = {"sms": ("SMS", self.settings.sms_auto_approve_max_cop), "notification": ("Notification", self.settings.notification_auto_approve_max_cop)}
-        if item.method == "parser" and item.source in phone_caps:
-            label, cap = phone_caps[item.source]
-            if not item.amount or cap == 0 or item.amount > cap:
-                reasons.append(f"{label} extraction requires human review")
-        item.currency, item.merchant = extraction.currency, extraction.merchant
-        item.transaction_type = extraction.kind
-        item.original_kind = extraction.kind
+        item.currency = extraction.currency
+        if not policy["enabled"]:
+            reasons.append("auto-approval disabled")
+        if item.amount is None or item.amount <= 0:
+            reasons.append("amount absent or invalid")
+        elif item.amount > policy["max_amount_cop"]:
+            reasons.append("amount over auto-approval limit")
+        if item.currency != "COP":
+            reasons.append("foreign currency requires confirmed COP amount")
+        # Who received it, decided before the row is overwritten: a stored transfer to a third party keeps its direction.
+        received = item.transaction_type == "deposit" if stored is not None and item.original_kind == "transfer" and item.transaction_type in {"withdrawal", "deposit"} else _received(subject + "\n" + text)
+        merchant = _clean_merchant(extraction.merchant)
+        item.transaction_type = item.original_kind = extraction.kind
         own = await self._resolve(item, extraction.account_hint)
         item.asset_account = own.firefly_account if own else None
         if not own:
@@ -405,25 +502,33 @@ class Processor:
                 item.destination_account = counterparty.firefly_account
             item.transaction_type = "transfer"
         elif extraction.kind == "transfer":
-            reasons.append("ambiguous transfer counterparty")
+            # Money to or from someone who is not an own account is an expense or an income whose merchant is that
+            # counterparty (_merchant creates or reuses its Firefly account); the tag lets the owner consolidate them later.
+            name = _clean_merchant(extraction.counterparty_hint) or merchant
+            if name:
+                merchant = name
+                item.transaction_type = "deposit" if received else "withdrawal"
+                if TRANSFER_TAG not in (item.tags or []):
+                    item.tags = [*(item.tags or []), TRANSFER_TAG]
+            else:
+                reasons.append("ambiguous transfer counterparty")
+        item.merchant = merchant or None
+        if not merchant and "ambiguous transfer counterparty" not in reasons:
+            reasons.append("merchant absent")
         if extraction.occurred_at:
             occurred = _aware(extraction.occurred_at, self.zone)
             if occurred > _now() or abs((occurred - item.occurred_at).total_seconds()) > 3 * 86400:
-                reasons.append("transaction date is future or differs by more than 3 days")
+                reasons.append(DATE_FUTURE_REASON)
             else:
                 item.occurred_at = occurred
         elif extraction.date_only and extraction.date_only != item.occurred_at.astimezone(self.zone).date():
-            reasons.append("date-only extraction differs from receipt date")
-        if item.currency != "COP":
-            reasons.append("foreign currency requires confirmed COP amount")
-        if item.amount is None or item.amount <= 0 or item.amount > self.settings.review_amount_cop:
-            reasons.append("amount absent, invalid, or over review threshold")
-        if not item.merchant or normalize_merchant(item.merchant) != item.merchant or "$" in item.merchant or len(item.merchant) > 60:
-            reasons.append("merchant is not clean")
+            reasons.append(DATE_ONLY_REASON)
         await rules.apply(self.session, item)
         reasons.extend(await flags.policy_reasons(self.session, item))
         if reasons:
             item.status, item.review_reason = "needs_review", "; ".join(dict.fromkeys(reasons))
+        else:
+            item.review_reason = None
 
     async def _split(self, item):
         asset = await self._asset(item.asset_account)
@@ -460,16 +565,19 @@ class Processor:
                 async with lock:
                     yield True
 
-    async def process(self, item, dry_run=False, cycle_id=None, approved=False):
+    async def process(self, item, dry_run=False, cycle_id=None, approved=False, reevaluate=False):
         if dry_run:
             return {"inbox_id": item.id, "status": item.status, "amount": item.amount, "method": item.method}
-        claimed = await self.inbox.claim(item.id, approved=approved)
+        claimed = await self.inbox.claim(item.id, approved=approved, reevaluate=reevaluate)
         if claimed is None:
             return await self.inbox.get(item.id)
         item = claimed
-        old_status = item.status
+        old_status, old_reason = item.status, item.review_reason
         try:
-            if item.method is None:
+            if reevaluate:
+                item.status = "pending"
+                await self._extract(item, cycle_id, reuse=True)
+            elif item.method is None:
                 await self._extract(item, cycle_id)
             if approved:
                 item.status, item.review_reason = "pending", None
@@ -514,25 +622,68 @@ class Processor:
             item.status = "failed" if item.source == "manual" else "needs_review"
             item.review_reason = item.last_error = _permanent_message(exc)
         except Exception:
+            item.last_error = "Upstream processing failed; retry safely by external_id"
             if item.amount is None:
                 item.method = None
-            item.attempts += 1
-            item.last_error = "Upstream processing failed; retry safely by external_id"
-            if item.source == "manual" or _now() - item.created_at >= timedelta(hours=self.settings.fail_after_hours):
-                item.status, item.next_attempt_at = "failed", None
+            if reevaluate and item.status != "submitting":
+                # Nothing reached Firefly: the item goes back to review as it was, never to a pending row with no decision taken.
+                item.status, item.review_reason = old_status, old_reason
             else:
-                item.status = "submitting" if item.status == "submitting" else "pending"
-                item.next_attempt_at = _now() + timedelta(minutes=min(720, 5 * 2 ** min(item.attempts - 1, 8)))
+                item.attempts += 1
+                if item.source == "manual" or _now() - item.created_at >= timedelta(hours=self.settings.fail_after_hours):
+                    item.status, item.next_attempt_at = "failed", None
+                else:
+                    item.status = "submitting" if item.status == "submitting" else "pending"
+                    item.next_attempt_at = _now() + timedelta(minutes=min(720, 5 * 2 ** min(item.attempts - 1, 8)))
         return await self._finish(item, old_status)
 
     async def _finish(self, item, old_status, approved=False):
         item.claim_token = item.claim_until = None
+        await self.compact(item, self._summaries.pop(item.id, None))
         self.session.add(InboxEvent(inbox_id=item.id, action=item.status, detail=item.review_reason or item.last_error))
         await self.session.commit()
         if item.occurred_at is None or item.created_at is None or item.created_at - item.occurred_at < HISTORIC_AGE:
             await self._announce(item, old_status)
             await self._new_charge(item, old_status, approved)
         return item
+
+    async def compact(self, item, summary=None):
+        """An e-mail that reached a final status keeps a short extract instead of the whole message (contract section 10).
+
+        The extract is the LLM ``summary`` when there is one, else the subject plus the body lines that mention the amount,
+        the merchant, the account or the date, at most ``EXCERPT_CHARS``. While the item is pending or in review the full
+        text stays: the review needs it. SMS and notifications are short and never change. Never commits.
+        """
+        if item.source != "email" or item.status not in FINAL_STATES or not item.raw_text:
+            return
+        item.raw_text = redact(summary)[:SUMMARY_MAX_CHARS] if summary else await self._excerpt(item) or None
+
+    async def _excerpt(self, item):
+        subject = (item.subject_or_title or "").strip()
+        day = item.occurred_at.astimezone(self.zone)
+        dates = {day.strftime(pattern) for pattern in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y")}
+        dates |= {f"{day.day}/{day.month}/{day.year}", f"{day.day} de {_MONTHS[day.month - 1]}"}
+        accounts = [account for account in await self._own() if account.firefly_account in {item.asset_account, item.destination_account}]
+        names = (item.merchant, item.asset_account, item.destination_account, *(value for account in accounts for value in (*account.aliases, *account.last4)))
+        keys = [fold(value) for value in names if value and len(value) >= 3] + list(dates)
+        lines = []
+        for line in item.raw_text.splitlines():
+            line = " ".join(line.split())
+            if line and line != subject and line not in lines and (any(key in fold(line) for key in keys) or self._mentions_amount(line, item)):
+                lines.append(line)
+        return "\n".join(part for part in (subject, *lines) if part)[:EXCERPT_CHARS]
+
+    @staticmethod
+    def _mentions_amount(line, item):
+        if item.amount is None:
+            return False
+        for token in re.findall(r"\d[\d.,]*", line):
+            try:
+                if parse_amount(token.rstrip(".,"), item.currency or "COP") == item.amount:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     async def _announce(self, item, old_status):
         """Item alerts are best-effort: a failure here must never fail the finance operation."""
@@ -686,6 +837,7 @@ class Processor:
                 raise ValueError("Void created items instead of rejecting")
             changes["status"] = {"old": item.status, "new": "rejected"}
             item.status = "rejected"
+            await self.compact(item)
         elif action == "void":
             if item.firefly_transaction_id:
                 try:
@@ -696,6 +848,7 @@ class Processor:
                         raise
             changes["status"] = {"old": item.status, "new": "voided"}
             item.status = "voided"
+            await self.compact(item)
         else:
             corrections = corrections or {}
             for key, value in corrections.items():
@@ -755,6 +908,7 @@ class Processor:
             if not found:
                 item.status = "voided"
                 voided.append(item.id)
+                await self.compact(item)
                 self.session.add(InboxEvent(inbox_id=item.id, action="reconciled_void"))
         known = {str(i.firefly_transaction_id) for i in rows}
         orphaned = [row for row in await self.firefly.list_auto_transactions() if str(row["id"]) not in known]

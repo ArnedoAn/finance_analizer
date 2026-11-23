@@ -65,9 +65,9 @@ class InboxRepository:
         query = select(InboxItem).where(InboxItem.status.in_(["pending", "submitting"]), InboxItem.source != "manual", or_(InboxItem.next_attempt_at.is_(None), InboxItem.next_attempt_at <= now_utc()), or_(InboxItem.claim_until.is_(None), InboxItem.claim_until < now_utc())).order_by(InboxItem.id)
         return list((await self.session.scalars(query)).all())
 
-    async def claim(self, item_id, approved=False):
+    async def claim(self, item_id, approved=False, reevaluate=False):
         token = str(uuid4())
-        statuses = ["pending", "submitting", "needs_review"] if approved else ["pending", "submitting"]
+        statuses = ["pending", "submitting", "needs_review"] if approved or reevaluate else ["pending", "submitting"]
         query = select(InboxItem).where(InboxItem.id == item_id).with_for_update(skip_locked=True)
         row = await self.session.scalar(query)
         if row is None:

@@ -4,6 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 
+from app.core import error_log
 from app.core.config import get_settings
 from app.core.exceptions import FireflyError, PermanentError
 
@@ -23,9 +24,12 @@ class FireflyClient:
         )
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
+        operation = f"{method} {path.split('?')[0]}"
+        token = self.settings.firefly_api_token.get_secret_value()
         try:
             response = await self._client.request(method, path, **kwargs)
         except httpx.RequestError as exc:
+            error_log.record("firefly", operation, "Firefly network request failed", exc=exc, scrub=(token,))
             raise FireflyError("Firefly network request failed") from exc
         if 400 <= response.status_code < 500 and response.status_code != 429:
             try:
@@ -35,11 +39,13 @@ class FireflyClient:
                 message = f"{message}: {errors}" if errors else message
             except (ValueError, AttributeError):
                 message = "Request rejected"
-            token = self.settings.firefly_api_token.get_secret_value()
             if token:
                 message = message.replace(token, "[redacted]")
+            if response.status_code != 404:  # a missing id is an expected answer (``get_transaction``), not a failure
+                error_log.record("firefly", operation, f"Firefly {response.status_code}", exc_type="PermanentError", status_code=response.status_code, body=response.text, scrub=(token,))
             raise PermanentError(f"Firefly {response.status_code}: {message[:1500]}")
         if response.is_error:
+            error_log.record("firefly", operation, f"Firefly temporarily unavailable ({response.status_code})", exc_type="FireflyError", status_code=response.status_code, body=response.text, scrub=(token,))
             raise FireflyError(f"Firefly temporarily unavailable ({response.status_code})")
         return response.json() if response.content else {}
 
@@ -114,6 +120,34 @@ class FireflyClient:
         """Every bill (recurring charge) as ``{id, name}``; the ledger editor resolves bills by name."""
         return [{"id": str(row["id"]), "name": row["attributes"]["name"]} for row in await self._list("bills")]
 
+    async def create_budget(self, name: str) -> dict:
+        """Create an active budget; returns ``{id, name}``."""
+        result = await self._request("POST", "budgets", json={"name": name, "active": True})
+        return {"id": str(result["data"]["id"]), "name": result["data"]["attributes"]["name"]}
+
+    async def budget_limits(self, budget_id: str, start, end) -> list[dict]:
+        """The limits of a budget that overlap the period, as ``{id, amount, start, end}`` (``amount`` Decimal, dates ``YYYY-MM-DD``)."""
+        result = await self._request("GET", f"budgets/{budget_id}/limits", params={"start": start.isoformat(), "end": end.isoformat()})
+        rows = []
+        for row in result.get("data", []):
+            attrs = row.get("attributes", {})
+            if attrs.get("currency_code") in (None, "", "COP"):
+                rows.append({"id": str(row["id"]), "amount": self._decimal(attrs.get("amount")), "start": str(attrs.get("start", ""))[:10], "end": str(attrs.get("end", ""))[:10]})
+        return rows
+
+    async def create_budget_limit(self, budget_id: str, start, end, amount: Decimal) -> str:
+        result = await self._request(
+            "POST", f"budgets/{budget_id}/limits",
+            json={"start": start.isoformat(), "end": end.isoformat(), "amount": f"{amount:.2f}", "currency_code": "COP"},
+        )
+        return str(result["data"]["id"])
+
+    async def update_budget_limit(self, budget_id: str, limit_id: str, start, end, amount: Decimal) -> None:
+        await self._request(
+            "PUT", f"budgets/{budget_id}/limits/{limit_id}",
+            json={"start": start.isoformat(), "end": end.isoformat(), "amount": f"{amount:.2f}", "currency_code": "COP"},
+        )
+
     async def insight(self, start, end) -> dict:
         return await self._request(
             "GET", "insight/expense/category",
@@ -156,8 +190,49 @@ class FireflyClient:
             rows.append({"name": attrs.get("name", str(budget["id"])), "spent": spent.quantize(Decimal("0.01")), "limit": limit.quantize(Decimal("0.01"))})
         return rows
 
+    async def period_splits(self, start, end) -> list[dict]:
+        """Every split of every transaction group between two dates (inclusive), as Firefly sends the split fields."""
+        groups = await self._list("transactions", start=start.isoformat(), end=end.isoformat(), type="all")
+        return [split for group in groups for split in group.get("attributes", {}).get("transactions", [])]
+
+    async def insight_total(self, kind: str, start, end) -> Decimal:
+        """COP total of ``expense`` or ``income`` between two dates (absolute value)."""
+        result = await self._request("GET", f"insight/{kind}/total", params={"start": start.isoformat(), "end": end.isoformat()})
+        rows = result if isinstance(result, list) else result.get("data", [])
+        return sum((self._decimal(row.get("difference")) for row in rows if row.get("currency_code") in (None, "", "COP")), Decimal(0))
+
     async def list_auto_transactions(self) -> list[dict]:
         return await self._list("search/transactions", query='tag_is:"auto"')
+
+    async def account_transactions(self, account_id: str, start, end) -> list[dict]:
+        """Every journal of one account between two dates (inclusive), flattened.
+
+        Each row keeps the group id as ``firefly_id`` plus the journal's ``type``, ``date``, ``description``, ``amount``,
+        ``source_id`` and ``destination_id`` exactly as Firefly sends them; the caller interprets them.
+        """
+        groups = await self._list(
+            f"accounts/{account_id}/transactions", start=start.isoformat(), end=end.isoformat(), type="all",
+        )
+        return [
+            {"firefly_id": str(group["id"]), **{key: split.get(key) for key in ("transaction_journal_id", "type", "date", "description", "amount", "source_id", "destination_id")}}
+            for group in groups for split in group["attributes"]["transactions"]
+        ]
+
+    async def update_split_account(self, group_id: str, journal_id: str, field: str, account_id: str) -> None:
+        """Point one split of a group at another account (``field`` is ``source_id`` or ``destination_id``).
+
+        Rules are NOT applied: merging counterparties must not recategorize anything.
+        """
+        if field not in {"source_id", "destination_id"}:
+            raise PermanentError("Only the source or destination account of a split may be moved")
+        await self._request(
+            "PUT", f"transactions/{group_id}",
+            json={"apply_rules": False, "fire_webhooks": False, "transactions": [{"transaction_journal_id": str(journal_id), field: str(account_id)}]},
+        )
+
+    async def delete_account(self, account_id: str) -> None:
+        """Delete one account. Firefly deletes its transactions too: callers must have checked it is empty."""
+        await self._request("DELETE", f"accounts/{account_id}")
 
     async def check_connection(self) -> bool:
         if not self.settings.firefly_base_url or not self.settings.firefly_api_token.get_secret_value():

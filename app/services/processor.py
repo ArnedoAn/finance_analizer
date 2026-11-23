@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.clients.imap import IMAPClient
 from app.clients.llm import SUMMARY_MAX_CHARS, verify_llm
+from app.core import error_log
 from app.core.config import get_settings
 from app.core.exceptions import PermanentError
 from app.core.logging import get_logger
@@ -22,11 +23,27 @@ from app.db.models import CycleRun, InboxEvent, InboxItem
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
 from app.parsers import Extraction, normalize_merchant, parse, parse_amount
 from app.parsers.common import fold
+from app.parsers.trim import trim_template
 from app.security import is_sensitive_code
 from app.security.redaction import redact
 from app.security.sender_trust import evaluate_email, sender_rule
+from app.services import (
+    ai_budget,
+    ai_insights,
+    ai_review,
+    audit,
+    capture,
+    descriptions,
+    digest,
+    flags,
+    own_accounts,
+    pse,
+    rules,
+    snapshots,
+    suggestions,
+)
 from app.services import alerts as alerting
-from app.services import audit, flags, own_accounts, rules, suggestions
+from app.services import statements as statement_store
 
 logger = get_logger(__name__)
 
@@ -140,7 +157,8 @@ class Processor:
     async def _resolve(self, item, hint=None):
         candidates = await self._source_accounts(item.source, item.app or "" if item.source == "notification" else item.sender)
         if hint:
-            matched = [a for a in candidates if hint.casefold().lstrip("*") in [v.casefold().lstrip("*") for v in (*a.last4, *a.aliases, a.firefly_account)]]
+            hint_key = hint.casefold().strip().lstrip("*")
+            matched = [a for a in candidates if any(hint_key == v or (len(v) >= 3 and v in hint_key) for v in [x.casefold().lstrip("*") for x in (*a.last4, *a.aliases, a.firefly_account)] if v)]
             if matched:
                 candidates = matched
         return candidates[0] if len(candidates) == 1 else None
@@ -210,12 +228,13 @@ class Processor:
                     decision = evaluate_email(message, rules)
                     trusted = decision.trusted
                     auth_failed = decision.reason == "authentication_failed"
-                    sensitive = is_sensitive_code(message.body or "", message.subject)
+                    body = trim_template(message.body or "")  # the bank's fixed advice and legal footer is cut before anything reads or stores the text
+                    sensitive = is_sensitive_code(body, message.subject)
                     ref = f"mail:{account.name}:{validity}:{message.uid}"
                     duplicate = await self.session.scalar(select(InboxItem).where(InboxItem.message_id == message.message_id, InboxItem.source_ref != ref).limit(1)) if message.message_id else None
                     status = "ignored" if sensitive else "needs_review" if auth_failed or message.error else "duplicate" if duplicate else "pending" if trusted else "ignored"
                     reason = "sensitive_code" if sensitive else "sender_auth_failed" if auth_failed else message.error
-                    item, inserted = await self._insert(ref, source="email", account_name=account.name, message_id=message.message_id, sender=message.from_address, subject_or_title="" if sensitive else message.subject, raw_text=None if sensitive or auth_failed else (message.body or message.subject or "")[:4000], occurred_at=message.occurred_at or _now(), status=status, review_reason=reason, duplicate_of_id=duplicate.id if duplicate else None, template_id="ignore.sensitive_code" if sensitive else None)
+                    item, inserted = await self._insert(ref, source="email", account_name=account.name, message_id=message.message_id, sender=message.from_address, subject_or_title="" if sensitive else message.subject, raw_text=None if sensitive or auth_failed else (body or message.subject or "")[:4000], occurred_at=message.occurred_at or _now(), status=status, review_reason=reason, duplicate_of_id=duplicate.id if duplicate else None, template_id="ignore.sensitive_code" if sensitive else None)
                     if inserted and item.status in FINAL_STATES:
                         await self.compact(item)
                     if inserted:
@@ -223,7 +242,7 @@ class Processor:
                     if not inserted and auth_failed and not sensitive and item.status in {"ignored", "pending", "needs_review"}:
                         item.status, item.review_reason, item.raw_text = "needs_review", "sender_auth_failed", None
                     if since and not inserted and trusted and not sensitive and item.status == "ignored":
-                        item.raw_text = (message.body or message.subject or "")[:4000]
+                        item.raw_text = (body or message.subject or "")[:4000]
                         item.status, item.method, item.review_reason = "pending", None, message.error
                     result["duplicates" if not inserted else "needs_review" if item.status == "needs_review" else "queued" if item.status == "pending" else "duplicates" if item.status == "duplicate" else "ignored"] += 1
                 state.uidvalidity, state.last_uid = str(validity), highwater
@@ -282,8 +301,9 @@ class Processor:
                 if not decision.trusted:
                     counts["untrusted"] += 1
                     continue
-                text = (message.body or message.subject or "")[:4000]
-                if is_sensitive_code(message.body or "", message.subject):
+                body = trim_template(message.body or "")
+                text = (body or message.subject or "")[:4000]
+                if is_sensitive_code(body, message.subject):
                     counts["sensitive"] += 1
                     continue
                 ref = f"mail:{account.name}:{validity}:{message.uid}"
@@ -437,6 +457,8 @@ class Processor:
         ``reuse`` decides an already extracted row again: the local parser runs again (it is free) and an LLM row keeps
         its stored extraction, so the provider is never called twice for the same message.
         """
+        if item.source == "email" and item.raw_text:
+            item.raw_text = trim_template(item.raw_text)  # rows stored before the trim existed
         if item.template_id == "ignore.sensitive_code" or is_sensitive_code(item.raw_text or "", item.subject_or_title or ""):
             item.status, item.raw_text, item.subject_or_title = "ignored", None, ""
             item.method, item.template_id, item.review_reason = "sensitive_code", "ignore.sensitive_code", "sensitive_code"
@@ -444,6 +466,7 @@ class Processor:
         if item.review_reason == "sender_auth_failed":
             item.status = "needs_review"
             return
+        await descriptions.refresh(self.session)
         text, subject, previous = item.raw_text or "", item.subject_or_title or "", item.review_reason or ""
         extraction = parse(text, subject, item.sender or "")
         stored = None
@@ -455,7 +478,18 @@ class Processor:
         else:
             item.method = "llm"
             # M1: the provider only receives redacted text; verify_llm below still checks the amount against the local original.
-            extraction = await self.llm.analyze("\n".join([redact(subject), redact(text)]), cycle_id=cycle_id or uuid4().hex)
+            usage = {}
+            try:
+                # A subject that is the same in every e-mail of the bank adds nothing and is not sent.
+                prompt_text = redact(text) if descriptions.is_generic_subject(item.sender, subject) else "\n".join([redact(subject), redact(text)])
+                extraction = await self.llm.analyze(prompt_text, cycle_id=cycle_id or uuid4().hex, usage=usage)
+            except Exception:
+                await capture.note_llm(self.session, False)
+                raise
+            else:
+                await capture.note_llm(self.session, True)
+            finally:
+                await ai_budget.record(self.session, "extract", usage.get("calls", 1), usage)
         item.template_id = extraction.template_id
         # M3: the LLM reason is free text that may quote the message; keep it redacted and bounded.
         llm_reason = redact(extraction.reason)[:200] if extraction.reason else None
@@ -475,6 +509,7 @@ class Processor:
             reasons.extend(verify_llm(text, extraction))
             if extraction.summary and item.source == "email":
                 self._summaries[item.id] = extraction.summary
+        reasons.extend(pse.check(subject + "\n" + text, extraction.kind))
         policy = await flags.policy(self.session, self.settings)
         item.amount = extraction.amount.quantize(Decimal("0.01")) if extraction.amount is not None else None
         item.currency = extraction.currency
@@ -513,6 +548,7 @@ class Processor:
             else:
                 reasons.append("ambiguous transfer counterparty")
         item.merchant = merchant or None
+        pse.tag(item, subject + "\n" + text)
         if not merchant and "ambiguous transfer counterparty" not in reasons:
             reasons.append("merchant absent")
         if extraction.occurred_at:
@@ -523,6 +559,8 @@ class Processor:
                 item.occurred_at = occurred
         elif extraction.date_only and extraction.date_only != item.occurred_at.astimezone(self.zone).date():
             reasons.append(DATE_ONLY_REASON)
+        if item.source != "manual" and not item.description:
+            item.description = descriptions.derive(item, extraction, subject + "\n" + text) or None
         await rules.apply(self.session, item)
         reasons.extend(await flags.policy_reasons(self.session, item))
         if reasons:
@@ -536,7 +574,7 @@ class Processor:
         other = await self._asset(item.destination_account) if kind == "transfer" else await self._merchant(item.merchant, kind)
         source, destination = (other, asset) if kind in {"deposit", "refund"} else (asset, other)
         automatic = ["manual"] if item.source == "manual" else ["auto", item.source]
-        split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str(item.amount.quantize(Decimal("0.01"))), "currency_code": item.currency, "description": item.description or item.subject_or_title or item.merchant, "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref, "tags": automatic + [tag for tag in item.tags or [] if tag not in automatic]}
+        split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str(item.amount.quantize(Decimal("0.01"))), "currency_code": item.currency, "description": descriptions.title(item), "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref, "tags": automatic + [tag for tag in item.tags or [] if tag not in automatic]}
         if item.status == "created" and not (item.description or item.subject_or_title):
             # Editing an item whose title was purged by retention: keep Firefly's description instead of overwriting it with the merchant.
             del split["description"]
@@ -593,6 +631,8 @@ class Processor:
                     item.firefly_transaction_id, item.status = str(found), "created"
                     return await self._finish(item, old_status, approved)
                 duplicate = await self.inbox.find_duplicate(item, self.settings.dedup_window_minutes)
+                if duplicate and not approved and await pse.supersedes(self, item, duplicate):
+                    duplicate = None
                 if duplicate and not approved:
                     if item.source == "manual" or duplicate.source == "manual":
                         item.status, item.review_reason = "needs_review", "possible duplicate manual/automatic transaction"
@@ -642,6 +682,8 @@ class Processor:
         await self.compact(item, self._summaries.pop(item.id, None))
         self.session.add(InboxEvent(inbox_id=item.id, action=item.status, detail=item.review_reason or item.last_error))
         await self.session.commit()
+        if item.status != old_status and item.status in {"created", "voided"}:
+            snapshots.touch_item(item, self.settings)
         if item.occurred_at is None or item.created_at is None or item.created_at - item.occurred_at < HISTORIC_AGE:
             await self._announce(item, old_status)
             await self._new_charge(item, old_status, approved)
@@ -699,6 +741,11 @@ class Processor:
         if item.status != "created" or old_status == "created" or approved or item.source == "manual":
             return
         try:
+            if await digest.should_group(self.session, self.settings, item):
+                # The daily digest reports it (and its sum); only charges at or above the auto-approval cap alert one by one.
+                await digest.defer_charge(self.session, item)
+                await self.session.commit()
+                return
             async with self.session.begin_nested():
                 place = f" en {item.merchant}" if item.merchant else ""
                 await alerting.emit(
@@ -733,6 +780,12 @@ class Processor:
             await self._purge()
             await self.session.commit()
             await self.alerts()
+            try:
+                await snapshots.after_cycle(self.session, self.settings)
+            except Exception as exc:
+                logger.error("snapshot_schedule_failed", error_type=type(exc).__name__)
+            await ai_review.after_cycle(self.session, self.firefly, self.llm, self.settings)
+            await ai_insights.after_cycle(self.session, self.firefly, self.llm, self.settings)
         return result
 
     async def alerts(self):
@@ -771,7 +824,13 @@ class Processor:
             from app.services import anomalies
             await anomalies.alert_check(self.session, self.settings, self.firefly)
 
-        for check in (old_pending, phone_silence, budgets, key_expiring, backup_failed, month_close, report_alerts, anomaly_alerts):
+        async def capture_gaps():
+            silence = (await digest.policy(self.session))["silence_days"]
+            await capture.check_sources(self.session, self.settings, silence)
+            await capture.check_mailboxes(self.session, self.settings, silence)
+            await capture.check_llm(self.session, silence)
+
+        for check in (old_pending, phone_silence, budgets, key_expiring, backup_failed, month_close, report_alerts, anomaly_alerts, capture_gaps):
             try:
                 await check()
                 await self.session.commit()
@@ -786,6 +845,8 @@ class Processor:
         cutoff = _now() - timedelta(days=self.settings.raw_text_retention_days)
         await self.session.execute(update(InboxItem).where(InboxItem.created_at < cutoff, InboxItem.raw_text.is_not(None)).values(raw_text=None))
         await self.session.execute(update(InboxItem).where(InboxItem.created_at < cutoff, InboxItem.subject_or_title != "").values(subject_or_title=""))
+        await error_log.purge(self.session)
+        await statement_store.purge(self.session)
 
     async def learn_senders(self):
         candidates, errors = set(), {}
@@ -874,6 +935,11 @@ class Processor:
                 if field == "tags":
                     value, old = self._clean_tags(value), list(old or [])
                 setattr(item, field, value)
+                if (field == "merchant" and old and value and old != value and "description" not in corrections
+                        and descriptions.is_derived(item.description) and old in item.description):
+                    # The description the analyzer derived from the merchant follows the owner's correction of it.
+                    previous, item.description = item.description, item.description.replace(old, value)
+                    changes["description"] = {"old": previous, "new": item.description}
                 if old != value:
                     changes[key] = {"old": old, "new": value}
             if not item.amount or not item.asset_account or not item.merchant:
@@ -898,6 +964,8 @@ class Processor:
         await self._audit_review(item, action, changes, principal)
         self.session.add(InboxEvent(inbox_id=item.id, action=action, detail=json.dumps(corrections, default=str)))
         await self.session.commit()
+        if action in {"edit", "void"}:
+            snapshots.touch_item(item, self.settings)
         return item
 
     async def reconcile(self):
@@ -913,6 +981,9 @@ class Processor:
         known = {str(i.firefly_transaction_id) for i in rows}
         orphaned = [row for row in await self.firefly.list_auto_transactions() if str(row["id"]) not in known]
         await self.session.commit()
+        for item in rows:
+            if item.id in voided:
+                snapshots.touch_item(item, self.settings)
         if voided or orphaned:
             await alerting.emit(self.session, "system_failure", title="Conciliación con diferencias", body=f"{len(voided)} movimientos ya no existen en Firefly y {len(orphaned)} transacciones de Firefly no tienen registro en la bandeja.", dedupe_key="reconcile", min_interval_minutes=360)
             await self.session.commit()
@@ -946,11 +1017,17 @@ class Processor:
         return result
 
     async def digest(self, weekly=False):
-        day = _now().astimezone(self.zone).date() - timedelta(days=1)
-        period = "week" if weekly else "day"
-        report = await self.report(period, day)
-        previous = await self.report(period, day - timedelta(days=7 if weekly else 1))
-        stats = await self.inbox.statistics()
-        await alerting.digest(self.session, report, previous, stats, weekly)
+        """Emit the digest of the current day (or Monday-to-Sunday week) now; the daily one also absorbs the grouped new charges."""
+        stats = await digest.stats(self.session, self.settings, _now().astimezone(self.zone).date(), weekly)
+        alert = await alerting.digest(self.session, stats)
+        if alert is not None and not weekly:
+            await digest.clear_grouped(self.session)
         await self.session.commit()
-        return report
+        return {"period": "week" if weekly else "day", "start": stats["start"].isoformat(), "registered": stats["registered"], "emitted": alert is not None}
+
+    async def digest_tick(self):
+        """Hourly scheduler job: send the digests that the owner's policy says are due (hour reached, not sent yet)."""
+        result = {}
+        for weekly in await digest.due(self.session, self.settings, _now()):
+            result["weekly" if weekly else "daily"] = await self.digest(weekly=weekly)
+        return result

@@ -5,8 +5,16 @@ review decision. It may set ``item.category`` from a matching rule; it never cha
 """
 from sqlalchemy import select, update
 
+from app.core.logging import get_logger
+from app.core.timezone import now_utc
+from app.db.models import MerchantCorrection
 from app.db.models_rules import Merchant, MerchantItem, Rule
+from app.db.repositories import InboxRepository
 from app.parsers import normalize_merchant
+from app.services import audit
+
+logger = get_logger(__name__)
+
 
 MATCHES = ("merchant_exact", "merchant_contains", "text_contains")
 SOURCES = ("manual", "learned")
@@ -65,7 +73,7 @@ def _matches(rule: Rule, name: str, text: str) -> bool:
 
 async def _first_rule(session, name: str, text: str) -> Rule | None:
     text = _squash(text.casefold())
-    rules = [rule for rule in (await session.scalars(select(Rule))).all() if rule.pattern and _matches(rule, name, text)]
+    rules = [rule for rule in (await session.scalars(select(Rule).where(Rule.active.is_(True)))).all() if rule.pattern and _matches(rule, name, text)]
     # Priority: exact > contains > text; then manual before learned; then most recent.
     rules.sort(key=lambda r: (_PRIORITY.get(r.match, len(MATCHES)), r.source != "manual", -r.created_at.timestamp(), -r.id))
     return rules[0] if rules else None
@@ -109,6 +117,7 @@ async def create_rule(session, *, match, pattern, category, merchant=None, sourc
         session.add(rule)
     else:
         rule.category = category
+        rule.active = True
         rule.merchant = merchant or rule.merchant
         if source == "manual":
             rule.source = "manual"
@@ -128,3 +137,71 @@ def merchant_data(merchant) -> dict:
         "id": merchant.id, "name": merchant.name, "default_category": merchant.default_category,
         "count": merchant.count, "last_seen_at": merchant.last_seen_at,
     }
+
+
+LEARN_STREAK = 2  # same category chosen this many consecutive times for one merchant creates the rule
+
+
+async def learn_from_correction(session, *, merchant, category, previous_category=None, item_id=None, principal=None) -> dict:
+    """The owner (or an applied AI suggestion) set ``category`` on an item of ``merchant``; learn from it. Does not commit.
+
+    * An active learned ``merchant_exact`` rule with another category is contradicted: it is switched off
+      (``rule.deactivate`` audit); the correction counts as the first of a new streak.
+    * Per normalized merchant the consecutive corrections to the same category are counted in ``merchant_corrections``;
+      at ``LEARN_STREAK`` an active rule ``merchant_exact`` with source ``learned`` is created or reactivated
+      (``rule.learn`` audit).
+    * Manual rules are the owner's explicit decision: while one is active nothing is learned for that merchant.
+
+    Returns ``{"learned": Rule | None, "deactivated": Rule | None}``.
+    """
+    result = {"learned": None, "deactivated": None}
+    name = merchant_name(merchant)
+    category = (category or "").strip()
+    if not name or not category or (previous_category or "").strip().casefold() == category.casefold():
+        return result  # nothing usable, or the owner only confirmed what was already there
+    rule = await session.scalar(select(Rule).where(Rule.match == "merchant_exact", Rule.pattern == name))
+    if rule is not None and rule.active and rule.source == "manual":
+        return result
+    if rule is not None and rule.active and rule.category.casefold() != category.casefold():
+        rule.active = False
+        await audit.record(
+            session, action="rule.deactivate", target_type="rule", target_id=rule.id, principal=principal,
+            detail={"match": rule.match, "pattern": rule.pattern, "category": rule.category, "contradicted_by": category, "source": rule.source, "item_id": item_id},
+        )
+        result["deactivated"] = rule
+    streak = await session.scalar(select(MerchantCorrection).where(MerchantCorrection.merchant == name))
+    if streak is None:
+        streak = MerchantCorrection(merchant=name, category=category, streak=1)
+        session.add(streak)
+    elif streak.category.casefold() == category.casefold():
+        streak.streak += 1
+    else:
+        streak.category, streak.streak = category, 1
+    streak.updated_at = now_utc()
+    if streak.streak >= LEARN_STREAK and (rule is None or not rule.active):
+        rule = await create_rule(session, match="merchant_exact", pattern=name, category=category, merchant=name, source="learned")
+        await audit.record(
+            session, action="rule.learn", target_type="rule", target_id=rule.id, principal=principal,
+            detail={"match": rule.match, "pattern": rule.pattern, "category": rule.category, "source": "learned", "item_id": item_id},
+        )
+        streak.streak = 0
+        result["learned"] = rule
+    await session.flush()
+    return result
+
+
+async def learn_item(session, item_id: int, previous_category: str | None, principal=None) -> None:
+    """``learn_from_correction`` for the item's current merchant and category, then commit.
+
+    Best-effort: callers run it after the review the owner asked for has been committed, and a failure here
+    (logged by class only) must never turn that finished review into an error.
+    """
+    try:
+        item = await InboxRepository(session).get(item_id)
+        if item is None or not item.category:
+            return
+        async with session.begin_nested():
+            await learn_from_correction(session, merchant=item.merchant, category=item.category, previous_category=previous_category, item_id=item_id, principal=principal)
+        await session.commit()
+    except Exception as exc:
+        logger.error("rule_learning_failed", item_id=item_id, error_type=type(exc).__name__)

@@ -237,11 +237,16 @@ async def compare(session, settings, a_from: date, a_to: date, b_from: date, b_t
 
 async def alert_check(session, settings, firefly=None) -> int:
     """Emit ``new_subscription`` / ``price_increase`` alerts; ``dedupe_key`` is stable per merchant and amount."""
+    from app.services import ai_subscriptions  # imported here: it imports this module
     from app.services.alerts import ONCE_MINUTES, emit
 
     emitted = 0
+    rejected = await ai_subscriptions.rejected_names(session)
+    own = await ai_subscriptions.owns_price_alerts(session)
     for sub in await _detect(session, settings, _local_day(settings, None), None):
         if sub["status"] not in ("new", "price_increase"):
+            continue
+        if sub["key"][0] in rejected or (own and sub["status"] == "price_increase"):
             continue
         name, currency, amount = sub["key"][0], sub["currency"], sub["amount"]
         if sub["status"] == "new":

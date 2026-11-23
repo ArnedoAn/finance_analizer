@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from app.core import error_log
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.timezone import now_utc
@@ -256,7 +257,10 @@ async def check_backup(session, settings) -> Alert | None:
         title, body = "Falló la copia de seguridad", "La última copia de seguridad terminó con error. Revisa el servidor."
     else:
         title, body = "Copia de seguridad atrasada", "No hay una copia de seguridad correcta en las últimas 24 horas."
-    return await emit(session, "backup_failed", title=title, body=body + tail, dedupe_key=f"backup_failed:{state}", min_interval_minutes=DAILY_MINUTES)
+    alert = await emit(session, "backup_failed", title=title, body=body + tail, dedupe_key=f"backup_failed:{state}", min_interval_minutes=DAILY_MINUTES)
+    if alert and state == "failed":
+        error_log.record("backup", "backup status", "La última copia de seguridad terminó con error", exc_type="BackupFailed", body=status.get("detail"))
+    return alert
 
 
 def _totals(report) -> tuple[Decimal, Decimal]:
@@ -278,16 +282,28 @@ async def month_close(session, report, month: date, final: bool) -> Alert | None
     return await emit(session, "month_close", title=title, body=body, dedupe_key=f"month_close:{month:%Y-%m}:{'final' if final else 'preview'}", min_interval_minutes=ONCE_MINUTES)
 
 
-async def digest(session, report, previous, stats, weekly: bool) -> Alert | None:
-    period = "week" if weekly else "day"
-    start = date.fromisoformat(report["start"])
-    income, spent = _totals(report)
-    _, spent_before = _totals(previous)
-    body = f"Gastos {money(spent)} (periodo anterior {money(spent_before)}), ingresos {money(income)}."
-    if report["by_category"]:
-        body += f" Categorías: {_top(report['by_category'])}."
-    if report["top_merchants"]:
-        body += " Comercios: " + ", ".join(f"{row['merchant']} ({money(row['amount'])})" for row in report["top_merchants"][:3]) + "."
-    body += f" Pendientes {stats['pending']}, por revisar {stats['needs_review']}, fallidos {stats['failed']}."
+def digest_body(stats: dict) -> str:
+    """Spanish digest text from ``digest.stats``: movements, total spending, top 3 categories, in review, capture failures."""
+    weekly, count = stats["weekly"], stats["registered"]
+    when = "Esta semana" if weekly else "Hoy"
+    moved = "se registró 1 movimiento" if count == 1 else f"se registraron {count} movimientos"
+    body = f"{when} {moved}. Gasto total {money(stats['spent'])} (periodo anterior {money(stats['previous_spent'])})."
+    if stats["categories"]:
+        body += " Top categorías: " + ", ".join(f"{name} ({money(value)})" for name, value in stats["categories"]) + "."
+    else:
+        body += " Sin gastos por categoría."
+    if stats.get("auto") and stats["auto"][0]:
+        body += f" Registrados automáticamente: {stats['auto'][0]} cobro{'s' if stats['auto'][0] != 1 else ''} por {money(stats['auto'][1])}."
+    review = stats["review"]
+    body += " Ningún movimiento en revisión." if not review else f" {review} movimiento{'s' if review != 1 else ''} en revisión."
+    failures = stats["failures"]
+    body += " Fallos de captura: " + "; ".join(failures) + "." if failures else " Sin fallos de captura."
+    return body
+
+
+async def digest(session, stats: dict) -> Alert | None:
+    """Emit the daily or weekly digest of ``digest.stats``; one per period."""
+    weekly, start = stats["weekly"], stats["start"]
     title = f"Resumen de la semana del {start:%d/%m/%Y}" if weekly else f"Resumen del {start:%d/%m/%Y}"
-    return await emit(session, f"digest_{'weekly' if weekly else 'daily'}", title=title, body=body, dedupe_key=f"digest:{period}:{start}", min_interval_minutes=DAILY_MINUTES)
+    return await emit(session, f"digest_{'weekly' if weekly else 'daily'}", title=title, body=digest_body(stats),
+                      dedupe_key=f"digest:{'week' if weekly else 'day'}:{start}", min_interval_minutes=DAILY_MINUTES)

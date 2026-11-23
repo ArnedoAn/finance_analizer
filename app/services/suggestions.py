@@ -52,7 +52,7 @@ async def suggest_for_merchant(session, merchant, *, text="", exclude_id=None, l
     text_key = (text or "").casefold()
     ordered: list[str] = []
     if Rule is not None and (merchant_key or text_key):
-        rules = (await session.scalars(select(Rule).order_by(Rule.hits.desc(), Rule.id))).all()
+        rules = (await session.scalars(select(Rule).where(Rule.active.is_(True)).order_by(Rule.hits.desc(), Rule.id))).all()
         ordered.extend(rule.category for rule in rules if rule.category and _rule_matches(rule, merchant_key, text_key))
     if merchant_key:
         ordered.extend(await _frequent(session, merchant, exclude_id))

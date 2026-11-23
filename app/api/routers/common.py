@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_db, get_processor
 from app.db.repositories import InboxRepository
 from app.security.redaction import redact
+from app.services import descriptions
 from app.services.processor import Processor
 
 DB = Annotated[AsyncSession, Depends(get_db)]
@@ -58,6 +59,9 @@ def item_data(item, *, redacted_raw=False, include_raw=False):
             data[name] = redact(data[name])
     for name in DIAGNOSTIC_FIELDS:
         data[name] = _cap(data[name], MAX_DIAGNOSTIC_CHARS)
+    if item.description and descriptions.is_generic_subject(item.sender, item.subject_or_title):
+        # The same subject in every e-mail of a bank tells movements apart no better than nothing: show the derived description.
+        data["subject_or_title"] = data["description"]
     # Contract section 14: money is a decimal string ("12345.00"), never a JSON number.
     if data["amount"] is not None:
         data["amount"] = f"{data['amount']:.2f}"

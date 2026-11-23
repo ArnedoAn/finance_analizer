@@ -30,7 +30,12 @@ Unlabelled 5-8 digit numbers are left alone because they cannot be told apart fr
 import re
 import unicodedata
 
-from app.security.sensitive_codes import _LABEL, CODE_WINDOW, credential_spans, digit_code_spans
+from app.security.sensitive_codes import (
+    CODE_WINDOW,
+    credential_labels,
+    credential_spans,
+    digit_code_spans,
+)
 
 # --- National IDs (only next to a label: a bare "79.123.456" is indistinguishable from an amount) ---
 _ID_LABEL = (
@@ -192,7 +197,7 @@ def _replace_spans(text: str, spans, placeholder: str) -> str:
 def _redact_codes(text: str) -> str:
     folded = _fold(text)
     spans = []
-    for label in _LABEL.finditer(folded):
+    for label in credential_labels(folded):
         low, high = max(0, label.start() - CODE_WINDOW), min(len(folded), label.end() + CODE_WINDOW)
         spans.extend(span for span in digit_code_spans(folded, low, high) if _is_plain_code(folded, span))
     spans.extend(credential_spans(folded))
@@ -289,7 +294,12 @@ def _redact_p2p(text: str) -> str:
     return _replace_spans(text, spans, "[NOMBRE]")
 
 
-def redact(text: str | None) -> str | None:
+def redact_identifiers(text: str | None) -> str | None:
+    """Everything ``redact`` masks except person names: URLs, IDs, codes, e-mails, phones and account/card numbers.
+
+    For data whose value IS the name (Firefly counterparty names being compared), so the provider sees the names
+    but never the identifiers. Still the same single redaction point: ``redact`` is this plus the name masks.
+    """
     if text is None:
         return None
     text = _redact_urls(text)
@@ -301,5 +311,21 @@ def redact(text: str | None) -> str | None:
     text = _DASHED_ACCOUNT.sub(_last4, text)
     for phone in _PHONES:
         text = phone.sub("[TEL]", text)
-    text = _LONG_NUMBER.sub(_last4, text)
-    return _redact_p2p(_redact_names(text))
+    return _LONG_NUMBER.sub(_last4, text)
+
+
+# «Bancolombia: JUAN PRUEBA PEREZ pagaste $22.500…»: the owner's own name, in capitals, right before the transaction verb.
+_TITULAR = re.compile(
+    r"(?i:\bbancolombia)[ \t]*:[ \t]*(?P<name>[A-ZÁÉÍÓÚÜÑ]{2,}(?:[ \t]+[A-ZÁÉÍÓÚÜÑ]{2,}){1,4})"
+    r"(?=[ \t]+(?i:pagaste|compraste|transferiste|recibiste|enviaste|retiraste)\b)"
+)
+
+
+def _redact_titular(text: str) -> str:
+    return _replace_spans(text, [match.span("name") for match in _TITULAR.finditer(text)], "[TITULAR]")
+
+
+def redact(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return _redact_p2p(_redact_names(redact_identifiers(_redact_titular(text))))

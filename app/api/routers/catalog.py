@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from app.api.dependencies import READ, ReviewPrincipal
 from app.api.routers.common import DB, Service, item_data
 from app.db.models_rules import Merchant, Rule
-from app.services import anomalies, rules, transfers
+from app.services import ai_anomalies, anomalies, rules, transfers
 
 router = APIRouter()
 
@@ -74,7 +74,7 @@ async def update_merchant(merchant_id: int, body: MerchantUpdate, db: DB, servic
 
 @router.get("/rules", dependencies=[READ])
 async def list_rules(db: DB):
-    found = (await db.scalars(select(Rule).order_by(Rule.id))).all()
+    found = (await db.scalars(select(Rule).where(Rule.active.is_(True)).order_by(Rule.id))).all()
     return {"items": [rules.rule_data(rule) for rule in found], "total": len(found)}
 
 
@@ -133,4 +133,4 @@ async def pair_transfer(body: TransferPair, db: DB, service: Service, principal:
 async def list_anomalies(db: DB, service: Service, since: datetime | None = None):
     if since is not None and since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
-    return {"items": await anomalies.detect(db, service.settings, since=since)}
+    return {"items": await ai_anomalies.attach(db, await anomalies.detect(db, service.settings, since=since))}

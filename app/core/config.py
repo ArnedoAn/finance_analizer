@@ -79,9 +79,7 @@ class Settings(BaseSettings):
     backup_status_file: str = "/var/lib/finance/backup-status.json"
     notify_min_interval_minutes: int = Field(default=15, ge=0)
     phone_silence_hours: int = Field(default=24, gt=0)
-    digest_cron: str = "0 8 * * *"
     reconcile_cron: str = "0 4 * * *"
-    weekly_digest_cron: str = "0 8 * * 1"
     email_lookback_days: int = Field(default=7, ge=0)
     email_max_body_chars: int = Field(default=12000, gt=0)
     llm_base_url: str = "https://opencode.ai/inference/go/openai/v1"

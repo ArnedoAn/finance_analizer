@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
+from app.core import error_log
 from app.core.config import get_settings
 from app.security.sender_trust import PROVIDER_AUTHSERV_IDS, AuthResult, authentication_result
 
@@ -55,6 +56,11 @@ class IMAPClient:
                 error = error.replace(value, "***")
         return error[:500]
 
+    def _record(self, operation: str, exc: Exception, error: str) -> None:
+        # ``_safe_error`` already masked the login; the buffer redacts the rest. The mailbox name identifies the failing account.
+        name = getattr(self.account, "name", None)
+        error_log.record("mailbox", f"{operation} {name}" if name else operation, error, exc=exc)
+
     def _connect(self, history: bool = False):
         account = self.account
         host = account.host or _PROVIDER_HOSTS.get(account.provider, "")
@@ -86,7 +92,9 @@ class IMAPClient:
             await asyncio.to_thread(self._test)
             return {"ok": True, "error": None}
         except Exception as exc:
-            return {"ok": False, "error": self._safe_error(exc)}
+            error = self._safe_error(exc)
+            self._record("test", exc, error)
+            return {"ok": False, "error": error}
 
     def _test(self) -> None:
         self._logout(self._connect())
@@ -96,7 +104,9 @@ class IMAPClient:
         try:
             return await asyncio.to_thread(self._poll, uidvalidity, last_uid, lookback_days, want_body)
         except Exception as exc:
-            raise RuntimeError(self._safe_error(exc)) from None
+            error = self._safe_error(exc)
+            self._record("poll", exc, error)
+            raise RuntimeError(error) from None
 
     @staticmethod
     def _fetch(connection, uid, query):
@@ -136,7 +146,9 @@ class IMAPClient:
         try:
             return await asyncio.to_thread(self._history, since, until, senders, want_body)
         except Exception as exc:
-            raise RuntimeError(self._safe_error(exc)) from None
+            error = self._safe_error(exc)
+            self._record("history", exc, error)
+            raise RuntimeError(error) from None
 
     def _history(self, since, until, senders, want_body):
         if not senders:

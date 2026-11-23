@@ -192,7 +192,9 @@ async def test_llm_contract_and_verification(service, clients, monkeypatch):
     row = await service.process(await item(service), cycle_id="cycle-42")
     assert row.status == "needs_review" and row.review_reason
     args = clients[1].analyze.call_args
-    assert args.args[0] and args.kwargs == {"cycle_id": "cycle-42"}
+    # «Compra» is not a generic subject: it still goes to the model, and the call carries the usage out-parameter.
+    assert args.args[0].startswith("Compra\n") and set(args.kwargs) == {"cycle_id", "usage"}
+    assert args.kwargs["cycle_id"] == "cycle-42" and isinstance(args.kwargs["usage"], dict)
     clients[0].create_transaction.assert_not_awaited()
 
 

@@ -5,21 +5,27 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import text
 
+from app.core import error_log
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.database import _get_engine
 
 logger = get_logger(__name__)
 LEADER_LOCK = 736283194
+DIGEST_TICK_CRON = "0 * * * *"
+MONTHLY_NARRATIVE_CRON = "0 9 1 * *"  # day 1, 09:00 in the settings timezone
+WEEKLY_SUBSCRIPTIONS_CRON = "30 9 * * 1"  # Mondays 09:30
 
 
 class SchedulerService:
-    def __init__(self, run_cycle, learn_senders, run_reconcile, run_digest, run_weekly_digest, settings=None):
+    def __init__(self, run_cycle, learn_senders, run_reconcile, run_digest, run_weekly_digest, run_digest_tick,
+                 run_monthly_narrative, run_weekly_subscriptions, settings=None):
         self.settings = settings or get_settings()
         self.callbacks = {
             "cycle": run_cycle, "sender_learning": learn_senders,
             "reconcile": run_reconcile, "digest": run_digest,
-            "weekly_digest": run_weekly_digest,
+            "weekly_digest": run_weekly_digest, "digest_tick": run_digest_tick,
+            "monthly_narrative": run_monthly_narrative, "weekly_subscriptions": run_weekly_subscriptions,
         }
         self.scheduler = AsyncIOScheduler(timezone=self.settings.timezone)
         self._connection = None
@@ -31,8 +37,11 @@ class SchedulerService:
             ("cycle", self.settings.cycle_cron),
             ("sender_learning", self.settings.sender_learning_cron),
             ("reconcile", self.settings.reconcile_cron),
-            ("digest", self.settings.digest_cron),
-            ("weekly_digest", self.settings.weekly_digest_cron),
+            # Hourly: the owner's digest policy (``digest_policy``: hour, daily, weekly) decides what is due.
+            # ``digest`` and ``weekly_digest`` are manual jobs (POST /scheduler/jobs/{id}/trigger), never scheduled.
+            ("digest_tick", DIGEST_TICK_CRON),
+            ("monthly_narrative", MONTHLY_NARRATIVE_CRON),
+            ("weekly_subscriptions", WEEKLY_SUBSCRIPTIONS_CRON),
         ):
             self.scheduler.add_job(
                 self._run, CronTrigger.from_crontab(cron, timezone=self.settings.timezone),
@@ -92,6 +101,9 @@ class SchedulerService:
         self._active.add(task)
         try:
             return await self.callbacks[job_id]()
+        except Exception as exc:
+            error_log.record("cycle", f"job {job_id}", exc=exc)
+            raise
         finally:
             self._active.discard(task)
 

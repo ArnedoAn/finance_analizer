@@ -12,6 +12,7 @@ from app.db.models import Notification
 from app.db.models_alerts import Alert
 from app.db.models_devices import Device
 from app.services import alerts as alerting
+from app.services import digest
 from app.services import processor as pipeline
 
 ADMIN_KEY = "test-admin-key-01234567890123456789"
@@ -177,6 +178,8 @@ async def test_big_amount_alert_above_review_threshold(service, db, extraction, 
 
 
 async def test_ordinary_created_item_emits_only_new_charge(service, db):
+    await digest.set_policy(db, daily=False, weekly=True, hour=20)
+    await db.commit()
     row = await service.process(await make_item(service))
     assert row.status == "created"
     assert [alert.type for alert in await rows(db)] == ["new_charge"]
@@ -318,15 +321,17 @@ async def test_digest_emits_summary_alert(service, db, weekly, kind):
 
 
 async def test_digest_summarizes_with_full_amounts(db):
-    report = {"start": "2026-11-20", "totals": {"withdrawal": "125000.00", "deposit": "3000000.00"},
-              "by_category": {"Mercado": "100000.00", "Ocio": "25000.00"}, "top_merchants": [{"merchant": "EXITO", "amount": "100000.00"}]}
-    previous = {"start": "2026-11-19", "totals": {"withdrawal": "80000.00", "deposit": "0"}, "by_category": {}, "top_merchants": []}
-    stats = {"pending": 1, "needs_review": 2, "failed": 0}
-    alert = await alerting.digest(db, report, previous, stats, weekly=False)
+    stats = {
+        "start": datetime(2026, 11, 20).date(), "weekly": False, "registered": 4, "spent": Decimal("125000.00"),
+        "previous_spent": Decimal("80000.00"), "categories": [("Mercado", Decimal("100000.00")), ("Ocio", Decimal("25000.00"))],
+        "review": 2, "failures": [], "auto": None,
+    }
+    alert = await alerting.digest(db, stats)
     assert alert.type == "digest_daily" and alert.title == "Resumen del 20/11/2026"
-    assert "$125.000 COP" in alert.body and "$3.000.000 COP" in alert.body and "$80.000 COP" in alert.body
-    assert "EXITO" in alert.body and "Pendientes 1, por revisar 2, fallidos 0" in alert.body
-    assert (await alerting.digest(db, report, previous, stats, weekly=False)) is None
+    assert "se registraron 4 movimientos" in alert.body and "Gasto total $125.000 COP" in alert.body and "$80.000 COP" in alert.body
+    assert "Mercado ($100.000 COP), Ocio ($25.000 COP)" in alert.body and "2 movimientos en revisión" in alert.body
+    assert "Sin fallos de captura" in alert.body
+    assert (await alerting.digest(db, stats)) is None
 
 
 async def test_missing_own_account_emits_system_failure(service, db, add_own_account):

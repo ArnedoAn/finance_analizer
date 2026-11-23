@@ -9,11 +9,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api import routes
 from app.api.dependencies import cleanup_clients, get_firefly, get_llm
 from app.api.routers import system
+from app.core import error_log
 from app.core.config import get_settings
 from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger, setup_logging
 from app.db.database import close_db, get_db_session, init_db
-from app.services import own_accounts
+from app.services import own_accounts, snapshots
 from app.services.processor import Processor
 from app.services.scheduler import SchedulerService
 
@@ -27,10 +28,18 @@ _STATUS_CODES = {
 
 
 @asynccontextmanager
+async def _snapshot_resources():
+    async with get_db_session() as db:
+        yield db, get_firefly(), get_settings()
+
+
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     setup_logging()
     await init_db()
+    error_log.install(get_db_session)
+    snapshots.enable(_snapshot_resources)
     # One-time import of OWN_ACCOUNTS into the table (only when it is empty); runs before anything reads the accounts.
     async with get_db_session() as db:
         await own_accounts.seed(db, settings)
@@ -41,7 +50,8 @@ async def lifespan(app: FastAPI):
             logger.warning("startup_firefly_sync_unavailable")
     scheduler = SchedulerService(
         routes.run_cycle, routes.learn_senders, routes.run_reconcile,
-        routes.run_digest, routes.run_weekly_digest, settings=settings,
+        routes.run_digest, routes.run_weekly_digest, routes.run_digest_tick,
+        routes.run_monthly_narrative, routes.run_weekly_subscriptions, settings=settings,
     )
     system._scheduler = scheduler
     if settings.scheduler_enabled:
@@ -53,6 +63,8 @@ async def lifespan(app: FastAPI):
             await scheduler.shutdown()
         finally:
             system._scheduler = None
+            await snapshots.disable()
+            await error_log.uninstall()
             await cleanup_clients()
             await close_db()
 
@@ -97,6 +109,7 @@ def create_application() -> FastAPI:
         # Keep webhook failures JSON for the durable phone outbox. Never expose
         # exception text, credentials, or request content in the response/log.
         logger.error("unhandled_request_failure", error_type=type(exc).__name__)
+        error_log.record("api", f"{request.method} {request.url.path}", exc=exc)
         return JSONResponse(status_code=500, content={"detail": "Internal server error", "code": "internal_error"})
 
     return application

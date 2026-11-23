@@ -31,7 +31,8 @@ NON_TRANSACTION = re.compile(
 MERCHANT_END = re.compile(
     r"[.,;\n]|\s+-\s+|\s+(?:saldo\b|si\s+no\b|(?:pagad[ao]\s+a\s+)?\d+\s+cuotas\b|"
     r"cuotas\b|pagad[ao]\s+a\b|con\s+(?:tu|su|tarjeta|tc)\b|desde\s+tu\b|"
-    r"en\s+tu\b|fecha\s*:|hora\s*:|el\s+\d|a\s+las\s+\d|fue\b)", re.I
+    r"en\s+tu\b|fecha\s*:|hora\s*:|el\s+\d|a\s+las\s+\d|fue\b|"
+    r"\d{1,2}:\d{2}(?!\d)|\d{1,2}/\d{1,2}/\d{2,4}(?!\d))", re.I
 )
 
 
@@ -140,6 +141,11 @@ class Candidate:
     extraction: Extraction
 
 
+_KEY = re.compile(r"(?:la\s+)?llave\s+(\S+)", re.I)
+KEY_MERCHANT = "LLAVE ···"  # followed by the last four characters of the key
+QR_MERCHANT = "PAGO QR"
+
+
 def candidates(text: str, bank: str, templates: tuple[Template, ...]) -> list[Candidate]:
     results = []
     normalized = fold(text)
@@ -155,11 +161,20 @@ def candidates(text: str, bank: str, templates: tuple[Template, ...]) -> list[Ca
             source = re.search(r"desde\s+tu\s+cuenta\s+(\*?\d{4})", tail, re.I)
             if source:
                 account = source[1].lstrip("*")
-                destination = re.search(r"\s+a\s+(?:la\s+cuenta\s+)?(.+)", tail[source.end():], re.I)
+                # «a las 17:50» is the time, not the destination.
+                destination = re.search(r"\s+a\s+(?!las?\s+\d)(?:la\s+cuenta\s+)?(.+)", tail[source.end():], re.I)
                 merchant_match = destination
             merchant_raw = merchant_match[1] if merchant_match else ""
             if rule.counterparty or re.match(r"(?:tarjeta|tu\s+bolsillo|bolsillo)\b", fold(merchant_raw)):
                 counterparty = MERCHANT_END.split(merchant_raw, maxsplit=1)[0].strip()[:120] or None
+            merchant = normalize_merchant(merchant_raw) or None
+            key = _KEY.match(merchant_raw)
+            if key and (tail_digits := re.sub(r"[^0-9A-Za-z]", "", key[1])[-4:]):
+                # A Bre-B / Bancolombia «llave» has no merchant name: its last four characters name the counterparty.
+                merchant = f"{KEY_MERCHANT}{tail_digits}"
+                counterparty = f"la llave ···{tail_digits}"  # never the whole key: a phone number would contain some own account's last four
+            elif not merchant and re.search(r"codigo\s+qr", fold(tail)):
+                merchant = QR_MERCHANT
             product = re.search(r"(?:con|desde|en)\s+(?:tu|su)\s+(?:tarjeta\s+)?(?:t\.?\s*cred\w*|cuenta|ahorros|tarjeta)(?:\s+(?:de\s+credito|terminada\s+en))?\s*\*?(\d{4})\b", fold(tail))
             if product and not account:
                 account = product[1]
@@ -177,7 +192,7 @@ def candidates(text: str, bank: str, templates: tuple[Template, ...]) -> list[Ca
                 amount, kind, reason = None, "review", str(exc)
             results.append(Candidate(match.start(), match.end(), Extraction(
                 kind=kind, amount=amount, currency=currency,
-                merchant=normalize_merchant(merchant_raw) or None,
+                merchant=merchant,
                 occurred_at=occurred_at, date_only=date_only, account_hint=account,
                 counterparty_hint=counterparty, template_id=f"{bank}.{rule.name}", reason=reason,
             )))

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from app.db.models import InboxItem
 from app.db.models_devices import Device
-from app.services import reports
+from app.services import ai_features, ai_subscriptions, reports  # noqa: F401  (ai_subscriptions: imported before alerts is stubbed)
 
 ADMIN_KEY = "test-admin-key-01234567890123456789"
 PHONE_KEY = "test-phone-key-01234567890123456789"
@@ -164,6 +164,8 @@ async def test_alert_check_emits_stable_dedupe_keys(db, settings, monkeypatch):
     add(db, local(11, 19), "20000.00", "Disney")
     for month in (6, 7, 8, 9, 10, 11):
         add(db, local(month, 2), "30000.00", "Nube")  # active: no alert
+    # These tests cover the plain detection path; with the AI function on, price_increase belongs to the AI job (see test_ai_insights_v4).
+    await ai_features.update(db, features={"subscriptions": False})
     await db.commit()
     monkeypatch.setattr(reports, "now_utc", lambda: datetime(2026, 11, 20, 17, 0, tzinfo=UTC))
     calls = []
@@ -315,6 +317,7 @@ async def test_alert_check_emits_price_increase_for_jump_above_twenty_percent(db
     for month in (8, 9, 10):
         add(db, local(month, 15), "10000.00", "Streaming")
     add(db, local(11, 15), "13000.00", "Streaming")
+    await ai_features.update(db, features={"subscriptions": False})  # plain detection path; see test_ai_insights_v4 for the AI owner
     await db.commit()
     monkeypatch.setattr(reports, "now_utc", lambda: datetime(2026, 11, 20, 17, 0, tzinfo=UTC))
     calls = []

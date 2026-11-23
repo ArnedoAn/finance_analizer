@@ -738,6 +738,10 @@ async def _write_update(db, processor, firefly_id: str, raw: dict, before: dict,
         _inbox_sync(item, after)
         db.add(InboxEvent(inbox_id=item.id, action="ledger_update"))
     change = await _record(db, principal, action="update", firefly_id=firefly_id, before=before, after=after, group_id=group_id, item=item, inbox_before=inbox_before)
+    if principal is not None:  # an owner's edit (or an applied suggestion), never the server's own automatic writes
+        from app.services import budget_assign  # lazy: budget_assign writes through this module
+
+        await budget_assign.learn_from_change(db, before, after, principal)
     return after, item, change
 
 
@@ -751,6 +755,28 @@ async def update(db, processor, firefly_id: str, draft: LedgerDraft, principal) 
     after, item, change = await _write_update(db, processor, firefly_id, raw, before, target, principal, None)
     await db.commit()
     return _public(after, raw["id"], item.id if item else None, processor.zone), change
+
+
+async def retitle(db, processor, firefly_id: str, expected: str, description: str, principal, group_id: str | None = None) -> bool:
+    """Replace the description of a single-split movement that still reads ``expected`` (its e-mail subject).
+
+    False, with nothing written, when the movement has several splits, its description is no longer ``expected`` (the
+    owner edited it) or nothing changes. Otherwise one audited, undoable change (``group_id`` groups a batch) and the inbox
+    item is synchronized like any edit. Commits."""
+    raw = await _fetch(processor, firefly_id)
+    before = normalize(raw, processor.zone)
+    _require_editable(before)
+    if len(before["splits"]) != 1 or (before["description"] or "").strip() != expected.strip():
+        return False
+    draft = _draft_from(before, processor.zone)
+    draft.description = description
+    target = await resolve(processor, draft)
+    target["external_id"] = before["external_id"]
+    if _comparable(target) == _comparable(before):
+        return False
+    await _write_update(db, processor, firefly_id, raw, before, target, principal, group_id)
+    await db.commit()
+    return True
 
 
 async def delete(db, processor, firefly_id: str, principal) -> LedgerChange:

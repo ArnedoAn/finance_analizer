@@ -16,7 +16,7 @@ from app.core.timezone import now_utc
 from app.db.models import InboxItem
 from app.db.models_alerts import Alert
 from app.models.schemas import ManualTransaction, WebhookPayload
-from app.services import flags, suggestions
+from app.services import digest, flags, suggestions
 from app.services import processor as pipeline
 
 API = "/api/v1"
@@ -170,8 +170,9 @@ async def test_purge_clears_the_title_after_retention_in_every_status(db, servic
 @pytest.mark.parametrize("purged", [False, True])
 async def test_editing_after_retention_keeps_the_firefly_description(service, clients, purged):
     row = await service.process(await item(service))
-    assert row.status == "created"
+    assert row.status == "created" and row.description == "Pago a SUPERMERCADO CENTRAL"
     if purged:
+        row.description = None  # an item created before descriptions were derived: only its subject kept Firefly's text
         row.created_at = now_utc() - timedelta(days=31)
         await service.session.commit()
         await service._purge()
@@ -182,7 +183,7 @@ async def test_editing_after_retention_keeps_the_firefly_description(service, cl
     if purged:
         assert "description" not in sent  # not overwritten with the merchant
     else:
-        assert sent["description"] == "Compra"
+        assert sent["description"] == "Pago a SUPERMERCADO CENTRAL"  # derived at extraction; the subject «Compra» is not used
 
 
 async def test_llm_review_reason_is_redacted_and_trimmed(service, clients, extraction, monkeypatch):
@@ -279,6 +280,7 @@ async def test_automatic_created_item_emits_new_charge_with_suggested_categories
         category="Alimentación", amount=Decimal("5000.00"), currency="COP", asset_account="Nequi", transaction_type="withdrawal",
         occurred_at=now_utc() - timedelta(days=3),
     ))
+    await digest.set_policy(db, daily=False, weekly=True, hour=20)  # with the daily digest on, the charge is grouped instead
     await db.commit()
     row = await service.process(await item(service))
     assert row.status == "created"
@@ -305,6 +307,8 @@ async def test_new_charge_failure_never_fails_the_operation(service, db, monkeyp
         raise RuntimeError("boom")
 
     monkeypatch.setattr(suggestions, "suggest", broken)
+    await digest.set_policy(db, daily=False, weekly=True, hour=20)
+    await db.commit()
     row = await service.process(await item(service))
     assert row.status == "created"
     assert await alerts(db, "new_charge") == []

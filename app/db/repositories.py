@@ -80,9 +80,30 @@ class InboxRepository:
         return await self.get(item_id) if result.rowcount else None
 
     async def find_duplicate(self, item, window_minutes):
+        """An earlier ``created`` movement of the same payment from another channel.
+
+        Normal: same own account, amount, currency and type, another source, within ``window_minutes``. PSE payments
+        (tag ``pse`` or description «Pago PSE a ...» on either side) also match within ``pse.DUPLICATE_WINDOW`` (2 days)
+        and by another sender of the same source (the PSE receipt and a bank e-mail are both e-mails).
+        """
+        same = (
+            InboxItem.status == "created", InboxItem.id != item.id, InboxItem.asset_account == item.asset_account,
+            InboxItem.amount == item.amount, InboxItem.currency == item.currency, InboxItem.transaction_type == item.transaction_type,
+        )
         window = timedelta(minutes=window_minutes)
-        query = select(InboxItem).where(InboxItem.status == "created", InboxItem.id != item.id, InboxItem.source != item.source, InboxItem.asset_account == item.asset_account, InboxItem.amount == item.amount, InboxItem.currency == item.currency, InboxItem.transaction_type == item.transaction_type, InboxItem.occurred_at >= item.occurred_at - window, InboxItem.occurred_at <= item.occurred_at + window).order_by(InboxItem.id).limit(1)
-        return await self.session.scalar(query)
+        query = select(InboxItem).where(*same, InboxItem.source != item.source, InboxItem.occurred_at >= item.occurred_at - window, InboxItem.occurred_at <= item.occurred_at + window).order_by(InboxItem.id).limit(1)
+        found = await self.session.scalar(query)
+        if found is not None:
+            return found
+        from app.services import pse  # lazy: the services package imports this module
+
+        wide = select(InboxItem).where(
+            *same, or_(InboxItem.source != item.source, InboxItem.sender != item.sender),
+            InboxItem.occurred_at >= item.occurred_at - pse.DUPLICATE_WINDOW, InboxItem.occurred_at <= item.occurred_at + pse.DUPLICATE_WINDOW,
+        )
+        if not pse.is_pse_item(item):
+            wide = wide.where(or_(cast(InboxItem.tags, String).contains(json.dumps(pse.TAG)), InboxItem.description.startswith(pse.DESCRIPTION_PREFIX, autoescape=True)))
+        return await self.session.scalar(wide.order_by(InboxItem.id).limit(1))
 
     async def requeue(self, item_id=None, failed_only=False, **kwargs):
         query = select(InboxItem)

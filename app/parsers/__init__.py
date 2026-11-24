@@ -14,15 +14,20 @@ from .common import (
     NON_TRANSACTION,
     REFUND,
     candidates,
+    canonical_mask,
     fold,
     is_declined,
+    is_masked_counterparty,
+    is_placeholder_merchant,
+    match_masked_counterparty,
     normalize_merchant,
     parse_amount,
 )
 from .types import Extraction, Kind
 
 __all__ = [
-    "DECLINED_REASON", "DECLINED_TEMPLATE", "Extraction", "Kind", "is_declined", "normalize_merchant", "parse", "parse_amount",
+    "DECLINED_REASON", "DECLINED_TEMPLATE", "Extraction", "Kind", "canonical_mask", "is_declined", "is_masked_counterparty",
+    "is_placeholder_merchant", "match_masked_counterparty", "normalize_merchant", "parse", "parse_amount",
 ]
 
 _BANKS = {

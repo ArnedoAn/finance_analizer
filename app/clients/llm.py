@@ -25,7 +25,8 @@ insuficiente o que no se pudo realizar, NO ocurrió: kind = ignore con reason "d
 Un aviso de pie de página («si su pago fue rechazado, contacte…», «si no reconoces esta transacción…») no la rechaza.
 kind: withdrawal|deposit|transfer|refund|ignore|review. Varios eventos: review.
 Monto positivo exacto de la transacción (nunca saldo, cupo o cuotas); sin monto: null.
-currency COP salvo USD/US$ adyacente al monto. merchant: contraparte literal o null.
+currency COP salvo USD/US$ adyacente al monto. merchant: contraparte literal o null; un marcador como PENDING, N/A,
+desconocido o sin comercio no es un comercio: null.
 Fecha ISO solo si explícita de la transacción, nunca vencimiento. Sin hora: YYYY-MM-DD.
 No asignes cuentas ni categorías. OTP/publicidad: ignore. Dudas: review.
 summary: frase en español que EMPIEZA por el tipo de movimiento («Compra en COMERCIO»,

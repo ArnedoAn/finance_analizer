@@ -20,7 +20,7 @@ from app.core.timezone import now_utc
 from app.db.models import AiSuggestion, InboxItem
 from app.db.models_rules import Rule
 from app.db.repositories import InboxRepository
-from app.parsers import DECLINED_REASON, is_declined, normalize_merchant
+from app.parsers import DECLINED_REASON, is_declined, is_placeholder_merchant, normalize_merchant
 from app.security.redaction import redact
 from app.services import ai_budget, ai_jobs, audit, own_accounts, rules
 
@@ -48,6 +48,7 @@ action: approve (registrar con estos datos) | ignore (no es un movimiento: publi
 firefly_account: SOLO un nombre exacto de CONTEXT.own_accounts o null si la evidencia no basta.
 category: SOLO un nombre exacto de CONTEXT.categories o null.
 merchant: nombre limpio y corto del comercio o de la persona contraparte (sin números de cuenta, códigos ni fechas) o null.
+Nunca pongas un marcador como PENDING, N/A, desconocido o sin comercio: si no hay un nombre real, null.
 transaction_type: withdrawal|deposit|transfer|refund o null.
 amount: número positivo SOLO si el monto del movimiento falta o es incorrecto según el texto; si no, null.
 duplicate_of_id: id de "similar" o null. confidence: de 0 a 1, tu certeza real; si dudas, baja.
@@ -190,6 +191,8 @@ def _parse(data: dict, item: InboxItem, context: dict, similar_ids: set[int], ma
         return catalog.get(value.strip().casefold()) if isinstance(value, str) else None
 
     merchant = normalize_merchant(data["merchant"]) if isinstance(data.get("merchant"), str) else ""
+    if is_placeholder_merchant(merchant):
+        merchant = ""  # «PENDING», «N/A»... is not a name: the owner still has to supply one
     kind = data.get("transaction_type") if data.get("transaction_type") in TYPES else None
     amount = None
     if data.get("amount") is not None and action == "approve":
@@ -216,7 +219,8 @@ def _parse(data: dict, item: InboxItem, context: dict, similar_ids: set[int], ma
     if action == "approve":
         complete = (
             (proposal["amount"] or item.amount) and (proposal["firefly_account"] or item.asset_account)
-            and (proposal["merchant"] or normalize_merchant(item.merchant or "")) and (item.currency or "COP") == "COP"
+            and (proposal["merchant"] or (normalize_merchant(item.merchant or "") and not is_placeholder_merchant(item.merchant)))
+            and (item.currency or "COP") == "COP"
         )
         if not complete:
             proposal["confidence"] = min(confidence, INCOMPLETE_CONFIDENCE)

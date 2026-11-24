@@ -20,12 +20,17 @@ from app.core.config import get_settings
 from app.core.exceptions import PermanentError
 from app.core.logging import get_logger
 from app.db.models import CycleRun, InboxEvent, InboxItem
+from app.db.models_rules import Merchant
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
 from app.parsers import (
     DECLINED_REASON,
     DECLINED_TEMPLATE,
     Extraction,
+    canonical_mask,
     is_declined,
+    is_masked_counterparty,
+    is_placeholder_merchant,
+    match_masked_counterparty,
     normalize_merchant,
     parse,
     parse_amount,
@@ -71,6 +76,10 @@ TRANSFER_TAG = "transferencia"
 PHONE_TIMESTAMP_REASON = "invalid phone timestamp"
 DATE_FUTURE_REASON = "transaction date is future or differs by more than 3 days"
 DATE_ONLY_REASON = "date-only extraction differs from receipt date"
+# A merchant the bank or the model wrote as «PENDING», «N/A»... never becomes a Firefly account: the item waits for a name.
+MERCHANT_UNKNOWN = "merchant_unknown"
+COUNTERPARTY_AMBIGUOUS = "counterparty_ambiguous"
+MASKED_MATCH_EVENT = "masked_counterparty_matched"
 _KINDS = frozenset({"withdrawal", "deposit", "transfer", "refund", "review"})
 _INCOMING = re.compile(r"\b(?:recibiste|recibio|te\s+llegaron|te\s+(?:transfirieron|enviaron|consignaron|giraron)|abono|consignacion|deposito)\b")
 _OUTGOING = re.compile(r"\b(?:enviaste|transferiste|giraste|pagaste|retiraste|compraste|debito)\b")
@@ -106,13 +115,13 @@ def _permanent_message(exc):
 
 
 def _clean_merchant(value):
-    """Canonical merchant name, clipped to 60 characters instead of rejected; empty when nothing usable is left."""
+    """Canonical merchant name, clipped to 60 characters instead of rejected; empty when nothing usable is left or it is a placeholder."""
     name = normalize_merchant(value or "")
-    if name:
-        return name
-    # normalize_merchant refuses (rather than trims) a long name, a "$" or a long digit run: trim those and try again.
-    trimmed = re.sub(r"\d{5,}", " ", (value or "").replace("$", " "))
-    return normalize_merchant(" ".join(trimmed.split())[:60])
+    if not name:
+        # normalize_merchant refuses (rather than trims) a long name, a "$" or a long digit run: trim those and try again.
+        trimmed = re.sub(r"\d{5,}", " ", (value or "").replace("$", " "))
+        name = normalize_merchant(" ".join(trimmed.split())[:60])
+    return "" if is_placeholder_merchant(name) else name
 
 
 def _received(text):
@@ -412,10 +421,35 @@ class Processor:
                 progress(done)
         return counts
 
+    async def _known_counterparties(self):
+        """Names of every counterparty already known: Firefly's expense and revenue accounts and the ``merchants`` table."""
+        names = [account["name"] for account in await self.accounts() if account["type"] in {"expense", "revenue"}]
+        names.extend((await self.session.scalars(select(Merchant.name))).all())
+        return names
+
+    async def _unmask(self, item, name):
+        """The one place where a counterparty the bank masked («PAU*** BET***») meets the names already known.
+
+        Parser, LLM, second opinion and the owner's or the AI's corrections all end here before anything reaches Firefly.
+        Exactly one known name that agrees token by token reuses it (and leaves an event with the reason); none keeps the
+        masked name with its asterisks reduced to three; several keep it too and return ``ambiguous=True``. Merchants with
+        a legitimate asterisk («UBER *TRIP», «PAYU*NETFLIX») are not masks and come back untouched. Returns ``(name, ambiguous)``.
+        """
+        if not is_masked_counterparty(name):
+            return name, False
+        masked = canonical_mask(name)
+        found = match_masked_counterparty(masked, await self._known_counterparties())
+        if len(found) == 1:
+            self.session.add(InboxEvent(inbox_id=item.id, action=MASKED_MATCH_EVENT, detail=f"{masked} -> {found[0]}"[:300]))
+            return found[0], False
+        return masked, len(found) > 1
+
     async def _merchant(self, merchant, kind):
         name = normalize_merchant(merchant or "")
         if not name or len(name) > 60 or "$" in name:
             raise PermanentError("Merchant is not clean")
+        if is_placeholder_merchant(name):
+            raise PermanentError(MERCHANT_UNKNOWN)
         account_type = "revenue" if kind in {"deposit", "refund"} else "expense"
         for account in await self.accounts():
             if account["type"] == account_type and normalize_merchant(account["name"]) == name:
@@ -449,7 +483,7 @@ class Processor:
         if occurred > _now() + timedelta(days=1) or occurred < datetime(2020, 1, 1, tzinfo=UTC):
             raise ValueError("Date outside allowed range")
         merchant = normalize_merchant(payload.merchant or ("Ingreso manual" if payload.type in {"deposit", "refund"} else "Gasto manual"))
-        if not merchant or len(merchant) > 60 or "$" in merchant:
+        if not merchant or len(merchant) > 60 or "$" in merchant or is_placeholder_merchant(merchant):
             raise ValueError("Merchant is not clean")
         item, inserted = await self._insert(ref, source="manual", sender="owner", raw_text=payload.description[:4000], subject_or_title=payload.description, occurred_at=occurred, status="needs_review" if hold else "pending", review_reason=hold, method="manual", amount=payload.amount.quantize(Decimal("0.01")), currency="COP", merchant=merchant, category=category, asset_account=asset["name"], destination_account=destination["name"] if destination else None, transaction_type=payload.type)
         if not inserted:
@@ -596,6 +630,7 @@ class Processor:
         # Who received it, decided before the row is overwritten: a stored transfer to a third party keeps its direction.
         received = item.transaction_type == "deposit" if stored is not None and item.original_kind == "transfer" and item.transaction_type in {"withdrawal", "deposit"} else _received(subject + "\n" + text)
         merchant = _clean_merchant(extraction.merchant)
+        unknown = bool((extraction.merchant or "").strip()) and is_placeholder_merchant(extraction.merchant)
         item.transaction_type = item.original_kind = extraction.kind
         own = await self._resolve(item, extraction.account_hint)
         item.asset_account = own.firefly_account if own else None
@@ -618,11 +653,15 @@ class Processor:
                 if TRANSFER_TAG not in (item.tags or []):
                     item.tags = [*(item.tags or []), TRANSFER_TAG]
             else:
-                reasons.append("ambiguous transfer counterparty")
+                reasons.append(MERCHANT_UNKNOWN if unknown else "ambiguous transfer counterparty")
+        if merchant:
+            merchant, ambiguous = await self._unmask(item, merchant)
+            if ambiguous:
+                reasons.append(COUNTERPARTY_AMBIGUOUS)
         item.merchant = merchant or None
         pse.tag(item, subject + "\n" + text)
-        if not merchant and "ambiguous transfer counterparty" not in reasons:
-            reasons.append("merchant absent")
+        if not merchant and not {"ambiguous transfer counterparty", MERCHANT_UNKNOWN} & set(reasons):
+            reasons.append(MERCHANT_UNKNOWN if unknown else "merchant absent")
         if extraction.occurred_at:
             occurred = _aware(extraction.occurred_at, self.zone)
             if occurred > _now() or abs((occurred - item.occurred_at).total_seconds()) > 3 * 86400:
@@ -1020,6 +1059,12 @@ class Processor:
                         raise ValueError("Unknown category")
                 if field == "merchant":
                     value = normalize_merchant(value)
+                    if value and is_placeholder_merchant(value):
+                        raise ValueError("Merchant is not clean")
+                    if value:
+                        value, ambiguous = await self._unmask(item, value)
+                        if ambiguous:
+                            raise ValueError(f"{COUNTERPARTY_AMBIGUOUS}: write the full name of the counterparty")
                 if field == "description":
                     value = (value or "").strip() or None
                     if value and len(value) > 500:
@@ -1034,7 +1079,7 @@ class Processor:
                     changes["description"] = {"old": previous, "new": item.description}
                 if old != value:
                     changes[key] = {"old": old, "new": value}
-            if not item.amount or not item.asset_account or not item.merchant:
+            if not item.amount or not item.asset_account or is_placeholder_merchant(item.merchant):
                 raise ValueError("Review requires amount, merchant and own account")
             if item.currency != "COP":
                 raise ValueError("Foreign currency requires a corrected COP amount/currency")

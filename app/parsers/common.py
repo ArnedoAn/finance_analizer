@@ -6,6 +6,7 @@ merchant tails are discarded before account creation can see them.
 
 import re
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -97,13 +98,77 @@ def parse_amount(raw: str, currency: str = "COP") -> Decimal:
         raise ValueError("Invalid amount") from exc
 
 
+_MASK_TAIL = re.compile(r"[^\W\d_]\*{2,}$")
+
+
+def _trim_edges(value: str) -> str:
+    """Strip separators and stray asterisks from both ends, but keep the ``***`` that closes a masked name («PAU*** BET***»)."""
+    value = value.lstrip(" :*-")
+    while True:
+        trimmed = value.rstrip(" :-")
+        if trimmed.endswith("*") and not _MASK_TAIL.search(trimmed):
+            trimmed = trimmed[:-1]
+        if trimmed == value:
+            return value
+        value = trimmed
+
+
 def normalize_merchant(value: str) -> str:
     value = MERCHANT_END.split(value, maxsplit=1)[0]
-    value = " ".join(value.upper().split()).strip(" :*- ")
+    value = _trim_edges(" ".join(value.upper().split()))
     value = re.sub(r"^(?:(?:DLO|UBR|PAYU|MERCADOPAGO)\s*\*\s*)+", "", value)
     if not value or len(value) > 60 or "$" in value or re.search(r"\d{5,}", value):
         return ""
     return value
+
+
+# What a bank or a model writes when it does not know the merchant yet (a Bancolombia pre-authorisation says «PENDING»).
+# Compared after folding and dropping every non-alphanumeric character, so «N/A», «Sin comercio» and «sin-comercio» match.
+PLACEHOLDER_MERCHANTS = frozenset({
+    "pending", "pendiente", "na", "null", "none", "unknown", "desconocido", "sincomercio", "comercio",
+})
+
+
+def is_placeholder_merchant(value: str | None) -> bool:
+    """The merchant, once normalized, is a stand-in for «unknown» (or nothing but signs and asterisks): no account may carry it."""
+    value = value or ""
+    name = normalize_merchant(value) or value
+    compact = re.sub(r"[\W_]+", "", fold(name))
+    return not compact or compact in PLACEHOLDER_MERCHANTS
+
+
+# A masked person name: every token is letters, and at least one is a prefix followed by two or more asterisks
+# («PAU*** BET***»). «UBER *TRIP» and «PAYU*NETFLIX» are merchants with a legitimate asterisk, not masks.
+_MASKED_TOKEN = re.compile(r"[^\W\d_]+\*{2,}")
+_PLAIN_TOKEN = re.compile(r"[^\W\d_]+")
+
+
+def is_masked_counterparty(name: str | None) -> bool:
+    tokens = fold(name or "").split()
+    return (bool(tokens) and all(_MASKED_TOKEN.fullmatch(t) or _PLAIN_TOKEN.fullmatch(t) for t in tokens)
+            and any(_MASKED_TOKEN.fullmatch(t) for t in tokens))
+
+
+def canonical_mask(name: str) -> str:
+    """The masked name with every run of asterisks reduced to three."""
+    return re.sub(r"\*{2,}", "***", name)
+
+
+def match_masked_counterparty(masked: str, known: Iterable[str]) -> list[str]:
+    """Distinct unmasked names of ``known`` that agree with ``masked`` token by token, each as a prefix («PAU»→«PAULA»).
+
+    Accents and case are ignored and the number of tokens must be the same. Masked names in ``known`` never match.
+    """
+    prefixes = [token.rstrip("*") for token in fold(masked).split()]
+    found: dict[str, str] = {}
+    for name in known:
+        clean = normalize_merchant(name or "")
+        if not clean or is_masked_counterparty(clean):
+            continue
+        tokens = fold(clean).split()
+        if len(tokens) == len(prefixes) and all(t.startswith(p) for t, p in zip(tokens, prefixes, strict=True)):
+            found.setdefault(" ".join(tokens), clean)
+    return list(found.values())
 
 
 DATE = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.-]\d{1,2}[/.-](?:\d{4}|\d{2}))"

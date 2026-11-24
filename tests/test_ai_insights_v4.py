@@ -510,7 +510,7 @@ async def test_previous_month_job_generates_once_respects_switch_and_budget(db, 
     await ai_budget.set_policy(db, 400)
     await db.commit()
     note = await db.scalar(select(AiNote).where(AiNote.kind == "narrative_try"))
-    note.updated_at = now_utc() - timedelta(hours=7)
+    note.updated_at = ai_narrative.now_utc() - timedelta(hours=7)  # the job's clock (the `november` fixture), not the wall clock
     await db.commit()
     assert await ai_insights.run_monthly_narrative(db, clients[0], llm, settings) == {"generated": "2026-10"}
     assert (await db.get(AiNarrative, "2026-10")).source == "auto"

@@ -322,3 +322,24 @@ async def test_month_plan_without_a_trm_counts_the_usd_income_as_zero(client, fi
     await client.post(f"{API}/incomes", headers=ADMIN, json=RETAINER)
     plan = (await client.get(f"{API}/plan/month", headers=ADMIN)).json()
     assert plan["income_expected"]["fixed_usd"] == {"usd": "100.00", "rate": "0.00", "cop": "0.00"} and plan["income_expected"]["total"] == "0.00"
+
+
+async def test_month_plan_has_no_cents_in_pesos(client, service, firefly, extraction, soda, monkeypatch, db):
+    """Incomes, budget, installments and the TRM conversion with cents come out as whole pesos; USD and the TRM keep theirs."""
+    today = datetime.now(ZONE).date()
+    soda.rows[:] = [("3920.75", (today - timedelta(days=10)).isoformat(), (today + timedelta(days=10)).isoformat())]
+    for income in ({**SALARY, "amount": "1500000.55"}, {**RETAINER, "amount": "333.33"}):
+        await client.post(f"{API}/incomes", headers=ADMIN, json=income)
+    firefly.budget_progress.return_value = [{"name": "Comida", "spent": Decimal("1.00"), "limit": Decimal("800000.49")}]
+    db.add(Debt(kind="loan", name="Credito Libre", firefly_account_id="20", firefly_account="Credito Libre", rate_ea=Decimal("28"),
+                installment=Decimal("397290.50"), insurance_monthly=Decimal("14999.50"), payment_day=5, payment_match=[], active=True))
+    firefly.account_balance.return_value = {"type": "liabilities", "balance": Decimal("-5000000.37")}
+    await db.commit()
+    await deposit(service, extraction, monkeypatch, "AMIGO PEREZ", "300000.45")
+    plan = (await client.get(f"{API}/plan/month", headers=ADMIN)).json()
+    from tests.test_debts_v4 import assert_whole_pesos
+
+    assert_whole_pesos(plan, allowed=(".income_expected.fixed_usd.usd", ".income_expected.fixed_usd.rate"))
+    assert plan["income_expected"]["fixed_usd"] == {"usd": "333.33", "rate": "3920.75", "cop": "1306904.00"}  # 333,33 x 3.920,75 = 1.306.903,6
+    assert plan["income_expected"]["fixed_cop"] == "1500001.00" and plan["budget_total"] == "800000.00"
+    assert plan["income_received"]["variable"] == "300000.00"  # 300.000,45

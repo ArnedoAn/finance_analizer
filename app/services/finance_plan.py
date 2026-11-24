@@ -76,17 +76,17 @@ async def month_plan(session, firefly, settings, month: str | None) -> dict:
     return {
         "month": f"{first.year:04d}-{first.month:02d}",
         "income_expected": {
-            "fixed_cop": debts.money(fixed_cop),
-            "fixed_usd": {"usd": debts.money(fixed_usd), "rate": debts.money(rate), "cop": debts.money(usd_in_cop)},
-            "total": debts.money(expected_total),
+            "fixed_cop": debts.peso_str(fixed_cop),
+            "fixed_usd": {"usd": debts.money(fixed_usd), "rate": debts.money(rate), "cop": debts.peso_str(usd_in_cop)},
+            "total": debts.peso_str(expected_total),
         },
         "income_received": {
-            "fixed": debts.money(received["fixed"]), "variable": debts.money(received["variable"]),
-            "total": debts.money(received["fixed"] + received["variable"]),
+            "fixed": debts.peso_str(received["fixed"]), "variable": debts.peso_str(received["variable"]),
+            "total": debts.peso_str(received["fixed"] + received["variable"]),
         },
-        "budget_total": debts.money(budget_total),
-        "installments_total": debts.money(installments),
-        "available_for_extra": debts.money(available),
-        "extra_received_unallocated": debts.money(unallocated),
+        "budget_total": debts.peso_str(budget_total),
+        "installments_total": debts.peso_str(installments),
+        "available_for_extra": debts.peso_str(available),
+        "extra_received_unallocated": debts.peso_str(unallocated),
         "suggestion": suggestion,
     }

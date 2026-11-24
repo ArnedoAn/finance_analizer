@@ -580,3 +580,44 @@ async def test_the_agent_month_close_report_carries_the_debts_section(client, fi
     section = json.loads(row.report)["debts"]
     assert section["total_balance"] == "9810557.00" and section["installments_paid"] == 0
     assert [d["name"] for d in section["debts"]] == ["Credito Libre"]
+
+
+# --- projections are whole pesos ----------------------------------------------------------------------------------------
+
+_MONEY_TEXT = __import__("re").compile(r"^-?\d+\.\d{2}$")
+
+
+def money_fields(value, path=""):
+    """Every ``"1234.00"``-looking string in a response, with its path."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from money_fields(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from money_fields(item, f"{path}[{index}]")
+    elif isinstance(value, str) and _MONEY_TEXT.match(value):
+        yield path, value
+
+
+def assert_whole_pesos(body, allowed=()):
+    fields = list(money_fields(body))
+    assert fields, "the response has no monetary field: the check would pass vacuously"
+    cents = [(path, value) for path, value in fields if not value.endswith(".00") and path not in allowed]
+    assert not cents, cents
+
+
+async def test_schedule_and_plan_have_no_cents(client, firefly):
+    """Firefly balances, installments and extras with cents still come out as whole pesos (rounded half up when serializing)."""
+    firefly.balances["20"]["balance"] = Decimal("-9810557.37")
+    body = await make_loan(client, installment="397290.50", insurance_monthly="14999.50")
+    for params in ({}, {"extra_monthly": "200000.49", "extra_once": "1000000.50"}, {"extra_once": "2000000.55", "mode": "installment"}):
+        data = (await client.get(f"{URL}/{body['id']}/schedule", headers=ADMIN, params=params)).json()
+        assert_whole_pesos(data)
+    assert data["rows"][0]["insurance"] == "15000.00"  # 14.999,50 rounds half up
+
+    firefly.account_list.append({"id": "31", "name": "Otro", "type": "liabilities"})
+    firefly.balances["31"] = {"type": "liabilities", "balance": Decimal("-3333333.33")}
+    await client.post(URL, headers=ADMIN, json={"kind": "loan", "name": "Otro", "firefly_account_id": "31", "rate_ea": "21.37", "installment": "150000.75"})
+    plan = (await client.post(f"{URL}/plan", headers=ADMIN, json={"extra_monthly": "123456.78", "extra_once": "50000.49", "strategy": "both"})).json()
+    assert_whole_pesos(plan)
+    assert set(plan) == {"avalanche", "snowball"}

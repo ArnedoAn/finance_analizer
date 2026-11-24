@@ -52,6 +52,14 @@ def money(value) -> str:
     return f"{Decimal(value):.2f}"
 
 
+def peso_str(value) -> str:
+    """COP for projections (schedule, plan, month plan, close report): whole pesos, half up, serialized ``"1234.00"``.
+
+    The only place those responses round, and only when serializing: the maths in between keeps what it computed.
+    """
+    return f"{math.peso(value):.2f}"
+
+
 def _optional(value) -> str | None:
     return None if value is None else money(value)
 
@@ -298,11 +306,11 @@ def _summary(baseline: math.Schedule, adjusted: math.Schedule) -> dict:
     return {
         "remaining_installments": adjusted.months,
         "payoff_date": adjusted.payoff_date.isoformat() if adjusted.payoff_date else None,
-        "total_interest": money(adjusted.total_interest),
-        "baseline": {"payoff_date": baseline.payoff_date.isoformat() if baseline.payoff_date else None, "total_interest": money(baseline.total_interest)},
-        "interest_saved": money(baseline.total_interest - adjusted.total_interest),
+        "total_interest": peso_str(adjusted.total_interest),
+        "baseline": {"payoff_date": baseline.payoff_date.isoformat() if baseline.payoff_date else None, "total_interest": peso_str(baseline.total_interest)},
+        "interest_saved": peso_str(baseline.total_interest - adjusted.total_interest),
         "months_saved": baseline.months - adjusted.months,
-        "new_installment": money(adjusted.new_installment),
+        "new_installment": peso_str(adjusted.new_installment),
     }
 
 
@@ -322,8 +330,8 @@ async def schedule(session, firefly, settings, debt_id: int, *, extra_monthly=ZE
     except math.NotAmortizingError as exc:
         raise _not_amortizing(row) from exc
     rows = [
-        {"n": r.n, "date": r.date.isoformat(), "installment": money(r.installment), "interest": money(r.interest), "principal": money(r.principal),
-         "insurance": money(r.insurance), "extra": money(r.extra), "balance": money(r.balance)}
+        {"n": r.n, "date": r.date.isoformat(), "installment": peso_str(r.installment), "interest": peso_str(r.interest), "principal": peso_str(r.principal),
+         "insurance": peso_str(r.insurance), "extra": peso_str(r.extra), "balance": peso_str(r.balance)}
         for r in adjusted.rows
     ]
     return {"rows": rows, "summary": _summary(baseline, adjusted)}
@@ -355,10 +363,10 @@ def strategy_result(items: list[tuple[Debt, math.DebtInput]], extra_monthly, ext
     free = None if result.debt_free_month is None else max((d for d in dates.values() if d), default=None)
     return {
         "order": math.payoff_order(result),
-        "debts": [{"debt_id": o.debt_id, "payoff_date": dates[o.debt_id], "total_interest": money(o.total_interest)} for o in result.outcomes],
+        "debts": [{"debt_id": o.debt_id, "payoff_date": dates[o.debt_id], "total_interest": peso_str(o.total_interest)} for o in result.outcomes],
         "debt_free_date": free,
-        "total_interest": money(result.total_interest),
-        "interest_saved_vs_minimum": money(baseline.total_interest - result.total_interest),
+        "total_interest": peso_str(result.total_interest),
+        "interest_saved_vs_minimum": peso_str(baseline.total_interest - result.total_interest),
     }
 
 
@@ -375,7 +383,7 @@ def suggest_allocations(items: list[tuple[Debt, math.DebtInput]], amount: Decima
     ``{strategy, allocations: [{debt_id, amount, reason}]}``; the amount goes to the first debt in the strategy's priority
     until it is paid off, then to the next. No debts or nothing to allocate give an empty list (strategy avalanche).
     """
-    amount = math.peso(max(amount, ZERO))
+    amount = max(Decimal(amount), ZERO)
     if not items or amount <= 0:
         return {"strategy": "avalanche", "allocations": []}
     inputs = [debt_input for _, debt_input in items]
@@ -388,7 +396,7 @@ def suggest_allocations(items: list[tuple[Debt, math.DebtInput]], amount: Decima
         part = min(left, debt.balance)
         reason = (f"Tasa más alta ({debt.rate_ea:.2f} % EA): es la que más intereses cobra." if best == "avalanche"
                   else f"Saldo más bajo: «{names[debt.id]}» se liquida primero y libera su cuota.")
-        allocations.append({"debt_id": debt.id, "amount": money(part), "reason": reason})
+        allocations.append({"debt_id": debt.id, "amount": peso_str(part), "reason": reason})
         left -= part
     return {"strategy": best, "allocations": allocations}
 
@@ -417,9 +425,9 @@ async def month_summary(session, firefly, settings, first, last) -> dict:
         estimate = math.peso(balance * math.monthly_rate(row.rate_ea))
         total += balance
         interest += estimate
-        items.append({"debt_id": row.id, "name": row.name, "balance": money(balance), "installments_paid": sum(1 for p in paid if p.destination_account.casefold() == row.firefly_account.casefold())})
+        items.append({"debt_id": row.id, "name": row.name, "balance": peso_str(balance), "installments_paid": sum(1 for p in paid if p.destination_account.casefold() == row.firefly_account.casefold())})
     return {
-        "total_balance": money(total), "installments_paid": len(paid),
-        "installments_paid_amount": money(sum((p.amount or ZERO for p in paid), ZERO)),
-        "estimated_interest": money(interest), "debts": items,
+        "total_balance": peso_str(total), "installments_paid": len(paid),
+        "installments_paid_amount": peso_str(sum((p.amount or ZERO for p in paid), ZERO)),
+        "estimated_interest": peso_str(interest), "debts": items,
     }

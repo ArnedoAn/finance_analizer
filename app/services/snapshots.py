@@ -250,9 +250,8 @@ def enable(opener) -> None:
     _opener = opener
 
 
-async def disable() -> None:
-    global _opener
-    _opener = None
+async def drop_pending() -> None:
+    """Cancel the recomputations running or waiting (after a mass purge their result would be stale)."""
     pending = [*_debounce.values(), *_inflight.values()]
     for task in pending:
         task.cancel()
@@ -260,6 +259,12 @@ async def disable() -> None:
     _debounce.clear()
     _inflight.clear()
     _rerun.clear()
+
+
+async def disable() -> None:
+    global _opener
+    _opener = None
+    await drop_pending()
 
 
 def schedule(month: str) -> None:

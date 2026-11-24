@@ -223,6 +223,14 @@ class FireflyClient:
         rows = result if isinstance(result, list) else result.get("data", [])
         return sum((self._decimal(row.get("difference")) for row in rows if row.get("currency_code") in (None, "", "COP")), Decimal(0))
 
+    async def transaction_groups_page(self, page: int, start, end) -> tuple[list[dict], int]:
+        """One page (100) of transaction groups between two dates (JSON:API ``data``) and the total number of pages."""
+        result = await self._request(
+            "GET", "transactions", params={"start": start.isoformat(), "end": end.isoformat(), "type": "all", "page": page, "limit": 100},
+        )
+        pagination = result.get("meta", {}).get("pagination", {})
+        return result["data"], int(pagination.get("total_pages", 1))
+
     async def list_auto_transactions(self) -> list[dict]:
         return await self._list("search/transactions", query='tag_is:"auto"')
 

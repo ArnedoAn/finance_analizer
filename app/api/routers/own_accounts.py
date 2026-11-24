@@ -34,6 +34,12 @@ def _exists() -> HTTPException:
     return _error(409, "Ya existe una cuenta propia con ese nombre de Firefly.", "own_account_exists")
 
 
+def _check_card_days(fields: dict, kind: str) -> None:
+    """Cut and payment days only make sense on a credit card: 422 ``card_days_not_credit`` otherwise."""
+    if kind != "credit" and any(fields.get(name) is not None for name in ("statement_day", "payment_day")):
+        raise _error(422, "El día de corte y el de pago solo se configuran en cuentas de tipo tarjeta de crédito.", "card_days_not_credit")
+
+
 def _sources(values: list[str]) -> list[str]:
     try:
         return registry.normalize_sources(values)
@@ -59,7 +65,7 @@ def _require_in_firefly(name: str, names: set[str] | None) -> None:
 def _out(row, names: set[str] | None) -> OwnAccountOut:
     return OwnAccountOut(
         id=row.id, firefly_account=row.firefly_account, bank=row.bank, kind=row.kind, last4=list(row.last4 or []),
-        aliases=list(row.aliases or []), sources=list(row.sources or []),
+        aliases=list(row.aliases or []), sources=list(row.sources or []), statement_day=row.statement_day, payment_day=row.payment_day,
         firefly_exists=None if names is None else row.firefly_account.casefold() in names, updated_at=row.updated_at,
     )
 
@@ -80,6 +86,7 @@ async def list_own_accounts(db: DB):
 async def add_own_account(payload: OwnAccountIn, db: DB, principal: Annotated[Principal, REVIEW]):
     repository = OwnAccountRepository(db)
     sources = _sources(payload.sources)
+    _check_card_days({"statement_day": payload.statement_day, "payment_day": payload.payment_day}, payload.kind)
     if await repository.taken(payload.firefly_account):
         raise _exists()
     names = await _firefly_names()
@@ -88,6 +95,7 @@ async def add_own_account(payload: OwnAccountIn, db: DB, principal: Annotated[Pr
         row = await repository.add(
             firefly_account=payload.firefly_account, bank=payload.bank, kind=payload.kind,
             last4=payload.last4, aliases=payload.aliases, sources=sources,
+            statement_day=payload.statement_day, payment_day=payload.payment_day,
         )
     except OwnAccountExistsError as exc:
         raise _exists() from exc
@@ -104,6 +112,10 @@ async def update_own_account(account_id: int, payload: OwnAccountPatch, db: DB, 
     if row is None:
         raise _not_found()
     fields = payload.model_dump(exclude_unset=True)
+    _check_card_days(fields, fields.get("kind", row.kind))
+    if "kind" in fields and fields["kind"] != "credit":
+        fields.setdefault("statement_day", None)
+        fields.setdefault("payment_day", None)
     if "sources" in fields:
         fields["sources"] = _sources(fields["sources"])
     renamed = "firefly_account" in fields and fields["firefly_account"].casefold() != row.firefly_account.casefold()

@@ -312,6 +312,18 @@ async def run_previous_month(session, firefly, llm, settings) -> dict:
         return {"error": type(exc).__name__}
 
 
+async def pending(session, settings) -> int:
+    """1 when ``run_previous_month`` would call the model now (feature on, previous month without report and not tried within
+    ``RETRY``), else 0: the valley queue's precheck."""
+    if not await ai_features.enabled(session, "narrative"):
+        return 0
+    month = previous_month(settings)
+    if await session.get(AiNarrative, month) is not None:
+        return 0
+    attempt = await session.scalar(select(AiNote).where(AiNote.kind == NOTE, AiNote.key == month))
+    return 0 if attempt is not None and attempt.updated_at > now_utc() - RETRY else 1
+
+
 async def after_cycle(session, firefly, llm, settings) -> dict:
     """Fallback for a server that was down on day 1 at 09:00: from 09:00 on, the previous month still gets its report."""
     if datetime.now(ZoneInfo(settings.timezone)).hour < MORNING_HOUR:

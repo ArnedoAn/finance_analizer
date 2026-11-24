@@ -68,17 +68,29 @@ async def _save(session, key: str, text: str) -> None:
         note.text, note.data, note.updated_at = text, {} if text else {"error": True}, now_utc()
 
 
+async def _todo(session, settings) -> list[dict]:
+    """Recent anomalies without a sentence (or whose failed try is old enough to retry), at most ``BATCH``."""
+    entries = [entry for entry in await anomalies.detect(session, settings, since=now_utc() - timedelta(days=SINCE_DAYS))]
+    notes = await _notes(session, [entry["key"] for entry in entries])
+    cutoff = now_utc() - RETRY
+    return [
+        entry for entry in entries
+        if (note := notes.get(entry["key"])) is None or (note.data.get("error") and note.updated_at < cutoff)
+    ][:BATCH]
+
+
+async def pending(session, settings) -> int:
+    """Anomalies ``explain_new`` would send to the model now (0 when the feature is off): the valley queue's precheck."""
+    if not await ai_features.enabled(session, "anomalies"):
+        return 0
+    return 1 if await _todo(session, settings) else 0
+
+
 async def explain_new(session, llm, settings, *, auto: bool = True) -> dict:
     """Explain the recent anomalies that have no sentence yet. Never raises: ``{"explained": n}`` or ``{"skipped": reason}``."""
     if not await ai_features.enabled(session, "anomalies"):
         return {"skipped": "disabled"}
-    entries = [entry for entry in await anomalies.detect(session, settings, since=now_utc() - timedelta(days=SINCE_DAYS))]
-    notes = await _notes(session, [entry["key"] for entry in entries])
-    cutoff = now_utc() - RETRY
-    todo = [
-        entry for entry in entries
-        if (note := notes.get(entry["key"])) is None or (note.data.get("error") and note.updated_at < cutoff)
-    ][:BATCH]
+    todo = await _todo(session, settings)
     if not todo:
         return {"skipped": "nothing_to_do"}
     evidence = [_evidence(entry) for entry in todo]

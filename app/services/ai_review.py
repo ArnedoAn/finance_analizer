@@ -22,7 +22,7 @@ from app.db.models_rules import Rule
 from app.db.repositories import InboxRepository
 from app.parsers import normalize_merchant
 from app.security.redaction import redact
-from app.services import ai_budget, audit, own_accounts, rules
+from app.services import ai_budget, ai_jobs, audit, own_accounts, rules
 
 logger = get_logger(__name__)
 
@@ -272,14 +272,34 @@ async def suggest_items(session, firefly, llm, ids: list[int], *, auto: bool, se
     return counts
 
 
+async def _suggest_pending(session, firefly, llm, settings=None) -> dict:
+    """The post-cycle work itself: suggest the eligible items when the budget guard allows it."""
+    ids = await eligible_ids(session, auto=True)
+    await session.commit()
+    if not ids or not await ai_budget.allow(session, KIND, 1):
+        return {"suggested": 0, "errors": 0, "skipped": len(ids), "budget_stopped": bool(ids)}
+    return await suggest_items(session, firefly, llm, ids, auto=True, settings=settings)
+
+
+@ai_jobs.register("ai_suggest")
+async def _run_job(ctx, payload):
+    return await _suggest_pending(ctx.session, ctx.firefly, ctx.llm, ctx.settings)
+
+
 async def after_cycle(session, firefly, llm, settings=None) -> dict:
-    """Automatic step after each cycle: suggest the new pending items when the guard allows it. Never raises."""
+    """Automatic step after each cycle: suggest the new pending items when the guard allows it. Never raises.
+
+    A heavy automatic job: outside the peak it runs now; in the peak it waits in the queue (``ai_jobs``) for the valley or the owner.
+    """
     try:
         ids = await eligible_ids(session, auto=True)
         await session.commit()
-        if not ids or not await ai_budget.allow(session, KIND, 1):
-            return {"suggested": 0, "errors": 0, "skipped": len(ids), "budget_stopped": bool(ids)}
-        return await suggest_items(session, firefly, llm, ids, auto=True, settings=settings)
+        if not ids:
+            return {"suggested": 0, "errors": 0, "skipped": 0, "budget_stopped": False}
+        return await ai_jobs.dispatch(
+            ai_jobs.JobContext(session, firefly, llm, settings), "ai_suggest", "Sugerir cómo resolver los movimientos en revisión",
+            "ai_suggest", estimated_calls=len(ids), dedupe_key="ai_suggest",
+        )
     except Exception as exc:
         logger.error("ai_suggest_after_cycle_failed", error_type=type(exc).__name__)
         try:

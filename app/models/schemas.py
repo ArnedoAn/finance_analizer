@@ -87,6 +87,7 @@ class HistorySmsBatch(BaseModel):
 OwnAccountKind = Literal["savings", "checking", "credit", "wallet", "pocket", "cash"]
 _Last4 = Annotated[str, StringConstraints(pattern=r"^[0-9]{4}$")]
 _Alias = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
+_CardDay = Annotated[int, Field(ge=1, le=31, strict=True)]
 
 
 class OwnAccountIn(BaseModel):
@@ -98,6 +99,8 @@ class OwnAccountIn(BaseModel):
     last4: list[_Last4] = Field(default_factory=list, max_length=10)
     aliases: list[_Alias] = Field(default_factory=list, max_length=20)
     sources: list[str] = Field(default_factory=list, max_length=30)
+    statement_day: _CardDay | None = None  # credit cards only (router: 422 ``card_days_not_credit`` otherwise)
+    payment_day: _CardDay | None = None
 
 
 class OwnAccountPatch(BaseModel):
@@ -109,10 +112,12 @@ class OwnAccountPatch(BaseModel):
     last4: list[_Last4] | None = Field(default=None, max_length=10)
     aliases: list[_Alias] | None = Field(default=None, max_length=20)
     sources: list[str] | None = Field(default=None, max_length=30)
+    statement_day: _CardDay | None = None  # null clears it
+    payment_day: _CardDay | None = None
 
     @model_validator(mode="after")
     def no_nulls(self):
-        for name in self.model_fields_set:
+        for name in self.model_fields_set - {"statement_day", "payment_day"}:
             if getattr(self, name) is None:
                 raise ValueError(f"{name} must not be null")
         return self
@@ -126,6 +131,8 @@ class OwnAccountOut(BaseModel):
     last4: list[str]
     aliases: list[str]
     sources: list[str]
+    statement_day: int | None = None
+    payment_day: int | None = None
     firefly_exists: bool | None
     updated_at: datetime
 

@@ -128,13 +128,19 @@ class LLMClient:
         self.settings = settings or get_settings()
         self._client = httpx.AsyncClient(timeout=60)
 
-    def _chain(self):
+    def _chain(self, model: str | None = None):
+        """Models to try in order. A call-level ``model`` (second opinion) means exactly that model on the primary provider:
+        no other model of the chain and no direct fallback, so the answer really comes from the model asked for."""
         settings = self.settings
         key = settings.llm_api_key.get_secret_value()
+        if model:
+            if key:
+                yield settings.llm_base_url, key, model.strip()
+            return
         if key:
-            for model in settings.llm_models.split(","):
-                if model.strip():
-                    yield settings.llm_base_url, key, model.strip()
+            for name in settings.llm_models.split(","):
+                if name.strip():
+                    yield settings.llm_base_url, key, name.strip()
         fallback_key = settings.llm_fallback_api_key.get_secret_value()
         if fallback_key and settings.llm_fallback_base_url and settings.llm_fallback_model:
             yield settings.llm_fallback_base_url, fallback_key, settings.llm_fallback_model
@@ -158,12 +164,12 @@ class LLMClient:
         if isinstance(opencode, dict) and opencode.get("allowance") is not None:
             usage["allowance"] = opencode["allowance"]
 
-    async def _infer(self, prompt: str, content: dict, cycle_id: str, validate, usage: dict | None = None):
+    async def _infer(self, prompt: str, content: dict, cycle_id: str, validate, usage: dict | None = None, model: str | None = None):
         """Ordered model chain. ``usage`` (optional out-parameter) receives ``calls`` (every request made, failed ones
         included), summed token counts, the last ``allowance`` OpenCode Go reported and the ``model`` that answered, even
         when the chain is exhausted."""
         errors = []
-        for base, key, model in self._chain():
+        for base, key, model in self._chain(model):
             try:
                 if usage is not None:
                     usage["calls"] = usage.get("calls", 0) + 1
@@ -200,15 +206,15 @@ class LLMClient:
         error_log.record("llm", "chain", "LLM chain exhausted: " + (", ".join(errors) or "no configured models"), exc_type="RuntimeError")
         raise RuntimeError("LLM chain exhausted: " + (", ".join(errors) or "no configured models"))
 
-    async def complete_json(self, prompt: str, content: dict, cycle_id: str, usage: dict | None = None) -> dict:
+    async def complete_json(self, prompt: str, content: dict, cycle_id: str, usage: dict | None = None, model: str | None = None) -> dict:
         """One JSON object answer for a service prompt (``content`` must already be redacted). The caller validates it."""
         def validate(data, model):
             if not isinstance(data, dict):
                 raise ValueError("Expected a JSON object")
             return data
-        return await self._infer(prompt, content, cycle_id, validate, usage)
+        return await self._infer(prompt, content, cycle_id, validate, usage, model)
 
-    async def analyze(self, text: str, cycle_id: str, usage: dict | None = None) -> Extraction:
+    async def analyze(self, text: str, cycle_id: str, usage: dict | None = None, model: str | None = None) -> Extraction:
         def validate(data, model):
             if not isinstance(data, dict):
                 raise ValueError("Expected extraction object")
@@ -256,7 +262,7 @@ class LLMClient:
                 reason=optional_string("reason"), summary=summary,
             )
         return await self._infer(
-            _PROMPT, {"UNTRUSTED_DATA": _compact(text), "END_UNTRUSTED_DATA": True}, cycle_id, validate, usage,
+            _PROMPT, {"UNTRUSTED_DATA": _compact(text), "END_UNTRUSTED_DATA": True}, cycle_id, validate, usage, model,
         )
 
     async def learn_senders(self, senders: list[str], cycle_id: str, usage: dict | None = None) -> list[str]:

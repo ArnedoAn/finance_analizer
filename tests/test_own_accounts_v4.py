@@ -57,7 +57,7 @@ async def test_crud_roundtrip(client):
     created = await create(client)
     assert created.status_code == 201, created.text
     body = created.json()
-    assert set(body) == {"id", "firefly_account", "bank", "kind", "last4", "aliases", "sources", "firefly_exists", "updated_at"}
+    assert set(body) == {"id", "firefly_account", "bank", "kind", "last4", "aliases", "sources", "statement_day", "payment_day", "firefly_exists", "updated_at"}
     assert isinstance(body["id"], int) and datetime.fromisoformat(body["updated_at"]).tzinfo is not None
     assert (body["firefly_account"], body["bank"], body["kind"], body["last4"], body["aliases"], body["sources"], body["firefly_exists"]) == (
         "Bancolombia", "bancolombia", "savings", ["5678"], ["bancolombia"], ["sms:87400"], True)
@@ -443,7 +443,8 @@ def test_migration_matches_the_model_and_enforces_unique_names_ignoring_case():
     engine = sa.create_engine("sqlite://")
     with engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
         module.upgrade()
-    assert {c["name"] for c in sa.inspect(engine).get_columns("own_accounts")} == {c.name for c in OwnAccountRow.__table__.columns}
+    # statement_day and payment_day arrive with the quality migration (20261125_15), tested in tests/test_quality_v4.py
+    assert {c["name"] for c in sa.inspect(engine).get_columns("own_accounts")} == {c.name for c in OwnAccountRow.__table__.columns} - {"statement_day", "payment_day"}
     insert = sa.text("INSERT INTO own_accounts (firefly_account, bank, kind, last4, aliases, sources, created_at, updated_at) "
                      "VALUES (:name, 'b', 'wallet', '[]', '[]', '[]', '2026-11-23', '2026-11-23')")
     with engine.begin() as connection:

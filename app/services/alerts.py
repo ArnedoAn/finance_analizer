@@ -29,6 +29,7 @@ from app.core.timezone import now_utc
 from app.db.models import InboxItem, Notification
 from app.db.models_alerts import Alert
 from app.db.models_devices import Device
+from app.services import alert_mutes
 
 logger = get_logger(__name__)
 
@@ -102,7 +103,10 @@ async def emit(session, type: str, *, title: str, body: str, item_id=None, amoun
                min_interval_minutes: int | None = None) -> Alert | None:
     """Insert an alert unless the same ``dedupe_key`` (default: the type) fired within the interval
     (default ``NOTIFY_MIN_INTERVAL_MINUTES``). Returns the flushed row, or None when suppressed.
-    On PostgreSQL the call first takes ``ALERT_ORDER_LOCK`` (see the module docstring)."""
+    On PostgreSQL the call first takes ``ALERT_ORDER_LOCK`` (see the module docstring).
+    A muted alert (``alert_mutes``, fails open) is dropped first and returns None."""
+    if await alert_mutes.is_muted(session, type, item_id=item_id, amount=amount):
+        return None
     if _is_postgres(session):
         # First thing, before the anti-noise claim: a transaction that waits here holds no claim rows,
         # so two emitters can never deadlock on each other's ``notifications`` keys.

@@ -43,6 +43,8 @@ class OwnAccountView:
     last4: tuple[str, ...]
     aliases: tuple[str, ...]
     sources: tuple[str, ...]
+    statement_day: int | None = None
+    payment_day: int | None = None
 
 
 _snapshot: tuple[OwnAccountView, ...] | None = None
@@ -64,7 +66,13 @@ async def load(session) -> tuple[OwnAccountView, ...]:
         return cached
     generation = _generation
     rows = await OwnAccountRepository(session).all()
-    loaded = tuple(OwnAccountView(row.firefly_account, row.bank, row.kind, tuple(row.last4 or ()), tuple(row.aliases or ()), tuple(row.sources or ())) for row in rows)
+    loaded = tuple(
+        OwnAccountView(
+            row.firefly_account, row.bank, row.kind, tuple(row.last4 or ()), tuple(row.aliases or ()), tuple(row.sources or ()),
+            row.statement_day, row.payment_day,
+        )
+        for row in rows
+    )
     # A write committed while this query ran invalidated the generation: the rows read may predate it, so do not keep them.
     if generation == _generation:
         _snapshot = loaded

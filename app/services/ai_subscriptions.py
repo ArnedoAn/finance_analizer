@@ -147,14 +147,8 @@ async def _price_alerts(session, subs: list[dict], notes: dict[str, AiNote]) -> 
     return emitted
 
 
-async def run(session, llm, settings, *, auto: bool = True, max_age: timedelta | None = None) -> dict:
-    """Judge the candidates without a fresh verdict, then emit the price-increase alerts. Never raises.
-
-    ``max_age`` None judges only candidates never judged (or failed more than ``RETRY`` ago, the cycle's call); the weekly
-    job passes ``REFRESH`` to judge again the verdicts older than that.
-    """
-    if not await ai_features.enabled(session, "subscriptions"):
-        return {"skipped": "disabled"}
+async def _due(session, settings, max_age: timedelta | None):
+    """``(subs, notes, todo)``: the recurring candidates, the stored verdicts and the candidates that need a (new) verdict."""
     subs = (await reports.subscriptions(session, settings))["items"]
     notes = await _notes(session)
     now = now_utc()
@@ -167,7 +161,26 @@ async def run(session, llm, settings, *, auto: bool = True, max_age: timedelta |
             return note.updated_at < now - RETRY
         return max_age is not None and note.updated_at < now - max_age
 
-    todo = [sub for sub in subs if due(sub)]
+    return subs, notes, [sub for sub in subs if due(sub)]
+
+
+async def pending(session, settings, max_age: timedelta | None = None) -> int:
+    """Calls ``run`` would make now (0 when the feature is off or every verdict is fresh): the valley queue's precheck."""
+    if not await ai_features.enabled(session, "subscriptions"):
+        return 0
+    _, _, todo = await _due(session, settings, max_age)
+    return -(-len(todo) // BATCH)
+
+
+async def run(session, llm, settings, *, auto: bool = True, max_age: timedelta | None = None) -> dict:
+    """Judge the candidates without a fresh verdict, then emit the price-increase alerts. Never raises.
+
+    ``max_age`` None judges only candidates never judged (or failed more than ``RETRY`` ago, the cycle's call); the weekly
+    job passes ``REFRESH`` to judge again the verdicts older than that.
+    """
+    if not await ai_features.enabled(session, "subscriptions"):
+        return {"skipped": "disabled"}
+    subs, notes, todo = await _due(session, settings, max_age)
     judged = True
     if todo:
         judged = await _judge(session, llm, todo, notes, auto=auto)

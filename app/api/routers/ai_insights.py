@@ -4,6 +4,7 @@ subscription verdicts and the switches that govern them. Reads need ``read``; ev
 Errors are ``{"detail", "code"}``. The owner's own requests (search, narrative on demand) only record their LLM calls in
 ``ai_budget``; the automatic jobs live in ``app.services.ai_insights`` and are braked by it.
 """
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
@@ -37,6 +38,17 @@ class Switches(BaseModel):
     anomalies: bool | None = None
     subscriptions: bool | None = None
     tags: bool | None = None
+    month_close: bool | None = None
+    coach: bool | None = None
+
+
+class SecondOpinionBody(BaseModel):
+    """Partial update of the second opinion; ``verified_max_amount_cop: null`` goes back to twice the normal auto-approval cap."""
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None = None
+    model: str | None = Field(default=None, max_length=100)
+    min_amount_cop: Decimal | None = Field(default=None, ge=0, le=ai_features.MAX_SECOND_OPINION_AMOUNT, decimal_places=2)
+    verified_max_amount_cop: Decimal | None = Field(default=None, gt=0, le=ai_features.MAX_SECOND_OPINION_AMOUNT, decimal_places=2)
 
 
 class FeaturesBody(BaseModel):
@@ -44,6 +56,7 @@ class FeaturesBody(BaseModel):
     features: Switches | None = None
     confidence_threshold: float | None = Field(default=None, ge=ai_features.MIN_THRESHOLD, le=1)
     tags: list[str] | None = Field(default=None, max_length=ai_features.MAX_VOCABULARY)
+    second_opinion: SecondOpinionBody | None = None
 
 
 class ApplyBody(BaseModel):
@@ -120,12 +133,18 @@ async def put_ai_features(body: FeaturesBody, db: DB, principal: ReviewPrincipal
         state = await ai_features.update(
             db, features=body.features.model_dump(exclude_none=True) if body.features else None,
             confidence_threshold=body.confidence_threshold, tags=body.tags,
+            second_opinion=body.second_opinion.model_dump(exclude_unset=True) if body.second_opinion else None,
         )
+    except ai_features.SecondOpinionError as exc:
+        raise _error(422, "invalid_second_opinion", str(exc)) from exc
     except ValueError as exc:
         raise _error(422, "invalid_tags", str(exc)) from exc
     await audit.record(
         db, action="settings.ai_features", target_type="settings", target_id="ai_features", principal=principal,
-        detail={"features": state["features"], "confidence_threshold": state["confidence_threshold"], "tags": state["tags"]},
+        detail={
+            "features": state["features"], "confidence_threshold": state["confidence_threshold"], "tags": state["tags"],
+            "second_opinion": state["second_opinion"],
+        },
     )
     await db.commit()
     return state

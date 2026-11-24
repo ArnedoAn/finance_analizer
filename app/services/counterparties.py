@@ -147,7 +147,7 @@ async def _judge(session, llm, pairs: list[tuple[dict, dict]]) -> dict[str, dict
     """LLM verdicts by pair hash for the doubtful ``pairs`` (cached ones are free; at most ``MAX_LLM_PAIRS`` new per call)."""
     cache = await _cache(session)
     todo = [(a, b) for a, b in pairs if _pair_hash(a, b) not in cache][:MAX_LLM_PAIRS]
-    if todo:
+    if todo and llm is not None:  # without a model (read-only callers) only the cached verdicts count
         usage: dict = {}
         content = {"UNTRUSTED_DATA": {"pairs": [{"i": i, "a": redact_identifiers(a["name"])[:120], "b": redact_identifiers(b["name"])[:120]} for i, (a, b) in enumerate(todo)]}, "END_UNTRUSTED_DATA": True}
         try:

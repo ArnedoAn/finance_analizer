@@ -120,6 +120,28 @@ class FireflyClient:
         """Every bill (recurring charge) as ``{id, name}``; the ledger editor resolves bills by name."""
         return [{"id": str(row["id"]), "name": row["attributes"]["name"]} for row in await self._list("bills")]
 
+    async def bills_status(self, start, end) -> list[dict]:
+        """Active bills with what Firefly expects and has matched between two dates (inclusive), read only.
+
+        ``[{id, name, amount_min, amount_max, currency, repeat_freq, pay_dates: [YYYY-MM-DD], paid_dates: [YYYY-MM-DD]}]``;
+        ``pay_dates`` are the expected charges in the period and ``paid_dates`` the dates of the transactions already
+        matched to the bill in it (Firefly fills both when ``start`` and ``end`` are sent).
+        """
+        rows = []
+        for row in await self._list("bills", start=start.isoformat(), end=end.isoformat()):
+            attrs = row.get("attributes", {})
+            if attrs.get("active") is False:
+                continue
+            paid = [str(entry.get("date", ""))[:10] for entry in attrs.get("paid_dates") or [] if isinstance(entry, dict)]
+            rows.append({
+                "id": str(row["id"]), "name": attrs.get("name", str(row["id"])),
+                "amount_min": self._decimal(attrs.get("amount_min")), "amount_max": self._decimal(attrs.get("amount_max")),
+                "currency": attrs.get("currency_code") or "COP", "repeat_freq": attrs.get("repeat_freq"),
+                "pay_dates": [str(day)[:10] for day in attrs.get("pay_dates") or []],
+                "paid_dates": [day for day in paid if day],
+            })
+        return rows
+
     async def create_budget(self, name: str) -> dict:
         """Create an active budget; returns ``{id, name}``."""
         result = await self._request("POST", "budgets", json={"name": name, "active": True})

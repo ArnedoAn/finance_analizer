@@ -15,7 +15,7 @@ Rules (see ``docs/contract-additions/ServerAiReview.md``):
 Functions flush but never commit; the caller owns the transaction.
 """
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -39,7 +39,65 @@ WEEKLY_STOP_PERCENT = 70.0
 GO_USAGE_URL = "https://opencode.ai/inference/go/v1/usage"
 GO_REFRESH = timedelta(minutes=15)
 
+# Peak hours of OpenCode Go: Monday to Friday, UTC, [start, end) in hours. In them deepseek-v4.1-flash costs twice
+# (20:00-23:00 and 01:00-05:00 in Bogota); mimo-v2.6-flash has no surcharge. Heavy automatic AI jobs wait for the valley.
+PEAK_WINDOWS_UTC = ((1, 4), (6, 10))
+PEAK_WEEKDAYS = frozenset(range(5))
+PEAK_POLICIES = ("ask", "wait", "run")
+DEFAULT_PEAK_POLICY = "ask"
+
 _refresh_lock = asyncio.Lock()
+
+
+def _clock() -> datetime:
+    """The instant ``is_peak`` and friends use when no ``now`` is given (tests replace it)."""
+    return now_utc()
+
+
+def is_peak(now: datetime | None = None) -> bool:
+    """True inside a peak window (Monday-Friday UTC, 01:00-04:00 and 06:00-10:00; the end is exclusive)."""
+    moment = (now or _clock()).astimezone(UTC)
+    minutes = moment.hour * 60 + moment.minute
+    return moment.weekday() in PEAK_WEEKDAYS and any(start * 60 <= minutes < end * 60 for start, end in PEAK_WINDOWS_UTC)
+
+
+def peak_ends_at(now: datetime | None = None) -> datetime | None:
+    """When the current peak window ends (the next valley starts), or None outside the peak."""
+    moment = (now or _clock()).astimezone(UTC)
+    if not is_peak(moment):
+        return None
+    minutes = moment.hour * 60 + moment.minute
+    end = next(end for start, end in PEAK_WINDOWS_UTC if start * 60 <= minutes < end * 60)
+    return moment.replace(hour=end, minute=0, second=0, microsecond=0)
+
+
+def next_peak_start(now: datetime | None = None) -> datetime:
+    """Start of the first peak window after ``now``."""
+    moment = (now or _clock()).astimezone(UTC)
+    for offset in range(8):
+        day = (moment + timedelta(days=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if day.weekday() not in PEAK_WEEKDAYS:
+            continue
+        for start, _ in PEAK_WINDOWS_UTC:
+            candidate = day.replace(hour=start)
+            if candidate > moment:
+                return candidate
+    raise RuntimeError("no peak window")  # unreachable: every week has weekdays
+
+
+def defer_until_offpeak(now: datetime | None = None) -> datetime | None:
+    """None when heavy automatic AI jobs may run now; otherwise the instant the valley starts (they wait until then)."""
+    until = peak_ends_at(now)
+    if until is not None:
+        logger.info("ai_deferred_to_offpeak", until=until.isoformat())
+    return until
+
+
+def peak_info(now: datetime | None = None) -> dict:
+    """``{"now": bool, "ends_at": iso | None, "next_start": iso}`` for the API."""
+    moment = now or _clock()
+    ends = peak_ends_at(moment)
+    return {"now": ends is not None, "ends_at": ends.isoformat() if ends else None, "next_start": next_peak_start(moment).isoformat()}
 
 
 def _zone() -> ZoneInfo:
@@ -67,18 +125,29 @@ async def _write_flag(session, key: str, value: dict) -> None:
 
 
 async def policy(session) -> dict:
-    """``{"daily_calls": int}``: the daily limit of AUTOMATIC calls (0 stops every automatic AI job)."""
-    stored = await _flag(session, POLICY_KEY)
-    calls = stored.get("daily_calls") if stored else None
-    if isinstance(calls, int) and not isinstance(calls, bool) and 0 <= calls <= MAX_DAILY_CALLS:
-        return {"daily_calls": calls}
-    return {"daily_calls": DEFAULT_DAILY_CALLS}
+    """``{"daily_calls": int, "peak_policy": "ask" | "wait" | "run"}``.
+
+    ``daily_calls`` is the daily limit of AUTOMATIC calls (0 stops every automatic AI job). ``peak_policy`` says what happens
+    to heavy automatic jobs that come due in the peak (see ``app.services.ai_jobs``): ``ask`` parks them and alerts once,
+    ``wait`` parks them silently until the valley, ``run`` runs them at once.
+    """
+    stored = await _flag(session, POLICY_KEY) or {}
+    calls = stored.get("daily_calls")
+    if not (isinstance(calls, int) and not isinstance(calls, bool) and 0 <= calls <= MAX_DAILY_CALLS):
+        calls = DEFAULT_DAILY_CALLS
+    mode = stored.get("peak_policy")
+    return {"daily_calls": calls, "peak_policy": mode if mode in PEAK_POLICIES else DEFAULT_PEAK_POLICY}
 
 
-async def set_policy(session, daily_calls: int) -> dict:
-    """Store the policy (the caller validates 0 <= daily_calls <= MAX_DAILY_CALLS, audits and commits)."""
-    await _write_flag(session, POLICY_KEY, {"daily_calls": int(daily_calls)})
-    return {"daily_calls": int(daily_calls)}
+async def set_policy(session, daily_calls: int | None = None, peak_policy: str | None = None) -> dict:
+    """Store the policy; what is None keeps its current value (the caller validates, audits and commits)."""
+    current = await policy(session)
+    merged = {
+        "daily_calls": current["daily_calls"] if daily_calls is None else int(daily_calls),
+        "peak_policy": current["peak_policy"] if peak_policy is None else peak_policy,
+    }
+    await _write_flag(session, POLICY_KEY, merged)
+    return merged
 
 
 # --- Go usage -------------------------------------------------------------------------------------------------------
@@ -249,4 +318,5 @@ async def usage_report(session) -> dict:
         "allowance": allowances[-1].allowance if allowances else None,
         "throttled": reason is not None,
         "throttle_reason": reason,
+        "peak": peak_info(),
     }

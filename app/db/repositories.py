@@ -246,9 +246,12 @@ class OwnAccountRepository:
         except IntegrityError as exc:  # concurrent insert of the same name slipped past the check
             raise OwnAccountExistsError(name) from exc
 
-    async def add(self, *, firefly_account, bank, kind, last4, aliases, sources):
+    async def add(self, *, firefly_account, bank, kind, last4, aliases, sources, statement_day=None, payment_day=None):
         await self._ensure_free(firefly_account)
-        row = OwnAccountRow(firefly_account=firefly_account, bank=bank, kind=kind, last4=list(last4), aliases=list(aliases), sources=list(sources))
+        row = OwnAccountRow(
+            firefly_account=firefly_account, bank=bank, kind=kind, last4=list(last4), aliases=list(aliases), sources=list(sources),
+            statement_day=statement_day, payment_day=payment_day,
+        )
         self.session.add(row)
         await self._flush(firefly_account)
         return row

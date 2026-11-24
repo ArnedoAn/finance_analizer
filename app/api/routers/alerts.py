@@ -8,6 +8,7 @@ from app.api.dependencies import READ
 from app.api.routers.common import DB
 from app.core.timezone import now_utc
 from app.db.models_alerts import Alert
+from app.services import alert_questions
 from app.services.alerts import alert_data
 
 router = APIRouter()
@@ -24,7 +25,9 @@ async def list_alerts(
     if not include_acked:
         query = query.where(Alert.acked_at.is_(None))
     rows = (await db.scalars(query.order_by(Alert.id).limit(limit))).all()
-    return {"items": [alert_data(row) for row in rows], "last_id": rows[-1].id if rows else after_id}
+    items = [alert_data(row) for row in rows]
+    await alert_questions.attach(db, items)
+    return {"items": items, "last_id": rows[-1].id if rows else after_id}
 
 
 @router.post("/alerts/{alert_id}/ack", dependencies=[READ])

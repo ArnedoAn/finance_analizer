@@ -21,6 +21,7 @@ os.environ["FIELD_ENCRYPTION_KEY"] = base64.b64encode(os.urandom(32)).decode()
 
 from app.core.config import Settings, get_settings
 from app.db.models import Base, OwnAccountRow
+from app.db.models_flags import RuntimeFlag
 from app.parsers import Extraction
 from app.services import own_accounts
 
@@ -40,6 +41,16 @@ def settings(monkeypatch):
     yield config
     own_accounts.invalidate()
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def off_peak(monkeypatch):
+    """The suite runs in the valley (a Sunday far from any fixture date) unless a test sets its own clock: heavy automatic AI jobs would otherwise wait for it."""
+    from datetime import UTC, datetime
+
+    from app.services import ai_budget
+
+    monkeypatch.setattr(ai_budget, "_clock", lambda: datetime(2030, 1, 6, 15, 0, tzinfo=UTC))
 
 
 @pytest_asyncio.fixture
@@ -63,6 +74,9 @@ async def db(settings) -> AsyncGenerator[AsyncSession, None]:
                 firefly_account="Nequi", bank="nequi", kind="wallet", last4=["1234"], aliases=["nequi"],
                 sources=own_accounts.normalize_sources(["app:com.nequi.MobileApp", "sms:85954", "email:nequi.com.co"]),
             ))
+            # The second opinion is on by default in production; the older suites count LLM calls, so they start with it off
+            # (tests/test_quality_v4.py turns it on).
+            session.add(RuntimeFlag(key="ai_second_opinion", value={"enabled": False}))
             await session.commit()
             own_accounts.invalidate()
             yield session

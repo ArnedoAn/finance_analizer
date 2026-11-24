@@ -33,6 +33,13 @@ from app.db.models import MailAccountState
 from app.db.models_rules import Merchant, Rule
 from app.db.repositories import KnownSenderRepository
 from app.services import alerts as alerting
+from tests import (
+    contract_agent_memory,
+    contract_capture,
+    contract_quality,
+    contract_snapshots_review,
+    contract_statements_budgets,
+)
 from tests.test_ledger_v4 import FireflyLedger
 
 ADMIN = {"X-API-Key": "test-admin-key-01234567890123456789"}
@@ -82,10 +89,16 @@ def _normalize(value, started, key=None):
     return value
 
 
+# Objects whose keys are column names mapped to positions (budget import `columns`): not money.
+NON_MONEY_OBJECTS = frozenset({"columns"})
+
+
 def _assert_money_strings(name, value, key=None):
     """Money crosses the API as a two-decimal string, never as a JSON number (contract section 14)."""
     if isinstance(value, dict):
         for field, item in value.items():
+            if field in NON_MONEY_OBJECTS:
+                continue
             if field in MONEY_MAPS and isinstance(item, dict):
                 for label, amount in item.items():
                     assert isinstance(amount, str) and DECIMAL_TEXT.match(amount), f"{name}: {field}[{label}] = {amount!r}"
@@ -618,5 +631,13 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     # The dinner came back with a new id, so only the lunch edit of the bulk group can still be undone.
     group = await rec.call("undo_ledger_group", "POST", f"/ledger/groups/{bulk['group_id']}/undo", reviewer)
     assert len(group["undone"]) == 1 and len(group["failed"]) == 1, group
+
+    # -- Endpoints of the later phases: one self-contained section per area (see tests/contract_*.py) -------------------
+    env = SimpleNamespace(
+        rec=rec, client=client, service=service, db=db, clients=clients, settings=settings, monkeypatch=monkeypatch,
+        reviewer=reviewer, ids=ids, tmp_path=tmp_path,
+    )
+    for section in (contract_snapshots_review, contract_statements_budgets, contract_capture, contract_agent_memory, contract_quality):
+        await section.record(env)
 
     _finish(rec.bodies)

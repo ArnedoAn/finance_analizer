@@ -7,6 +7,7 @@ automatic (the owner's own requests only ``record``), redacts nothing itself (ca
 the usage even when the call fails. Functions flush but never commit.
 """
 import re
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -18,7 +19,7 @@ from app.services import ai_budget
 
 logger = get_logger(__name__)
 
-FEATURES = ("categorize", "narrative", "anomalies", "subscriptions", "tags")
+FEATURES = ("categorize", "narrative", "anomalies", "subscriptions", "tags", "month_close", "coach")
 FEATURES_KEY = "ai_features"
 TAGS_KEY = "ai_tags"
 DEFAULT_THRESHOLD = 0.85
@@ -26,6 +27,62 @@ MIN_THRESHOLD = 0.5
 DEFAULT_TAGS = ("viaje", "trabajo", "salud", "hogar", "mascotas", "educación", "regalos", "ocio")
 MAX_VOCABULARY = 20
 MAX_TAG_CHARS = 40
+
+SECOND_OPINION_KEY = "ai_second_opinion"
+# ``verified_max_amount_cop`` None means twice the normal auto-approval cap (see ``app.services.second_opinion.verified_cap``).
+SECOND_OPINION_DEFAULT = {"enabled": True, "model": "mimo-v2.6-flash", "min_amount_cop": "1000000.00", "verified_max_amount_cop": None}
+MAX_SECOND_OPINION_AMOUNT = Decimal("1000000000")
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}$")
+# Models that train on the owner's data or are free-tier (403 outside OpenCode) are never allowed.
+_FORBIDDEN_MODEL_SUFFIXES = ("-contributor", "-free")
+
+
+def validate_model(name) -> str:
+    """The model name, or ``ValueError`` when it is malformed or one of the forbidden families."""
+    value = name.strip() if isinstance(name, str) else ""
+    if not _MODEL_NAME.fullmatch(value) or value.casefold().endswith(_FORBIDDEN_MODEL_SUFFIXES):
+        raise ValueError("Modelo no permitido: usa un modelo sin entrenamiento con tus datos (no *-contributor ni gratuitos).")
+    return value
+
+
+class SecondOpinionError(ValueError):
+    """The second-opinion settings sent are not valid."""
+
+
+def _money(value, *, minimum: Decimal, optional: bool = False) -> str | None:
+    """Two-decimal money string within ``minimum..MAX_SECOND_OPINION_AMOUNT``; None only when ``optional`` and value is None."""
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float | str | Decimal):
+        raise ValueError("Monto no válido.")
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError("Monto no válido.") from None
+    if not amount.is_finite() or amount < minimum or amount > MAX_SECOND_OPINION_AMOUNT or amount != amount.quantize(Decimal("0.01")):
+        raise ValueError("Monto no válido.")
+    return f"{amount:.2f}"
+
+
+def normalize_second_opinion(stored) -> dict:
+    """The stored second-opinion settings with a default for every missing or invalid field."""
+    stored = stored if isinstance(stored, dict) else {}
+    result = dict(SECOND_OPINION_DEFAULT)
+    if isinstance(stored.get("enabled"), bool):
+        result["enabled"] = stored["enabled"]
+    try:
+        result["model"] = validate_model(stored.get("model"))
+    except ValueError:
+        pass
+    try:
+        result["min_amount_cop"] = _money(stored.get("min_amount_cop"), minimum=Decimal("0"))
+    except ValueError:
+        pass
+    try:
+        result["verified_max_amount_cop"] = _money(stored.get("verified_max_amount_cop"), minimum=Decimal("0.01"), optional=True)
+    except ValueError:
+        pass
+    return result
 
 
 _NUMBER = re.compile(r"\d[\d.,]*")
@@ -90,7 +147,7 @@ async def _write(session, key: str, value: dict) -> None:
 
 
 async def get(session) -> dict:
-    """``{"features": {name: bool}, "confidence_threshold": float, "tags": [str]}`` with defaults for what is not stored."""
+    """``{"features": {name: bool}, "confidence_threshold": float, "tags": [str], "second_opinion": {...}}`` with defaults for what is not stored."""
     stored = await _flag(session, FEATURES_KEY) or {}
     threshold = stored.get("confidence_threshold")
     if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not MIN_THRESHOLD <= threshold <= 1:
@@ -102,6 +159,7 @@ async def get(session) -> dict:
     return {
         "features": {name: stored.get(name) is not False for name in FEATURES},
         "confidence_threshold": float(threshold), "tags": tags,
+        "second_opinion": normalize_second_opinion(await _flag(session, SECOND_OPINION_KEY)),
     }
 
 
@@ -109,14 +167,34 @@ async def enabled(session, name: str) -> bool:
     return (await get(session))["features"][name]
 
 
-async def update(session, *, features: dict | None = None, confidence_threshold: float | None = None, tags=None) -> dict:
-    """Merge the given changes into the stored state and return the new one (the caller validates names, audits and commits)."""
+async def update(
+    session, *, features: dict | None = None, confidence_threshold: float | None = None, tags=None, second_opinion: dict | None = None,
+) -> dict:
+    """Merge the given changes into the stored state and return the new one (the caller validates names, audits and commits).
+
+    ``second_opinion`` merges field by field; ``ValueError`` for an invalid model or amount. ``verified_max_amount_cop`` None
+    in the dict goes back to the default (twice the normal cap)."""
     current = await get(session)
     merged = {**current["features"], **(features or {})}
     threshold = current["confidence_threshold"] if confidence_threshold is None else float(confidence_threshold)
+    opinion = None
+    if second_opinion:
+        wanted = {**current["second_opinion"], **second_opinion}
+        try:
+            if not isinstance(wanted["enabled"], bool):
+                raise ValueError("enabled debe ser verdadero o falso.")
+            opinion = {
+                "enabled": wanted["enabled"], "model": validate_model(wanted["model"]),
+                "min_amount_cop": _money(wanted["min_amount_cop"], minimum=Decimal("0")),
+                "verified_max_amount_cop": _money(wanted["verified_max_amount_cop"], minimum=Decimal("0.01"), optional=True),
+            }
+        except ValueError as exc:
+            raise SecondOpinionError(str(exc)) from exc
     await _write(session, FEATURES_KEY, {**merged, "confidence_threshold": threshold})
     if tags is not None:
         await _write(session, TAGS_KEY, {"tags": normalize_tags(tags)})
+    if opinion is not None:
+        await _write(session, SECOND_OPINION_KEY, opinion)
     return await get(session)
 
 

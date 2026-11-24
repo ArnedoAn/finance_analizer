@@ -31,7 +31,9 @@ from app.services import (
     ai_budget,
     ai_insights,
     ai_review,
+    alert_questions,
     audit,
+    bills,
     capture,
     descriptions,
     digest,
@@ -39,6 +41,7 @@ from app.services import (
     own_accounts,
     pse,
     rules,
+    second_opinion,
     snapshots,
     suggestions,
 )
@@ -448,6 +451,34 @@ class Processor:
             counterparty_hint=both, template_id=item.template_id or "unknown",
         )
 
+    def _prompt_text(self, item, text, subject):
+        """The only text that goes to a provider: redacted, and without a subject that is the same in every e-mail of the bank."""
+        return redact(text) if descriptions.is_generic_subject(item.sender, subject) else "\n".join([redact(subject), redact(text)])
+
+    async def _second_opinion(self, item, extraction, text, subject, cycle_id, reuse, settings):
+        """Verdict of the second model on ``extraction`` (see ``app.services.second_opinion``) or None when there is none.
+
+        ``{"status": "verified" | "disagree", "model", "fields", "reason"}``; it is stored on the item. A reevaluation keeps the
+        verdict already taken instead of asking again. Never raises: without a verdict the item keeps the normal cap.
+        """
+        prior = item.second_opinion if reuse else None
+        if isinstance(prior, dict) and prior.get("status") in {"verified", "disagree"}:
+            return prior
+        if not second_opinion.wanted(settings, item.method, extraction.amount):
+            return None
+        other = await second_opinion.ask(self.session, self.llm, self._prompt_text(item, text, subject), cycle_id or uuid4().hex, settings["model"])
+        if other is None:
+            return None
+        mine, theirs = await self._resolve(item, extraction.account_hint), await self._resolve(item, other.account_hint)
+        verdict = second_opinion.compare(
+            extraction, other, clean=_clean_merchant,
+            first_account=mine.firefly_account if mine else None, second_account=theirs.firefly_account if theirs else None,
+        )
+        verdict["model"] = settings["model"]
+        item.second_opinion = verdict
+        self.session.add(InboxEvent(inbox_id=item.id, action="second_opinion", detail=verdict["reason"] or "verified"))
+        return verdict
+
     async def _extract(self, item, cycle_id, reuse=False):
         """Extract the item and decide whether it may reach Firefly unreviewed; otherwise it becomes ``needs_review``.
 
@@ -468,6 +499,8 @@ class Processor:
             return
         await descriptions.refresh(self.session)
         text, subject, previous = item.raw_text or "", item.subject_or_title or "", item.review_reason or ""
+        if not reuse:
+            item.second_opinion = None
         extraction = parse(text, subject, item.sender or "")
         stored = None
         if extraction is not None:
@@ -481,7 +514,7 @@ class Processor:
             usage = {}
             try:
                 # A subject that is the same in every e-mail of the bank adds nothing and is not sent.
-                prompt_text = redact(text) if descriptions.is_generic_subject(item.sender, subject) else "\n".join([redact(subject), redact(text)])
+                prompt_text = self._prompt_text(item, text, subject)
                 extraction = await self.llm.analyze(prompt_text, cycle_id=cycle_id or uuid4().hex, usage=usage)
             except Exception:
                 await capture.note_llm(self.session, False)
@@ -496,6 +529,7 @@ class Processor:
         if extraction.kind == "ignore":
             item.status = "ignored"
             item.review_reason = llm_reason
+            await bills.consider_ignored(self.session, item)  # an ignored e-mail that reads like a bill becomes a candidate (no commit here)
             return
         if reuse:
             # What a stored row cannot tell again (the extraction's own date, the phone's timestamp) is carried over.
@@ -510,6 +544,12 @@ class Processor:
             if extraction.summary and item.source == "email":
                 self._summaries[item.id] = extraction.summary
         reasons.extend(pse.check(subject + "\n" + text, extraction.kind))
+        opinion, opinion_settings = None, None
+        if extraction.kind != "review" and extraction.amount is not None:
+            opinion_settings = await second_opinion.config(self.session)
+            opinion = await self._second_opinion(item, extraction, text, subject, cycle_id, reuse, opinion_settings)
+            if opinion is not None and opinion["status"] == "disagree":
+                reasons.append(opinion["reason"])
         policy = await flags.policy(self.session, self.settings)
         item.amount = extraction.amount.quantize(Decimal("0.01")) if extraction.amount is not None else None
         item.currency = extraction.currency
@@ -517,7 +557,7 @@ class Processor:
             reasons.append("auto-approval disabled")
         if item.amount is None or item.amount <= 0:
             reasons.append("amount absent or invalid")
-        elif item.amount > policy["max_amount_cop"]:
+        elif item.amount > (second_opinion.verified_cap(opinion_settings, policy["max_amount_cop"]) if opinion is not None and opinion["status"] == "verified" else policy["max_amount_cop"]):
             reasons.append("amount over auto-approval limit")
         if item.currency != "COP":
             reasons.append("foreign currency requires confirmed COP amount")
@@ -684,6 +724,11 @@ class Processor:
         await self.session.commit()
         if item.status != old_status and item.status in {"created", "voided"}:
             snapshots.touch_item(item, self.settings)
+        if item.status != old_status and item.status == "created":
+            try:
+                await bills.on_item_created(self, item)  # pairs a payment with its bill; commits itself
+            except Exception as exc:
+                logger.error("bills_on_created_failed", inbox_id=item.id, error_type=type(exc).__name__)
         if item.occurred_at is None or item.created_at is None or item.created_at - item.occurred_at < HISTORIC_AGE:
             await self._announce(item, old_status)
             await self._new_charge(item, old_status, approved)
@@ -786,6 +831,15 @@ class Processor:
                 logger.error("snapshot_schedule_failed", error_type=type(exc).__name__)
             await ai_review.after_cycle(self.session, self.firefly, self.llm, self.settings)
             await ai_insights.after_cycle(self.session, self.firefly, self.llm, self.settings)
+            for name, step in (
+                ("bills", lambda: bills.after_cycle(self.session, self.firefly, self.llm, self.settings)),
+                ("alert_questions", lambda: alert_questions.after_cycle(self.session, self.settings)),
+            ):
+                try:
+                    await step()
+                except Exception as exc:
+                    await self.session.rollback()
+                    logger.error("post_cycle_step_failed", step=name, error_type=type(exc).__name__)
         return result
 
     async def alerts(self):
@@ -830,7 +884,11 @@ class Processor:
             await capture.check_mailboxes(self.session, self.settings, silence)
             await capture.check_llm(self.session, silence)
 
-        for check in (old_pending, phone_silence, budgets, key_expiring, backup_failed, month_close, report_alerts, anomaly_alerts, capture_gaps):
+        async def card_payments():
+            from app.services import cards
+            await cards.alert_check(self.session, self.firefly, today)
+
+        for check in (old_pending, phone_silence, budgets, key_expiring, backup_failed, month_close, report_alerts, anomaly_alerts, capture_gaps, card_payments):
             try:
                 await check()
                 await self.session.commit()

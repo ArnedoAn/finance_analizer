@@ -19,13 +19,17 @@ WEEKLY_SUBSCRIPTIONS_CRON = "30 9 * * 1"  # Mondays 09:30
 
 class SchedulerService:
     def __init__(self, run_cycle, learn_senders, run_reconcile, run_digest, run_weekly_digest, run_digest_tick,
-                 run_monthly_narrative, run_weekly_subscriptions, settings=None):
+                 run_monthly_narrative, run_weekly_subscriptions, settings=None, extra_jobs=None):
+        """``extra_jobs`` is ``{job_id: (callback, cron)}``: jobs of the other modules (AI job queue tick, forgotten
+        subscriptions, month close, coach...) scheduled in the settings timezone like the rest."""
         self.settings = settings or get_settings()
+        self.extra_jobs = dict(extra_jobs or {})
         self.callbacks = {
             "cycle": run_cycle, "sender_learning": learn_senders,
             "reconcile": run_reconcile, "digest": run_digest,
             "weekly_digest": run_weekly_digest, "digest_tick": run_digest_tick,
             "monthly_narrative": run_monthly_narrative, "weekly_subscriptions": run_weekly_subscriptions,
+            **{job_id: callback for job_id, (callback, _) in self.extra_jobs.items()},
         }
         self.scheduler = AsyncIOScheduler(timezone=self.settings.timezone)
         self._connection = None
@@ -42,6 +46,7 @@ class SchedulerService:
             ("digest_tick", DIGEST_TICK_CRON),
             ("monthly_narrative", MONTHLY_NARRATIVE_CRON),
             ("weekly_subscriptions", WEEKLY_SUBSCRIPTIONS_CRON),
+            *((job_id, cron) for job_id, (_, cron) in self.extra_jobs.items()),
         ):
             self.scheduler.add_job(
                 self._run, CronTrigger.from_crontab(cron, timezone=self.settings.timezone),

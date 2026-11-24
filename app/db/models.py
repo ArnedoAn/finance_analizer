@@ -76,6 +76,8 @@ class InboxItem(Base):
     # v4 (Phase 4 migration adds these columns): owner/assistant description and context tags.
     description: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[list[str] | None] = mapped_column(JSON)
+    # ServerQuality: verdict of the second model on the extraction, ``{"status": "verified" | "disagree", "model", "fields", "reason"}``.
+    second_opinion: Mapped[dict | None] = mapped_column(JSON)
 
 
 class MailAccountState(Base):
@@ -135,6 +137,9 @@ class OwnAccountRow(Base):
     last4: Mapped[list[str]] = mapped_column(JSON, default=list)
     aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
     sources: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # ServerQuality: credit cards only. Day of the month of the statement cut and of the payment due date (1-31, clamped to the month length).
+    statement_day: Mapped[int | None] = mapped_column(Integer)
+    payment_day: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
 
@@ -400,6 +405,252 @@ class BudgetAssignment(Base):
     note: Mapped[str | None] = mapped_column(String(60))
     model: Mapped[str | None] = mapped_column(String(100))
     month: Mapped[str] = mapped_column(String(7))
+    group_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+    applied_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+
+
+# --- ServerCapture ---
+class Receipt(Base):
+    """A photographed receipt reduced to its structured reading. The image itself is never stored.
+
+    ``data`` is the encrypted JSON of everything free-form (merchant, NIT, items, payment method, split suggestion);
+    the plain columns only hold what queries need. ``image_sha256`` (of the metadata-free bytes) makes a repeated upload
+    idempotent. ``item_id`` is the registered movement the receipt belongs to (``match_kind`` ``linked``: the owner said
+    so; ``matched``: found by amount, date and merchant). ``applied`` records what ``/receipts/{id}/apply`` did.
+    """
+    __tablename__ = "receipts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    reason: Mapped[str | None] = mapped_column(String(60))
+    image_sha256: Mapped[str] = mapped_column(String(64), unique=True)
+    item_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    match_kind: Mapped[str | None] = mapped_column(String(10))
+    total: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    receipt_date: Mapped[date | None] = mapped_column(Date())
+    model: Mapped[str | None] = mapped_column(String(100))
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    data: Mapped[str | None] = mapped_column(EncryptedText)
+    applied: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, index=True)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+
+
+class Bill(Base):
+    """A utility bill to pay (water, power, gas, internet...). ``reference`` is always masked (only the last four characters).
+
+    ``status`` is ``pending``, ``paid`` or ``overdue`` (the API also derives ``overdue`` from ``due_date`` between cycles).
+    ``paid_item_id`` is the registered payment (inbox item) that settled it, None when marked paid by hand.
+    """
+    __tablename__ = "bills"
+    __table_args__ = (UniqueConstraint("entity_key", "due_date", "amount", name="uq_bills_entity_due_amount"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity: Mapped[str] = mapped_column(String(255))
+    entity_key: Mapped[str] = mapped_column(String(255), index=True)
+    service: Mapped[str] = mapped_column(String(20))
+    reference: Mapped[str | None] = mapped_column(String(40))
+    period: Mapped[str | None] = mapped_column(String(40))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    issued_on: Mapped[date] = mapped_column(Date())
+    due_date: Mapped[date] = mapped_column(Date(), index=True)
+    status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
+    paid_item_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    source: Mapped[str] = mapped_column(String(10), default="manual")
+    source_item_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+
+
+class BillCandidate(Base):
+    """An e-mail the processor ignored as «not a transaction» that looks like a bill, waiting for the batch extraction.
+
+    ``text`` is the REDACTED subject and body, encrypted, and is erased as soon as the candidate is processed
+    (``status`` ``done``, ``skipped`` or ``failed``); the row itself is purged after ``bills.CANDIDATE_RETENTION_DAYS``.
+    """
+    __tablename__ = "bill_candidates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(Integer, unique=True)
+    sender: Mapped[str] = mapped_column(String(512), default="")
+    received_on: Mapped[date] = mapped_column(Date())
+    text: Mapped[str | None] = mapped_column(EncryptedText)
+    status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+
+
+
+# --- ServerAgent ---
+class AgentTask(Base):
+    """A long task of the server-side agent (``app.services.agent``). ``kind``: ``owner`` | ``month_close``.
+
+    ``status``: queued | deferred (waiting for the off-peak queue) | running | done | failed | cancelled. ``instruction``,
+    ``summary`` and ``report`` are encrypted (they quote the owner's data). The agent only reads and adds proposals to
+    ``batch_id`` (``proposal_batches``); it never writes to the ledger.
+    """
+    __tablename__ = "agent_tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), default="owner", index=True)
+    instruction: Mapped[str] = mapped_column(EncryptedText, default="")
+    month: Mapped[str | None] = mapped_column(String(7))
+    status: Mapped[str] = mapped_column(String(12), default="queued", index=True)
+    run_now: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto: Mapped[bool] = mapped_column(Boolean, default=False)
+    window_from: Mapped[datetime] = mapped_column(AwareDateTime())
+    window_to: Mapped[datetime] = mapped_column(AwareDateTime())
+    batch_id: Mapped[int | None] = mapped_column(ForeignKey("proposal_batches.id"))
+    job_id: Mapped[int | None] = mapped_column(Integer)
+    summary: Mapped[str | None] = mapped_column(EncryptedText)
+    report: Mapped[str | None] = mapped_column(EncryptedText)
+    error_code: Mapped[str | None] = mapped_column(String(40))
+    error: Mapped[str | None] = mapped_column(String(300))
+    max_calls: Mapped[int] = mapped_column(Integer, default=60)
+    calls_used: Mapped[int] = mapped_column(Integer, default=0)
+    steps_count: Mapped[int] = mapped_column(Integer, default=0)
+    requested_by: Mapped[str] = mapped_column(String(100), default="system")
+    device_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+
+
+class AgentStep(Base):
+    """One tool step of an ``AgentTask``: the tool, its arguments and a short summary of the result (encrypted)."""
+    __tablename__ = "agent_steps"
+    __table_args__ = (UniqueConstraint("task_id", "n", name="uq_agent_steps_task_n"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True)
+    n: Mapped[int] = mapped_column(Integer)
+    tool: Mapped[str] = mapped_column(String(40))
+    args: Mapped[dict] = mapped_column(JSON, default=dict)
+    summary: Mapped[str] = mapped_column(EncryptedText, default="")
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+
+
+class CoachTip(Base):
+    """A weekly finding of the coach (``app.services.coach``). ``kind`` is the server-defined finding type; ``useful`` is the
+    owner's feedback (None until given). ``detail``, ``suggestion`` and ``evidence`` are encrypted."""
+    __tablename__ = "coach_tips"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    week: Mapped[date] = mapped_column(Date(), index=True)
+    kind: Mapped[str] = mapped_column(String(30), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    detail: Mapped[str] = mapped_column(EncryptedText)
+    evidence: Mapped[str] = mapped_column(EncryptedText, default="[]")
+    suggestion: Mapped[str] = mapped_column(EncryptedText, default="")
+    model: Mapped[str | None] = mapped_column(String(100))
+    useful: Mapped[bool | None] = mapped_column(Boolean)
+    feedback_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+
+
+# --- ServerMemory ---
+class Memory(Base):
+    """Short Spanish note the assistant keeps about the owner (``app.services.memories``). Never holds secrets.
+
+    ``kind``: preference | fact | rule. ``origin``: owner | assistant. ``status``: active | archived.
+    ``rule_proposal`` is the structured rule the LLM proposed (``category_rule`` | ``budget_rule`` | ``alert_mute``) and
+    ``rule_ref`` points to what approving it created (``rule:<id>``, ``budget_map:<id>``, ``alert_mute:<id>``).
+    """
+    __tablename__ = "memories"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str] = mapped_column(String(300))
+    kind: Mapped[str] = mapped_column(String(10))
+    origin: Mapped[str] = mapped_column(String(10), default="owner")
+    status: Mapped[str] = mapped_column(String(10), default="active", index=True)
+    rule_proposal: Mapped[dict | None] = mapped_column(JSON)
+    rule_ref: Mapped[str | None] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+    last_used_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+
+
+class AlertMute(Base):
+    """«No avisar de X menor a Y»: ``alerts.emit`` drops an alert of ``alert_type`` (None: any mutable type) about
+    ``merchant`` (normalized, None: any) whose amount is below ``below_amount``."""
+    __tablename__ = "alert_mutes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    alert_type: Mapped[str | None] = mapped_column(String(40))
+    merchant: Mapped[str | None] = mapped_column(String(255))
+    below_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    memory_id: Mapped[int | None] = mapped_column(ForeignKey("memories.id", ondelete="SET NULL"), index=True)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+
+
+class AlertQuestion(Base):
+    """The answerable part of a ``question`` alert (one per alert; one per ``(kind, key)`` ever, so nothing is asked twice).
+
+    ``kind``: category | new_merchant | duplicate | personal. ``choices`` is ``[{id, label}]``; ``payload`` keeps what applying
+    needs. ``status``: open | answering | answered | stale (the movement changed before the owner answered).
+    """
+    __tablename__ = "alert_questions"
+    __table_args__ = (UniqueConstraint("kind", "key", name="uq_alert_questions_kind_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    alert_id: Mapped[int] = mapped_column(ForeignKey("alerts.id", ondelete="CASCADE"), unique=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    key: Mapped[str] = mapped_column(String(255))
+    item_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    choices: Mapped[list] = mapped_column(JSON, default=list)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(10), default="open", index=True)
+    answer: Mapped[str | None] = mapped_column(String(40))
+    claimed_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, index=True)
+    answered_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+
+
+# --- ServerQuality ---
+class AiJob(Base):
+    """A heavy AI job that waits for, or goes through, the queue of ``app.services.ai_jobs``.
+
+    ``status``: queued (runs on the next tick), waiting_offpeak (parked until ``run_after``, the start of the next valley, or
+    until the owner runs it), running, done, failed, cancelled. ``decided_by``: ``policy`` (``peak_policy`` or the valley decided)
+    or ``owner`` (run now / wait). ``runner_key`` names the registered runner; ``payload`` is its small JSON argument.
+    """
+    __tablename__ = "ai_jobs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(40), index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), index=True, default="queued")
+    runner_key: Mapped[str] = mapped_column(String(60))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    dedupe_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    estimated_calls: Mapped[int] = mapped_column(Integer, default=1)
+    estimated_allowance_pct: Mapped[float | None] = mapped_column(Float)
+    model: Mapped[str | None] = mapped_column(String(100))
+    run_after: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    decided_by: Mapped[str | None] = mapped_column(String(10))
+    result: Mapped[dict | None] = mapped_column(JSON)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)
+    started_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    finished_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+
+
+class AiEvent(Base):
+    """A trip or event the server detected among the registered expenses (``app.services.ai_events``): a tag proposal for a
+    block of movements. ``status``: pending (owner decides), applied (``group_id`` is the ledger group to undo), discarded,
+    stale (its movements changed). ``item_ids`` are inbox ids; ``name_source``: rule | llm."""
+    __tablename__ = "ai_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True)
+    label: Mapped[str] = mapped_column(String(40))
+    kind: Mapped[str] = mapped_column(String(10), default="trip")
+    city: Mapped[str | None] = mapped_column(String(60))
+    start_date: Mapped[date] = mapped_column(Date())
+    end_date: Mapped[date] = mapped_column(Date())
+    item_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0"))
+    name_source: Mapped[str] = mapped_column(String(10), default="rule")
+    reason: Mapped[str] = mapped_column(String(300), default="")
+    status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
     group_id: Mapped[str | None] = mapped_column(String(36), index=True)
     created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc, onupdate=now_utc)

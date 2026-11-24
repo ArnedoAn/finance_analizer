@@ -52,6 +52,14 @@ async def lifespan(app: FastAPI):
         routes.run_cycle, routes.learn_senders, routes.run_reconcile,
         routes.run_digest, routes.run_weekly_digest, routes.run_digest_tick,
         routes.run_monthly_narrative, routes.run_weekly_subscriptions, settings=settings,
+        # Jobs of the extra modules: {job_id: (callback, cron)}. Add the other executors' jobs here.
+        extra_jobs={
+            "ai_jobs_tick": (routes.run_ai_jobs_tick, "* * * * *"),  # AI job queue (peak/valley), every minute
+            "forgotten_subscriptions": (routes.run_forgotten_subscriptions, "0 10 2 * *"),  # day 2, 10:00 Bogota
+            "month_close": (routes.run_agent_month_close, "30 5 1 * *"),
+            "weekly_coach": (routes.run_weekly_coach, "0 8 * * 0"),
+            "agent_tick": (routes.run_agent_tick, "*/5 * * * *"),  # only cleans orphaned agent tasks
+        },
     )
     system._scheduler = scheduler
     if settings.scheduler_enabled:

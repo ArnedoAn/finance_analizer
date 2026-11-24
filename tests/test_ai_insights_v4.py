@@ -83,14 +83,16 @@ async def rows(db, model=AiItemSuggestion):
 async def test_ai_features_defaults_update_and_validation(client):
     first = (await client.get(f"{API}/settings/ai-features", headers=ADMIN)).json()
     assert first == {
-        "features": {"categorize": True, "narrative": True, "anomalies": True, "subscriptions": True, "tags": True},
+        "features": {"categorize": True, "narrative": True, "anomalies": True, "subscriptions": True, "tags": True, "month_close": True, "coach": True},
         "confidence_threshold": 0.85, "tags": ["viaje", "trabajo", "salud", "hogar", "mascotas", "educación", "regalos", "ocio"],
+        "second_opinion": {"enabled": False, "model": "mimo-v2.6-flash", "min_amount_cop": "1000000.00", "verified_max_amount_cop": None}
     }
     response = await client.put(f"{API}/settings/ai-features", headers=ADMIN, json={"features": {"tags": False}, "confidence_threshold": 0.9, "tags": ["Viaje ", "trabajo", "viaje"]})
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "features": {"categorize": True, "narrative": True, "anomalies": True, "subscriptions": True, "tags": False},
+        "features": {"categorize": True, "narrative": True, "anomalies": True, "subscriptions": True, "tags": False, "month_close": True, "coach": True},
         "confidence_threshold": 0.9, "tags": ["viaje", "trabajo"],
+        "second_opinion": {"enabled": False, "model": "mimo-v2.6-flash", "min_amount_cop": "1000000.00", "verified_max_amount_cop": None}
     }
     assert (await client.get(f"{API}/settings/ai-features", headers=ADMIN)).json() == response.json()
     partial = (await client.put(f"{API}/settings/ai-features", headers=ADMIN, json={"features": {"narrative": False}})).json()
@@ -673,7 +675,7 @@ async def test_after_cycle_runs_every_step_and_never_raises(db, llm, fake, setti
     await add_item(db, fake, "t1")
     llm.complete_json.side_effect = RuntimeError("down")
     result = await ai_insights.after_cycle(db, clients[0], llm, settings)
-    assert set(result) == {"categorize", "budgets", "anomalies", "subscriptions", "narrative"}
+    assert set(result) == {"categorize", "budgets", "anomalies", "subscriptions", "narrative", "events"}
     assert result["categorize"] == {"skipped": "llm"}
     clients[0].categories.side_effect = FireflyError("down")
     assert (await ai_insights.after_cycle(db, clients[0], llm, settings))["categorize"] in ({"skipped": "firefly"}, {"skipped": "nothing_to_do"})

@@ -232,3 +232,19 @@ async def test_a_mail_stored_before_the_trim_is_trimmed_when_it_is_extracted(mai
     await mailbox.session.commit()
     done = await mailbox.process(row)
     assert done.status == "created" and done.description == "Pago QR a llave ···4567"
+
+
+async def test_a_repoll_rescues_a_mail_wrongly_ignored_as_a_sensitive_code(mailbox):
+    # Before the footer trim, every Bancolombia mail was ignored as a one-time code and lost its text.
+    row = await mailbox.inbox.add(
+        source="email", source_ref="mail:primary:7:1", sender=SENDER, subject_or_title="", raw_text=None,
+        occurred_at=datetime(2026, 11, 22, 22, 50, tzinfo=UTC), status="ignored", method="sensitive_code",
+        template_id="ignore.sensitive_code", review_reason="sensitive_code",
+    )
+    await mailbox.session.commit()
+    result = await mailbox.poll_mail(since=datetime(2026, 11, 1).date(), account_name="primary")
+    assert result["requeued"] == 1 and result["duplicates"] == 0
+    await mailbox.session.refresh(row)
+    assert (row.status, row.template_id, row.subject_or_title) == ("pending", None, GENERIC)
+    done = await mailbox.process(row)
+    assert done.status == "created" and done.description == "Pago QR a llave ···4567"

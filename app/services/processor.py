@@ -217,7 +217,7 @@ class Processor:
         return item, inserted and known and not sensitive
 
     async def poll_mail(self, since=None, account_name=None):
-        result = {"queued": 0, "ignored": 0, "duplicates": 0, "needs_review": 0, "errors": {}}
+        result = {"queued": 0, "requeued": 0, "ignored": 0, "duplicates": 0, "needs_review": 0, "errors": {}}
         rules = list(await self.senders.all(False))
         rules += own_accounts.email_rules(await self._own())
         for account in self.settings.mail_accounts:
@@ -244,10 +244,16 @@ class Processor:
                         await self._announce(item, None)
                     if not inserted and auth_failed and not sensitive and item.status in {"ignored", "pending", "needs_review"}:
                         item.status, item.review_reason, item.raw_text = "needs_review", "sender_auth_failed", None
-                    if since and not inserted and trusted and not sensitive and item.status == "ignored":
+                    requeued = since and not inserted and trusted and not sensitive and item.status == "ignored"
+                    if requeued:
+                        # A repoll gives a wrongly ignored mail a fresh start: clear the extraction left by the first
+                        # pass, including the sensitive-code marker that `_extract` would otherwise honour again.
                         item.raw_text = (body or message.subject or "")[:4000]
+                        item.subject_or_title = message.subject
                         item.status, item.method, item.review_reason = "pending", None, message.error
-                    result["duplicates" if not inserted else "needs_review" if item.status == "needs_review" else "queued" if item.status == "pending" else "duplicates" if item.status == "duplicate" else "ignored"] += 1
+                        if item.template_id == "ignore.sensitive_code":
+                            item.template_id = None
+                    result["requeued" if requeued else "duplicates" if not inserted else "needs_review" if item.status == "needs_review" else "queued" if item.status == "pending" else "duplicates" if item.status == "duplicate" else "ignored"] += 1
                 state.uidvalidity, state.last_uid = str(validity), highwater
                 state.last_error, state.consecutive_failures = None, 0
             except Exception:

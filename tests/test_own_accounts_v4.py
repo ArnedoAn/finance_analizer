@@ -156,7 +156,7 @@ async def test_sources_are_stored_normalized_without_duplicates(client):
 @pytest.mark.parametrize("changes", [
     {"last4": ["12a4"]}, {"last4": ["123"]}, {"last4": ["12345"]}, {"last4": ["1234"] * 11},
     {"aliases": [""]}, {"aliases": ["   "]}, {"aliases": ["x" * 61]}, {"aliases": ["a"] * 21},
-    {"sources": ["sms:1"] * 31}, {"kind": "loan"}, {"bank": ""}, {"bank": "b" * 61},
+    {"sources": ["sms:1"] * 31}, {"kind": "mortgage"}, {"bank": ""}, {"bank": "b" * 61},
     {"firefly_account": ""}, {"firefly_account": "f" * 256}, {"unknown": 1},
 ])
 async def test_field_limits_are_422_validation_errors(client, changes):

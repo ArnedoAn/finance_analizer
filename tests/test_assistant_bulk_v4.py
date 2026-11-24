@@ -130,27 +130,27 @@ async def test_repeating_apply_with_the_same_idempotency_key_does_not_reapply(cl
     first = (await apply(client, batch_id, ids, headers=headers)).json()
     writes = len(world.ledger.writes("update"))
     assert first["applied"] == ids and writes == 3
-    again = (await apply(client, batch_id, ids, headers=headers)).json()
-    assert again["applied"] == ids and again["failed"] == []  # the same answer the first call gave
+    again = await apply(client, batch_id, ids, headers=headers)
+    assert again.json()["run"]["id"] == first["run"]["id"] and again.json()["applied"] == ids and again.json()["failed"] == []  # the same run, not a new one
     assert len(world.ledger.writes("update")) == writes
     other = (await apply(client, batch_id, ids, headers={**ADMIN, "Idempotency-Key": "otra"})).json()
-    assert other["applied"] == [] and other["failed"] == [] and len(world.ledger.writes("update")) == writes
+    assert other["run"]["id"] != first["run"]["id"] and other["applied"] == ids and other["failed"] == []  # a new run: what is applied already counts, nothing is written
+    assert len(world.ledger.writes("update")) == writes
     plain = (await apply(client, batch_id, ids)).json()
-    assert plain["applied"] == [] and len(world.ledger.writes("update")) == writes
+    assert plain["applied"] == ids and len(world.ledger.writes("update")) == writes
     assert {p["status"] for p in plain["batch"]["proposals"]} == {"applied"}
 
 
-async def test_a_retry_under_the_same_key_finishes_what_failed_and_reports_everything(client, service, world):
+async def test_a_retry_under_a_new_key_finishes_what_failed_and_reports_everything(client, service, world):
     first, second = world.movement(), world.movement(hours=3)
     batch_id = (await open_batch(client))["id"]
     good = await act(client, batch_id, "ledger_edit", first, {"category": "Ocio"})
     late = await act(client, batch_id, "ledger_edit", second, {"category": "Transporte"})  # not in Firefly yet
-    headers = {**ADMIN, "Idempotency-Key": "retry-1"}
-    body = (await apply(client, batch_id, [good["id"], late["id"]], headers=headers)).json()
+    body = (await apply(client, batch_id, [good["id"], late["id"]], headers={**ADMIN, "Idempotency-Key": "retry-1"})).json()
     assert body["applied"] == [good["id"]] and [row["id"] for row in body["failed"]] == [late["id"]]
     world.categories.append("Transporte")
     service.invalidate_categories()
-    body = (await apply(client, batch_id, [good["id"], late["id"]], headers=headers)).json()
+    body = (await apply(client, batch_id, [good["id"], late["id"]], headers={**ADMIN, "Idempotency-Key": "retry-2"})).json()
     assert body["applied"] == [good["id"], late["id"]] and body["failed"] == []
     assert len(world.ledger.writes("update")) == 2
 

@@ -58,7 +58,7 @@ from app.db.models import (
     StatementRow,
 )
 from app.db.models_alerts import Alert
-from app.db.models_assistant import Proposal, ProposalBatch
+from app.db.models_assistant import AssistantRun, Proposal, ProposalBatch
 from app.db.models_flags import RuntimeFlag
 from app.db.models_ledger import LedgerChange
 from app.db.models_rules import Merchant, MerchantItem, Rule
@@ -112,6 +112,7 @@ def _targets(options: ResetOptions) -> list[tuple[str, type, object | None]]:
         ("inbox_events", InboxEvent, None),
         ("agent_steps", AgentStep, None),
         ("agent_tasks", AgentTask, None),
+        ("assistant_runs", AssistantRun, None),
         ("proposal_batches", ProposalBatch, None),
         ("statement_rows", StatementRow, None),
         ("statements", Statement, None),

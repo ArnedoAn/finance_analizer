@@ -107,6 +107,49 @@ class FireflyClient:
         )
         return self._account(result["data"])
 
+    async def create_liability(
+        self, name: str, liability_type: str, rate_ea: Decimal, opening_balance: Decimal, opening_date: date,
+    ) -> dict:
+        """Create a liability account the owner owes (``POST accounts`` with ``type`` ``liability``) and return it like ``accounts()``.
+
+        This is the only explicit way the analyzer creates a non-merchant account (``create_account`` stays restricted to
+        expense/revenue merchants); the debts service is its only caller. Fields (Firefly III API v1, ``AccountStore``):
+        ``liability_type`` is ``loan`` or ``debt`` (also ``mortgage``), ``liability_direction`` ``debit`` is «I owe this debt»
+        (``credit`` would mean somebody owes the owner), ``interest`` is the percentage and ``interest_period`` ``yearly``
+        (the rate is an EA), and ``opening_balance`` goes with ``opening_balance_date`` (both or none). The opening balance
+        of a liability the owner owes is sent negative, as in the API's own example; the service reads the balance back
+        from Firefly and uses its absolute value, so the sign Firefly stores never changes what the app shows.
+        """
+        if liability_type not in {"loan", "debt"}:
+            raise PermanentError("Only loan or debt liabilities may be created")
+        result = await self._request("POST", "accounts", json={
+            "name": name, "type": "liability", "liability_type": liability_type, "liability_direction": "debit",
+            "interest": f"{rate_ea:.2f}", "interest_period": "yearly",
+            "opening_balance": f"{-abs(opening_balance):.2f}", "opening_balance_date": opening_date.isoformat(),
+            "currency_code": "COP", "active": True, "include_net_worth": True,
+        })
+        return self._account(result["data"])
+
+    async def update_account(self, account_id: str, fields: dict) -> None:
+        """Partial ``PUT accounts/{id}``; the debts service only sends ``interest`` and ``interest_period`` (a rate change)."""
+        await self._request("PUT", f"accounts/{account_id}", json=fields)
+
+    async def account_balance(self, account_id: str) -> dict | None:
+        """``{type, balance}`` of one account (``balance`` is Firefly's signed ``current_balance``) or None when it does not exist."""
+        try:
+            result = await self._request("GET", f"accounts/{account_id}")
+        except PermanentError as exc:
+            if str(exc).startswith("Firefly 404"):
+                return None
+            raise
+        attrs = result["data"]["attributes"]
+        value = attrs.get("current_balance")
+        try:
+            balance = Decimal(str(value)) if value not in (None, "") else Decimal(0)
+        except InvalidOperation:
+            balance = Decimal(0)
+        return {"type": attrs["type"], "balance": balance}
+
     async def create_transaction(self, payload: dict) -> str:
         result = await self._request(
             "POST", "transactions", json={**payload, "apply_rules": True}

@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.timezone import now_utc
@@ -59,3 +59,23 @@ class Proposal(Base):
     reverted_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
     # What applying left behind (the ledger change id that "undo batch" reverts).
     result: Mapped[Any] = mapped_column(JSON, nullable=True)
+
+
+class AssistantRun(Base):
+    """One background ``apply`` of a batch (``services/assistant_runs``); kept so a restart can tell what was left unfinished."""
+
+    __tablename__ = "assistant_runs"
+    __table_args__ = (UniqueConstraint("batch_id", "idempotency_key", name="uq_assistant_runs_batch_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("proposal_batches.id"), index=True)
+    # running | done | failed
+    status: Mapped[str] = mapped_column(String(10), default="running")
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    approved_ids: Mapped[list] = mapped_column(JSON, default=list)
+    applied: Mapped[list] = mapped_column(JSON, default=list)
+    # ``[{"id", "detail"}]``
+    failed: Mapped[list] = mapped_column(JSON, default=list)
+    # Proposals the request discarded (``discard_others``); only the audit entry needs them.
+    discarded: Mapped[list] = mapped_column(JSON, default=list)
+    started_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    finished_at: Mapped[datetime | None] = mapped_column(AwareDateTime())

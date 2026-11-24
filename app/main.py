@@ -14,7 +14,7 @@ from app.core.config import get_settings
 from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger, setup_logging
 from app.db.database import close_db, get_db_session, init_db
-from app.services import own_accounts, snapshots
+from app.services import assistant_runs, own_accounts, snapshots
 from app.services.processor import Processor
 from app.services.scheduler import SchedulerService
 
@@ -44,6 +44,8 @@ async def lifespan(app: FastAPI):
     async with get_db_session() as db:
         await own_accounts.seed(db, settings)
     async with get_db_session() as db:
+        await assistant_runs.recover_orphans(db)  # a run that was working when the previous process died
+    async with get_db_session() as db:
         try:
             await Processor(db, get_firefly(), get_llm()).sync(force=True)
         except FinanceAnalyzerError:
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
             "month_close": (routes.run_agent_month_close, "30 5 1 * *"),
             "weekly_coach": (routes.run_weekly_coach, "0 8 * * 0"),
             "agent_tick": (routes.run_agent_tick, "*/5 * * * *"),  # only cleans orphaned agent tasks
+            "fx_trm": (routes.run_fx_trm, "0 8 * * *"),  # official TRM (datos.gov.co), daily 08:00 Bogota
         },
     )
     system._scheduler = scheduler
@@ -71,6 +74,7 @@ async def lifespan(app: FastAPI):
             await scheduler.shutdown()
         finally:
             system._scheduler = None
+            await assistant_runs.shutdown()  # before the clients and the database go away
             await snapshots.disable()
             await error_log.uninstall()
             await cleanup_clients()

@@ -21,9 +21,11 @@ from app.api.routers import (
     cards,
     catalog,
     counterparties,
+    debts,
     devices,
     digest,
     errors,
+    finance_plan,
     history,
     inbox,
     ingest,
@@ -47,7 +49,7 @@ from app.api.routers import (
 )
 from app.core.config import get_settings
 from app.db.database import get_db_session
-from app.services import agent, ai_forgotten, coach
+from app.services import agent, ai_forgotten, coach, fx
 from app.services import ai_insights as insights_service
 from app.services import ai_jobs as ai_jobs_service
 from app.services.processor import Processor
@@ -57,6 +59,7 @@ for module in (
     system, ingest, devices, history, inbox, alerts, assistant, reports, catalog, widgets, ledger, own_accounts,
     ai, counterparties, statements, snapshots, digest, errors, ai_insights, maintenance, budgets,
     ai_jobs, ai_events, cards, agent_router, simulate, coach_router, receipts, bills_router, memories, alert_questions,
+    debts, finance_plan,
 ):
     router.include_router(module.router)
 
@@ -121,3 +124,9 @@ async def run_weekly_coach():
 
 async def run_agent_tick():
     return await agent.run_tick(get_firefly(), get_llm(), get_settings())
+
+
+async def run_fx_trm():
+    """Daily: store the latest TRM rates so USD movements convert from the cache (a failure leaves the cache serving)."""
+    async with get_db_session() as db:
+        return await fx.refresh(db, get_settings())

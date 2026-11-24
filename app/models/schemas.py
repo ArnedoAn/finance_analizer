@@ -84,7 +84,7 @@ class HistorySmsBatch(BaseModel):
     items: list[HistorySms] = Field(min_length=1, max_length=200)
 
 
-OwnAccountKind = Literal["savings", "checking", "credit", "wallet", "pocket", "cash"]
+OwnAccountKind = Literal["savings", "checking", "credit", "wallet", "pocket", "cash", "loan"]
 _Last4 = Annotated[str, StringConstraints(pattern=r"^[0-9]{4}$")]
 _Alias = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
 _CardDay = Annotated[int, Field(ge=1, le=31, strict=True)]

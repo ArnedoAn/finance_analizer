@@ -33,9 +33,11 @@ from app.db.models import MailAccountState
 from app.db.models_rules import Merchant, Rule
 from app.db.repositories import KnownSenderRepository
 from app.services import alerts as alerting
+from app.services import assistant_runs
 from tests import (
     contract_agent_memory,
     contract_capture,
+    contract_finance_plan,
     contract_quality,
     contract_snapshots_review,
     contract_statements_budgets,
@@ -484,9 +486,27 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     risky = await rec.call(None, "POST", f"{batch_url}/proposals", reviewer, status=201, json={"target_id": ids.d1_second.id, "field": "void", "new_value": None, "reason": "Es el mismo cobro que avisó el SMS"})
     assert risky["risky"] is True
     approved = [first["id"], second["id"], third["id"]]
-    applied = await rec.call("apply_batch", "POST", f"{batch_url}/apply", reviewer, json={"approved_ids": approved})
-    assert applied["applied"] == approved and applied["failed"] == [], applied
-    await rec.call("get_batch", "GET", batch_url, reviewer)
+    # Firefly answers slowly: the apply is accepted at once (202, run still "running"), a second approval is refused (409) and
+    # the GET shows the finished run once Firefly is done.
+    inside, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow_firefly(*args, **kwargs):
+        inside.set()
+        await gate.wait()
+
+    firefly.update_transaction.side_effect = slow_firefly
+    accepted = await rec.call(
+        "apply_batch", "POST", f"{batch_url}/apply", {**reviewer, "Idempotency-Key": "apply-contract-1"}, status=202, json={"approved_ids": approved},
+    )
+    assert accepted["run"]["status"] == "running" and accepted["run"]["approved_ids"] == approved and accepted["run"]["pending"] == approved, accepted
+    await asyncio.wait_for(inside.wait(), 5)
+    refused = await rec.error("error_409_apply_running", "POST", f"{batch_url}/apply", {**reviewer, "Idempotency-Key": "apply-contract-2"}, 409, "apply_running", json={"approved_ids": approved})
+    assert refused["run"]["id"] == accepted["run"]["id"] and refused["run"]["status"] == "running"
+    gate.set()
+    await assistant_runs.wait_idle()
+    firefly.update_transaction.side_effect = None
+    shown = await rec.call("get_batch", "GET", batch_url, reviewer)
+    assert shown["run"]["status"] == "done" and shown["run"]["applied"] == approved and shown["run"]["failed"] == [], shown["run"]
     reverted = await rec.call("revert_batch", "POST", f"{batch_url}/revert", reviewer)
     assert sorted(reverted["reverted"]) == sorted(approved) and reverted["failed"] == [], reverted
 
@@ -658,7 +678,10 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
         rec=rec, client=client, service=service, db=db, clients=clients, settings=settings, monkeypatch=monkeypatch,
         reviewer=reviewer, ids=ids, tmp_path=tmp_path,
     )
-    for section in (contract_snapshots_review, contract_statements_budgets, contract_capture, contract_agent_memory, contract_quality):
+    for section in (
+        contract_snapshots_review, contract_statements_budgets, contract_capture, contract_agent_memory, contract_quality,
+        contract_finance_plan,
+    ):
         await section.record(env)
 
     _finish(rec.bodies)

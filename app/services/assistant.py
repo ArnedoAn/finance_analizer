@@ -1,9 +1,9 @@
 """Assistant batches: fixed-window proposals, apply and revert (contract sections 9 and 14).
 
-Creating a proposal never touches the ledger. ``apply`` and ``revert`` go through the normal
-review path (``Processor.review`` / ``Processor.manual``), so Firefly writes, validation and the
-audit trail are identical to a manual correction. Functions commit their own work; ``apply`` and
-``revert`` report per-proposal failures instead of aborting the whole batch.
+Creating a proposal never touches the ledger. ``apply_proposals`` (run in the background by ``assistant_runs``) and
+``revert`` go through the normal review path (``Processor.review`` / ``Processor.manual``), so Firefly writes,
+validation and the audit trail are identical to a manual correction. Functions commit their own work; apply and
+revert report per-proposal failures instead of aborting the whole batch.
 """
 from datetime import UTC, timedelta
 from decimal import Decimal
@@ -24,7 +24,7 @@ from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger
 from app.core.timezone import now_utc
 from app.db.models import InboxEvent, InboxItem
-from app.db.models_assistant import Audit, Proposal, ProposalBatch
+from app.db.models_assistant import AssistantRun, Proposal, ProposalBatch
 from app.models.schemas import ManualTransaction
 from app.services import assistant_actions as actions
 from app.services import audit, ledger
@@ -38,6 +38,8 @@ MAX_SPLIT_PARTS = 20
 REVERT_WINDOW = timedelta(days=7)
 # An ``applying`` proposal older than this lost its worker (crash, cancelled request) and may be claimed again.
 CLAIM_TIMEOUT = timedelta(minutes=10)
+# What a proposal says when an apply was cut short (cancelled, server restarted); it can be approved again.
+INTERRUPTED = "Se interrumpió antes de terminar; aplica de nuevo"
 EDIT_FIELDS = frozenset({"category", "merchant", "description", "firefly_account", "destination_account", "occurred_at", "amount", "transaction_type", "tags"})
 ALLOWED_FIELDS = EDIT_FIELDS | {"void", "split"}
 RISKY_FIELDS = frozenset({"amount", "void", "split", "transaction_type", "firefly_account", "destination_account", "occurred_at"})
@@ -408,29 +410,19 @@ async def _apply_one(processor, proposal_id: int, principal, *, resumed: bool):
     await session.commit()
 
 
-async def _applied_under(session, batch_id: int, key: str) -> list[int]:
-    """Ids earlier ``apply`` calls on this batch applied under the same ``Idempotency-Key`` (kept in the audit detail)."""
-    query = select(Audit).where(Audit.action == "assistant.apply", Audit.target_type == "batch", Audit.target_id == str(batch_id)).order_by(Audit.id)
-    details = [row.detail or {} for row in await session.scalars(query)]
-    return [pid for detail in details if detail.get("idempotency_key") == key for pid in detail.get("applied", [])]
+async def active_run(session, batch_id: int) -> AssistantRun | None:
+    """The batch's run that is still ``running`` (at most one), if any."""
+    query = select(AssistantRun).where(AssistantRun.batch_id == batch_id, AssistantRun.status == "running").limit(1).execution_options(populate_existing=True)
+    return await session.scalar(query)
 
 
-async def apply(session, processor, batch_id: int, *, approved_ids: list[int], discard_others: bool, principal, idempotency_key: str | None = None):
-    """Apply the approved proposals through the normal review path.
+async def prepare_apply(session, batch_id: int, *, approved_ids: list[int], discard_others: bool) -> list[int]:
+    """Validate an ``apply`` request and return the approved ids in the order they run.
 
-    Returns ``(applied, failed)``: ids applied by this call and ``[{"id", "detail"}]`` for the rest.
-    Each proposal is claimed with an atomic ``proposed|failed -> applying`` update and becomes ``applied``
-    only after all its work finished, so concurrent or repeated requests never run it twice. Proposals
-    that are already applied are ignored, which makes retries safe. A retry with the same ``idempotency_key``
-    also reports what the earlier calls under that key applied (as long as it is still applied).
-
-    Phases run in order (creations, renames and limits, everything else, deletions) and proposals run one at a
-    time on purpose: every one writes Firefly and then the single ``AsyncSession`` (claim, ledger change, audit,
-    commit), and the ledger/category services interleave both, so running them concurrently would share that
-    session between tasks. Firefly latency is what a batch pays, and the app waits 180 s for it.
+    Phases run in order (creations, renames and limits, everything else, deletions); the order of ``approved_ids``
+    does not matter. Nothing is changed here: the work happens in ``apply_proposals``.
     """
     batch = await get_batch(session, batch_id)
-    prior = await _applied_under(session, batch_id, idempotency_key) if idempotency_key else []
     ids = list(dict.fromkeys(approved_ids))
     if not ids and not discard_others:
         raise AssistantError(422, "validation_error", "approved_ids is empty")
@@ -444,37 +436,10 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
     ids.sort(key=lambda pid: actions.rank(known[pid].field))
     if batch.status in {"reverted", "discarded"}:
         raise AssistantError(409, "conflict", f"Batch is {batch.status}")
-    applied, failed = [], []
-    for pid in ids:
-        proposal = await session.get(Proposal, pid, populate_existing=True)
-        if proposal.status == "applied":
-            continue
-        if proposal.status in {"discarded", "reverted"}:
-            failed.append({"id": pid, "detail": f"Proposal is {proposal.status}"})
-            continue
-        resumed = proposal.status == "applying"
-        if not await _claim(session, pid):
-            status = (await session.get(Proposal, pid, populate_existing=True)).status
-            if status != "applied":
-                failed.append({"id": pid, "detail": "Proposal is being applied by another request" if status == "applying" else f"Proposal is {status}"})
-            continue
-        try:
-            await _apply_one(processor, pid, principal, resumed=resumed)
-        except Exception as exc:
-            logger.warning("assistant_apply_failed", proposal_id=pid, error_type=type(exc).__name__)
-            detail = _public_error(exc)
-            await _fail(session, Proposal, pid, status="failed", error=detail, applied_at=None)
-            failed.append({"id": pid, "detail": detail})
-        else:
-            applied.append(pid)
-    batch = await _lock_batch(session, batch_id)
-    proposals = await proposals_of(session, batch_id)
-    discarded = []
-    if discard_others:
-        for proposal in proposals:
-            if proposal.id not in ids and proposal.status in {"proposed", "failed"}:
-                proposal.status = "discarded"
-                discarded.append(proposal.id)
+    return ids
+
+
+def _refresh_status(batch, proposals: list[Proposal]) -> None:
     statuses = {proposal.status for proposal in proposals}
     first = min((proposal.applied_at for proposal in proposals if proposal.status == "applied"), default=None)
     if first is not None and batch.applied_at is None:
@@ -483,13 +448,79 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
         batch.status = "partially_applied" if statuses & {"proposed", "failed", "applying"} else "applied"
     elif statuses == {"discarded"}:
         batch.status = "discarded"
-    detail = {"applied": applied, "failed": [entry["id"] for entry in failed], "discarded": discarded}
-    if idempotency_key:
-        detail["idempotency_key"] = idempotency_key
-    await audit.record(session, action="assistant.apply", target_type="batch", target_id=batch.id, detail=detail, principal=principal)
-    live = {proposal.id for proposal in proposals if proposal.status == "applied"}
+
+
+async def discard_rest(session, batch_id: int, keep: list[int]) -> list[int]:
+    """``discard_others``: whatever is still ``proposed`` or ``failed`` and not in ``keep`` is discarded (the request does this, not the run)."""
+    batch = await _lock_batch(session, batch_id)
+    proposals = await proposals_of(session, batch_id)
+    discarded = []
+    for proposal in proposals:
+        if proposal.id not in keep and proposal.status in {"proposed", "failed"}:
+            proposal.status = "discarded"
+            discarded.append(proposal.id)
+    _refresh_status(batch, proposals)
     await session.commit()
-    return [pid for pid in dict.fromkeys([*prior, *applied]) if pid in live], failed
+    return discarded
+
+
+async def finish_batch(session, batch_id: int) -> None:
+    """Recompute the batch's status and revert deadline from its proposals; the caller commits."""
+    batch = await _lock_batch(session, batch_id)
+    _refresh_status(batch, await proposals_of(session, batch_id))
+
+
+async def _fail_interrupted(session, proposal_id: int) -> None:
+    try:
+        await _fail(session, Proposal, proposal_id, status="failed", error=INTERRUPTED, applied_at=None)
+    except Exception:
+        logger.error("assistant_apply_unmark_failed", proposal_id=proposal_id)
+
+
+async def apply_proposals(processor, ids: list[int], principal, record) -> None:
+    """Apply the approved proposals one by one through the normal review path (the body of a background run).
+
+    ``record(proposal_id, error)`` is awaited after each one (``error`` is None when it ended up applied), so the run's
+    progress is visible while the rest still works. Each proposal is claimed with an atomic ``proposed|failed -> applying``
+    update and becomes ``applied`` only after all its work finished, so concurrent or repeated requests never run it twice.
+    Proposals that are already applied count as applied, which makes retries safe. One that has already been attempted
+    (``failed``, or ``applying`` with an expired claim) is *resumed*: when its effect already reached Firefly it ends
+    ``applied`` instead of colliding with its own change as «stale».
+
+    Proposals run one at a time on purpose: every one writes Firefly and then the single ``AsyncSession`` (claim, ledger
+    change, audit, commit), and the ledger/category services interleave both, so running them concurrently would share
+    that session between tasks. A cancellation (shutdown) leaves the current proposal ``failed``, never ``applying``,
+    and propagates.
+    """
+    session = processor.session
+    for pid in ids:
+        proposal = await session.get(Proposal, pid, populate_existing=True)
+        if proposal.status == "applied":
+            await record(pid, None)
+            continue
+        if proposal.status in {"discarded", "reverted"}:
+            await record(pid, f"Proposal is {proposal.status}")
+            continue
+        resumed = proposal.status in {"applying", "failed"}
+        if not await _claim(session, pid):
+            status = (await session.get(Proposal, pid, populate_existing=True)).status
+            if status == "applied":
+                await record(pid, None)
+            else:
+                await record(pid, "Proposal is being applied by another request" if status == "applying" else f"Proposal is {status}")
+            continue
+        try:
+            await _apply_one(processor, pid, principal, resumed=resumed)
+        except Exception as exc:
+            logger.warning("assistant_apply_failed", proposal_id=pid, error_type=type(exc).__name__)
+            detail = _public_error(exc)
+            await _fail(session, Proposal, pid, status="failed", error=detail, applied_at=None)
+            await record(pid, detail)
+        except BaseException:
+            await _fail_interrupted(session, pid)
+            raise
+        else:
+            await record(pid, None)
 
 
 async def _recreate(processor, item, client_ref: str, principal):
@@ -547,11 +578,13 @@ async def revert(session, processor, batch_id: int, *, principal):
     """Restore the values saved by ``apply`` (newest first), each within 7 days of its own ``applied_at``.
 
     Returns ``(reverted, failed)`` like ``apply``; proposals past their window are reported in ``failed``.
-    Reverting a reverted batch is a no-op.
+    Reverting a reverted batch is a no-op; while a background apply is running the batch cannot be reverted (409 ``apply_running``).
     """
     batch = await get_batch(session, batch_id)
     if batch.status == "reverted":
         return [], []
+    if await active_run(session, batch_id) is not None:
+        raise AssistantError(409, "apply_running", "The batch is still being applied; wait for it to finish")
     applied = [proposal for proposal in await proposals_of(session, batch.id) if proposal.status == "applied" and actions.revertible(proposal)]
     if not applied:
         raise AssistantError(409, "conflict", "The batch has nothing to revert")

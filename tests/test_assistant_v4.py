@@ -9,6 +9,7 @@ from app.core.exceptions import FireflyError, PermanentError
 from app.core.timezone import now_utc
 from app.db.models_assistant import Proposal
 from app.db.models_devices import Device
+from app.services import assistant_runs
 
 ADMIN = {"X-API-Key": "test-admin-key-01234567890123456789"}
 PHONE = {"X-API-Key": "test-phone-key-01234567890123456789"}
@@ -52,8 +53,32 @@ async def proposal_id(client, batch_id, target_id, field, new_value=None, header
     return response.json()["id"]
 
 
-async def apply(client, batch_id, ids, headers=ADMIN, **extra):
+class Settled:
+    """What ``apply`` answers once the background run ended: ``{batch, run, applied, failed}`` (the last two are the run's)."""
+
+    status_code = 200
+
+    def __init__(self, body):
+        self.body, self.text = body, json.dumps(body, default=str)
+
+    def json(self):
+        return self.body
+
+
+async def start_apply(client, batch_id, ids, headers=ADMIN, **extra):
     return await client.post(f"{API}/{batch_id}/apply", headers=headers, json={"approved_ids": ids, **extra})
+
+
+async def apply(client, batch_id, ids, headers=ADMIN, **extra):
+    """Approve and wait for the run: a request that is not accepted (422, 403...) is returned as is."""
+    response = await start_apply(client, batch_id, ids, headers, **extra)
+    if response.status_code not in {200, 202}:
+        return response
+    await assistant_runs.wait_idle()
+    batch = (await client.get(f"{API}/{batch_id}", headers=headers)).json()
+    run = batch["run"]
+    assert run["id"] == response.json()["run"]["id"] and run["status"] in {"done", "failed"}, run
+    return Settled({"batch": batch, "run": run, "applied": run["applied"], "failed": run["failed"]})
 
 
 async def audit_actions(client):
@@ -208,7 +233,7 @@ async def test_apply_is_idempotent(client, service, clients):
     pid = await proposal_id(client, batch_id, item.id, "description", "Mercado")
     assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
     second = await apply(client, batch_id, [pid])
-    assert second.status_code == 200 and second.json()["applied"] == [] and second.json()["failed"] == []
+    assert second.status_code == 200 and second.json()["applied"] == [pid] and second.json()["failed"] == []  # already applied counts as applied
     assert second.json()["batch"]["status"] == "applied"
     clients[0].update_transaction.assert_awaited_once()
 
@@ -374,7 +399,7 @@ async def test_split_creates_deterministic_children_and_revert_restores_the_orig
     children = [await service.inbox.by_ref(f"manual:split:{pid}:{n}") for n in (1, 2)]
     assert [c.status for c in children] == ["created", "created"] and [c.amount for c in children] == [Decimal("20000.00"), Decimal("30000.00")]
 
-    assert (await apply(client, batch_id, [pid])).json()["applied"] == []
+    assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
     assert firefly.create_transaction.await_count == 2
 
     reverted = await client.post(f"{API}/{batch_id}/revert", headers=ADMIN)
@@ -484,7 +509,7 @@ async def test_audit_trail_and_endpoint(client, service):
 
     only = (await client.get("/api/v1/audit", headers=ADMIN, params={"action": "assistant.apply"})).json()
     assert only["total"] == 1 and only["items"][0]["target_id"] == str(batch_id)
-    assert only["items"][0]["detail"] == {"applied": [pid], "failed": [], "discarded": []}
+    assert only["items"][0]["detail"] == {"run_id": only["items"][0]["detail"]["run_id"], "status": "done", "applied": [pid], "failed": [], "discarded": []}
     created = (await client.get("/api/v1/audit", headers=ADMIN, params={"action": "assistant.batch_created"})).json()["items"][0]
     assert created["detail"]["instruction_length"] == len("top secret instruction")
 
@@ -503,13 +528,13 @@ async def test_a_proposal_is_applying_during_the_work_and_applied_only_after(cli
     batch_id = (await open_batch(client))["id"]
     pid = await proposal_id(client, batch_id, item.id, "description", "Mercado")
     seen = []
-    original = service.review
+    original = type(service).review
 
-    async def spy(target, action, *args, **kwargs):
+    async def spy(target_service, target, action, *args, **kwargs):
         seen.append((await db.get(Proposal, pid, populate_existing=True)).status)
-        return await original(target, action, *args, **kwargs)
+        return await original(target_service, target, action, *args, **kwargs)
 
-    monkeypatch.setattr(service, "review", spy)
+    monkeypatch.setattr(type(service), "review", spy)
     assert (await apply(client, batch_id, [pid])).json()["applied"] == [pid]
     assert seen == ["applying"]
     assert (await db.get(Proposal, pid, populate_existing=True)).status == "applied"
@@ -556,7 +581,7 @@ async def test_a_stuck_applying_proposal_is_completed_by_the_next_apply(client, 
     assert clients[0].update_transaction.await_count == 1
     assert (await apply(client, batch_id, [resume])).json()["applied"] == [resume]
     assert clients[0].update_transaction.await_count == 1
-    assert (await apply(client, batch_id, [redo, resume])).json()["applied"] == []
+    assert (await apply(client, batch_id, [redo, resume])).json()["applied"] == [redo, resume]
 
 
 async def test_a_firefly_404_when_voiding_counts_as_success(client, service, clients):

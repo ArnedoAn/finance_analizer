@@ -48,9 +48,13 @@ from app.services import (
     audit,
     bills,
     capture,
+    debt_math,
+    debts,
     descriptions,
     digest,
     flags,
+    fx,
+    incomes,
     own_accounts,
     pse,
     rules,
@@ -619,6 +623,8 @@ class Processor:
         policy = await flags.policy(self.session, self.settings)
         item.amount = extraction.amount.quantize(Decimal("0.01")) if extraction.amount is not None else None
         item.currency = extraction.currency
+        if item.currency == "USD" and item.amount is not None and item.amount > 0:
+            await self._convert_foreign(item, extraction)
         if not policy["enabled"]:
             reasons.append("auto-approval disabled")
         if item.amount is None or item.amount <= 0:
@@ -658,6 +664,16 @@ class Processor:
             merchant, ambiguous = await self._unmask(item, merchant)
             if ambiguous:
                 reasons.append(COUNTERPARTY_AMBIGUOUS)
+        if item.transaction_type == "withdrawal" and not received and item.asset_account:
+            # The only place an installment becomes a payment: an outgoing movement that names an active debt (``payment_match``)
+            # is a TRANSFER from the paying account to the liability, so the debt's balance drops by itself in Firefly.
+            # Declined attempts never get here (``_ignore_declined``); masked names and ``*`` wildcards are handled by the matcher.
+            debt = await debts.payment_debt(self.session, merchant, extraction.counterparty_hint, exclude_account=item.asset_account)
+            if debt is not None:
+                item.transaction_type, item.destination_account = "transfer", debt.firefly_account
+                item.tags = [tag for tag in item.tags or [] if tag != TRANSFER_TAG]
+                merchant = merchant or debt.name
+                self.session.add(InboxEvent(inbox_id=item.id, action="debt_payment", detail=f"-> {debt.name}"[:300]))
         item.merchant = merchant or None
         pse.tag(item, subject + "\n" + text)
         if not merchant and not {"ambiguous transfer counterparty", MERCHANT_UNKNOWN} & set(reasons):
@@ -679,16 +695,130 @@ class Processor:
         else:
             item.review_reason = None
 
-    async def _split(self, item):
+    async def _convert_foreign(self, item, extraction):
+        """Convert a USD movement to COP with the TRM of its Bogota day: ``amount`` becomes COP, ``foreign_*`` keep the original.
+
+        Nothing is converted when there is no rate for that day or the days just before; the item then goes to review as before
+        («foreign currency requires confirmed COP amount»). Leaves an ``fx_converted`` event with the figures used.
+        """
+        occurred = _aware(extraction.occurred_at, self.zone) if extraction.occurred_at else item.occurred_at
+        day = extraction.date_only or occurred.astimezone(self.zone).date()
+        converted = await fx.to_cop(self.session, self.settings, item.amount, day)
+        if converted is None:
+            return
+        usd = item.amount
+        item.foreign_amount, item.foreign_currency = usd, "USD"
+        item.amount, item.currency = converted.cop, "COP"
+        detail = f"{usd:.2f} USD x {converted.rate:.2f} (TRM {converted.rate_day.isoformat()}{', anterior' if converted.stale else ''}) = {converted.cop:.2f} COP"
+        if await self.session.scalar(select(InboxEvent.id).where(InboxEvent.inbox_id == item.id, InboxEvent.action == "fx_converted", InboxEvent.detail == detail).limit(1)) is None:
+            self.session.add(InboxEvent(inbox_id=item.id, action="fx_converted", detail=detail))
+
+    async def _loan_payment(self, item):
+        """The active loan an automatic transfer pays, or None: only those are split into capital and interest."""
+        if item.source == "manual" or item.transaction_type != "transfer" or not item.destination_account:
+            return None
+        return await debts.loan_by_account(self.session, item.destination_account)
+
+    async def _split_plan(self, item, loan=None):
+        """The stored breakdown ``{debt, payment, capital, interest, insurance, expense}`` of a loan payment, or None.
+
+        With ``loan`` it is decided when missing (or when the amount changed): interest = the balance Firefly has now x the monthly
+        EA rate, rounded to the peso; insurance = the debt's fixed one; the capital is what the payment leaves (zero when it
+        does not cover them, then ``expense`` is the whole payment; an extra payment is all capital). It is stored in a
+        ``debt_payment_split`` event, so a retry or a re-import uses the same figures even though the balance has dropped since.
+        """
+        if item.amount is None:
+            return None
+        events = (await self.session.scalars(select(InboxEvent).where(InboxEvent.inbox_id == item.id, InboxEvent.action == "debt_payment_split").order_by(InboxEvent.id.desc()))).all()
+        for event in events:
+            data = json.loads(event.detail)
+            if data["payment"] == f"{item.amount:.2f}":
+                return data
+        if loan is None:
+            return None
+        interest = debt_math.peso(await debts.balance_of(self.firefly, loan) * debt_math.monthly_rate(loan.rate_ea))
+        insurance = debt_math.peso(loan.insurance_monthly or 0)
+        capital = max(Decimal(0), item.amount - interest - insurance)
+        data = {
+            "debt": loan.name, "payment": f"{item.amount:.2f}", "capital": f"{capital:.2f}", "interest": f"{interest:.2f}",
+            "insurance": f"{insurance:.2f}", "expense": f"{item.amount - capital:.2f}",
+        }
+        self.session.add(InboxEvent(inbox_id=item.id, action="debt_payment_split", detail=json.dumps(data)))
+        return data
+
+    async def _firefly_found(self, item):
+        """Firefly's id of what an item already wrote (adoption by external id), including the parts of a split loan payment."""
+        ref = "fa:" + item.source_ref
+        found = await self.firefly.find_by_external_id(ref)
+        if found or item.transaction_type != "transfer" or await self._split_plan(item) is None:
+            return found
+        return await self.firefly.find_by_external_id(ref + ":capital") or await self.firefly.find_by_external_id(ref + ":interes")
+
+    async def _interest_account(self, loan_name):
+        accounts = await self.accounts()
+        for account in accounts:
+            if account["type"] == "expense" and account["name"].casefold() == loan_name.casefold():
+                return account
+        account = await self.firefly.create_account(loan_name, "expense")
+        self._accounts.append(account)
+        return account
+
+    async def _ensure_interest(self, item, plan):
+        """The expense movement of a split loan payment (interest plus insurance), created once: its external id is ``fa:<ref>:interes``."""
+        external_id = "fa:" + item.source_ref + ":interes"
+        existing = await self.firefly.find_by_external_id(external_id)
+        if existing:
+            return str(existing)
+        loan = await debts.loan_by_account(self.session, item.destination_account)
+        label = f"Intereses y seguro · {(loan.lender if loan and loan.lender else plan['debt'])}"[:255]
+        split = {
+            "type": "withdrawal", "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": plan["expense"], "currency_code": "COP",
+            "description": f"Intereses y seguro de {plan['debt']}", "source_id": str((await self._asset(item.asset_account))["id"]),
+            "destination_id": str((await self._interest_account(label))["id"]), "external_id": external_id, "tags": ["intereses"],
+        }
+        category = next((c for c in await self.categories() if c.casefold() == "comisiones e impuestos"), None)
+        if category:
+            split["category_name"] = category
+        return str(await self.firefly.create_transaction({"apply_rules": True, "error_if_duplicate_hash": True, "transactions": [split]}))
+
+    async def _create_movements(self, item, plan):
+        """Write the item to Firefly and return the id the item keeps: the one transaction, or for a split loan payment the
+        capital transfer (the interest and insurance expense when there is no capital) followed by the expense."""
+        if plan is None:
+            return str(await self.firefly.create_transaction(await self._split(item)))
+        principal = None
+        if Decimal(plan["capital"]) > 0:
+            principal = str(await self.firefly.create_transaction(await self._split(item, Decimal(plan["capital"]), ":capital")))
+        if Decimal(plan["expense"]) > 0:
+            expense = await self._ensure_interest(item, plan)
+            principal = principal or expense
+        return principal
+
+    async def _delete_companions(self, item):
+        """Void the other movement of a split loan payment (the first one is deleted by the caller); idempotent."""
+        if await self._split_plan(item) is None:
+            return
+        for suffix in (":capital", ":interes"):
+            other = await self.firefly.find_by_external_id("fa:" + item.source_ref + suffix)
+            if other and str(other) != str(item.firefly_transaction_id):
+                try:
+                    await self.firefly.delete_transaction(str(other))
+                except PermanentError as exc:
+                    if not str(exc).startswith("Firefly 404"):
+                        raise
+
+    async def _split(self, item, amount=None, suffix=""):
         asset = await self._asset(item.asset_account)
         kind = item.transaction_type
         other = await self._asset(item.destination_account) if kind == "transfer" else await self._merchant(item.merchant, kind)
         source, destination = (other, asset) if kind in {"deposit", "refund"} else (asset, other)
         automatic = ["manual"] if item.source == "manual" else ["auto", item.source]
-        split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str(item.amount.quantize(Decimal("0.01"))), "currency_code": item.currency, "description": descriptions.title(item), "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref, "tags": automatic + [tag for tag in item.tags or [] if tag not in automatic]}
+        split = {"type": "deposit" if kind == "refund" else kind, "date": item.occurred_at.astimezone(self.zone).isoformat(), "amount": str((amount if amount is not None else item.amount).quantize(Decimal("0.01"))), "currency_code": item.currency, "description": descriptions.title(item), "source_id": str(source["id"]), "destination_id": str(destination["id"]), "external_id": "fa:" + item.source_ref + suffix, "tags": automatic + [tag for tag in item.tags or [] if tag not in automatic]}
         if item.status == "created" and not (item.description or item.subject_or_title):
             # Editing an item whose title was purged by retention: keep Firefly's description instead of overwriting it with the merchant.
             del split["description"]
+        if item.foreign_amount is not None:
+            split["foreign_amount"], split["foreign_currency_code"] = str(item.foreign_amount.quantize(Decimal("0.01"))), item.foreign_currency
         if item.category:
             split["category_name"] = item.category
         return {"apply_rules": True, "error_if_duplicate_hash": True, "transactions": [split]}
@@ -739,9 +869,12 @@ class Processor:
                     item.next_attempt_at = _now() + timedelta(seconds=5)
                     return await self._finish(item, old_status)
                 # Every attempt, even the first, adopts any externally committed result.
-                found = await self.firefly.find_by_external_id("fa:" + item.source_ref)
+                found = await self._firefly_found(item)
                 if found:
                     item.firefly_transaction_id, item.status = str(found), "created"
+                    plan = await self._split_plan(item)
+                    if plan is not None and Decimal(plan["expense"]) > 0:
+                        await self._ensure_interest(item, plan)  # a crash between the two movements leaves only the second to create
                     return await self._finish(item, old_status, approved)
                 duplicate = await self.inbox.find_duplicate(item, self.settings.dedup_window_minutes)
                 if duplicate and not approved and await pse.supersedes(self, item, duplicate):
@@ -764,10 +897,11 @@ class Processor:
                     if paused:
                         item.status, item.review_reason = "needs_review", "; ".join(paused)
                         return await self._finish(item, old_status)
+                loan = await self._loan_payment(item)
+                plan = await self._split_plan(item, loan) if loan is not None else None  # decided and stored before anything is written
                 item.status = "submitting"
                 await self.session.commit()
-                payload = await self._split(item)
-                item.firefly_transaction_id = str(await self.firefly.create_transaction(payload))
+                item.firefly_transaction_id = await self._create_movements(item, plan)
                 item.status, item.last_error, item.next_attempt_at = "created", None, None
                 # Commit before releasing the economic guard: another channel must see it.
                 return await self._finish(item, old_status, approved)
@@ -805,6 +939,8 @@ class Processor:
         if item.occurred_at is None or item.created_at is None or item.created_at - item.occurred_at < HISTORIC_AGE:
             await self._announce(item, old_status)
             await self._new_charge(item, old_status, approved)
+            if item.status == "created" and old_status != "created":
+                await incomes.on_item_created(self.session, self.firefly, self.settings, item)  # raises extra_income; never raises itself
         return item
 
     async def compact(self, item, summary=None):
@@ -1038,6 +1174,7 @@ class Processor:
                     # Already gone in Firefly (404): the void is idempotent.
                     if not str(exc).startswith("Firefly 404"):
                         raise
+                await self._delete_companions(item)
             changes["status"] = {"old": item.status, "new": "voided"}
             item.status = "voided"
             await self.compact(item)
@@ -1087,6 +1224,8 @@ class Processor:
             if action == "edit":
                 if item.status != "created":
                     raise ValueError("Only created items can be edited")
+                if await self._split_plan(item) is not None:
+                    raise ValueError("A loan payment split into capital and interest cannot be edited; void it and register it again")
                 payload = await self._split(item)
                 if "category" in corrections and not item.category:
                     # Firefly keeps the current category when the key is absent; null clears it.
@@ -1109,7 +1248,7 @@ class Processor:
         voided = []
         rows = list((await self.session.scalars(select(InboxItem).where(InboxItem.status == "created"))).all())
         for item in rows:
-            found = await self.firefly.find_by_external_id("fa:" + item.source_ref)
+            found = await self._firefly_found(item)
             if not found:
                 item.status = "voided"
                 voided.append(item.id)

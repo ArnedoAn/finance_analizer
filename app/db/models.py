@@ -78,6 +78,9 @@ class InboxItem(Base):
     tags: Mapped[list[str] | None] = mapped_column(JSON)
     # ServerQuality: verdict of the second model on the extraction, ``{"status": "verified" | "disagree", "model", "fields", "reason"}``.
     second_opinion: Mapped[dict | None] = mapped_column(JSON)
+    # A USD movement converted with the TRM of its day (``app.services.fx``): ``amount`` is then COP and these keep the original.
+    foreign_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    foreign_currency: Mapped[str | None] = mapped_column(String(10))
 
 
 class MailAccountState(Base):
@@ -153,6 +156,7 @@ Index("uq_own_accounts_firefly_account_lower", func.lower(OwnAccountRow.firefly_
 from app.db import (  # noqa: E402,F401
     models_alerts,
     models_assistant,
+    models_debts,
     models_devices,
     models_flags,
     models_ledger,

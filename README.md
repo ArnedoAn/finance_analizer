@@ -45,6 +45,7 @@ Ejemplos completos: [.env.example](.env.example) y [env.production.example](env.
 | `RAW_TEXT_RETENTION_DAYS` | 30 para todos los estados; el texto crudo se guarda cifrado (AES-GCM) mientras tanto |
 | `SCHEDULER_ENABLED`, `CYCLE_CRON` | true, `0 * * * *` |
 | `SENDER_LEARNING_CRON` | `0 3 1,15 * *` |
+| `TRM_BASE_URL`, `TRM_TIMEOUT_SECONDS` | `https://www.datos.gov.co/resource/32sa-8pi3.json` (SODA, TRM oficial), 10; el job `fx_trm` (08:00 Bogotá) la guarda en `fx_rates` |
 | `RECONCILE_CRON` | `0 4 * * *`, conciliación diaria con Firefly |
 | `FIELD_ENCRYPTION_KEY_FILE`, `BACKUP_STATUS_FILE` | Clave maestra de cifrado de campos (archivo montado) y JSON de estado del respaldo |
 | `NOTIFY_MIN_INTERVAL_MINUTES`, `PHONE_SILENCE_HOURS` | 15, 24 |
@@ -119,7 +120,19 @@ Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready` y `P
 | POST | `/rules` | Crear o actualizar una regla (`review`): `{match, pattern, category, merchant?, tags?}`; las etiquetas se suman a las del movimiento cuando la regla casa (`docs/contract-additions/AssistantActions.md`) |
 | POST | `/assistant/batches/{id}/proposals` | Proponer un cambio o acción (`read`, `201`) |
 | POST | `/assistant/batches/{id}/proposals/bulk` | 1 a 50 propuestas en una llamada (`read`): `{items:[{ok,proposal}\|{ok:false,error:{detail,code}}],created,failed}` en el mismo orden; un elemento inválido no tumba a los demás; lote cerrado `409`, inexistente `404` |
-| POST | `/assistant/batches/{id}/apply` | Aplicar propuestas aprobadas (`review`), por fases y en serie; con `Idempotency-Key` repetir no aplica dos veces |
+| POST | `/assistant/batches/{id}/apply` | Aprobar propuestas (`review`). Valida como siempre (`422`, `409`, `risky_requires_single`) y responde **`202 {run, batch}`** al instante; aplica en segundo plano, por fases y en serie. Misma `Idempotency-Key` en el mismo lote: devuelve ese run (`200`) sin aplicar de nuevo; otra clave con un run activo: `409 apply_running` con el run |
+| GET | `/assistant/batches/{id}` | Lote con sus propuestas y `run` (el del último apply, `null` si no hay): `{id, status: running\|done\|failed, approved_ids, applied, failed:[{id,detail}], pending, started_at, finished_at}`; la app lo consulta cada 1,5 s mientras `running` (`docs/contract-additions/AssistantActions.md`) |
+| POST | `/assistant/batches/{id}/revert` | Deshacer lo aplicado (`review`); `409 apply_running` mientras un apply sigue en curso |
+| GET | `/debts` | Deudas activas con el saldo leído de Firefly: `{items,total,totals:{balance,installments_monthly}}` (`read`; `docs/contract-additions/DebtsIncomes.md`) |
+| POST | `/debts` | Crear deuda (`review`, `201`): sin `firefly_account_id` crea el pasivo en Firefly y la cuenta propia (`loan`/`credit`); con él, lo vincula |
+| PUT/DELETE | `/debts/{id}` | Editar (una tasa nueva se envía al pasivo) / desactivar sin borrar el pasivo (`review`) |
+| GET | `/debts/{id}/schedule?extra_monthly=&extra_once=&extra_once_month=&mode=term\|installment` | Tabla de amortización desde el saldo, con seguro y abonos, contra la base sin abonos (`read`) |
+| POST | `/debts/plan` | Avalancha y bola de nieve con efecto bola: `{avalanche?,snowball?}` (`read`, solo cálculo) |
+| GET/POST | `/incomes` | Ingresos `{items}` (`read`) / crear (`review`, `201`) |
+| PUT/DELETE | `/incomes/{id}` | Editar / desactivar un ingreso (`review`) |
+| GET/PUT | `/settings/extra-income` | Umbral de ingreso extra en COP, por defecto 200.000 (`read` / `review`) |
+| GET | `/fx/trm?date=YYYY-MM-DD` | TRM oficial del día, con caché; sin red usa la última conocida y `stale: true` (`read`) |
+| GET | `/plan/month?month=YYYY-MM` | Ingresos esperados y recibidos, presupuesto, cuotas, disponible para abonar y sugerencia de reparto (`read`) |
 
 ### Message Mirror
 

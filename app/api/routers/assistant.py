@@ -1,17 +1,21 @@
 """Assistant batches, proposals, apply/revert and audit log (contract sections 9 and 14). Owner: Phase 4.
 
 Errors raise ``HTTPException(status, {"detail": ..., "code": ...})``; ``main.py`` renders that
-as the flat ``{"detail", "code"}`` body of contract section 14.
+as the flat ``{"detail", "code"}`` body of contract section 14. ``409 apply_running`` is the exception: it also carries the
+running ``run``, so it is answered directly.
 """
 from contextlib import contextmanager
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from app.api.dependencies import ReadPrincipal, ReviewPrincipal
 from app.api.routers.common import DB, Service, item_data
-from app.services import assistant, assistant_errors, audit
+from app.db.database import get_db_session
+from app.services import assistant, assistant_errors, assistant_runs, audit
 
 router = APIRouter()
 
@@ -70,11 +74,13 @@ def _proposal(proposal):
 
 async def _batch(db, batch):
     proposals, items = await assistant.batch_contents(db, batch)
+    run = await assistant_runs.latest(db, batch.id)
     return {
         "id": batch.id, "window": {"from": batch.window_from, "to": batch.window_to}, "instruction": batch.instruction,
         "status": batch.status, "created_at": batch.created_at, "applied_at": batch.applied_at,
         "revert_deadline": assistant.revert_deadline(batch),
         "proposals": [{**_proposal(proposal), "target": item_data(items[proposal.target_id], redacted_raw=True) if proposal.target_id is not None else None} for proposal in proposals],
+        "run": assistant_runs.public(run) if run is not None else None,
     }
 
 
@@ -121,17 +127,32 @@ async def get_batch(batch_id: int, db: DB, principal: ReadPrincipal):
         return await _batch(db, await assistant.get_batch(db, batch_id))
 
 
-@router.post("/assistant/batches/{batch_id}/apply")
+@router.post("/assistant/batches/{batch_id}/apply", status_code=202)
 async def apply_batch(
-    batch_id: int, body: ApplyBody, db: DB, service: Service, principal: ReviewPrincipal,
+    batch_id: int, body: ApplyBody, db: DB, service: Service, principal: ReviewPrincipal, response: Response,
     idempotency_key: Annotated[str | None, Header(max_length=200)] = None,
 ):
+    """Validate and answer at once ``202 {run, batch}``; the proposals are applied in the background (``assistant_runs``).
+
+    The same ``Idempotency-Key`` on the same batch answers that run again (200) without applying anything; a different key
+    while a run is ``running`` is ``409 apply_running`` with that run. ``GET /assistant/batches/{id}`` follows the run."""
     with _coded_errors():
-        applied, failed = await assistant.apply(
-            db, service, batch_id, approved_ids=body.approved_ids, discard_others=body.discard_others, principal=principal,
-            idempotency_key=idempotency_key or None,
-        )
-        return {"batch": await _batch(db, await assistant.get_batch(db, batch_id)), "applied": applied, "failed": failed}
+        try:
+            run, launch = await assistant_runs.start(
+                db, service, get_db_session, batch_id, approved_ids=body.approved_ids, discard_others=body.discard_others, principal=principal,
+                idempotency_key=idempotency_key or None,
+            )
+        except assistant_runs.ApplyRunningError as exc:
+            content = {"detail": "Ya se está aplicando este lote; espera a que termine.", "code": "apply_running", "run": assistant_runs.public(exc.run)}
+            return JSONResponse(status_code=409, content=jsonable_encoder(content))
+        try:
+            content = {"run": assistant_runs.public(run), "batch": await _batch(db, await assistant.get_batch(db, batch_id))}
+        finally:
+            if launch is not None:
+                launch()  # only after the response is composed: the run in it is the one just created
+        if launch is None:
+            response.status_code = 200
+        return content
 
 
 @router.post("/assistant/batches/{batch_id}/revert")

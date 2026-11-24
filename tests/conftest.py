@@ -2,6 +2,7 @@
 import base64
 import os
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -41,6 +42,20 @@ def settings(monkeypatch):
     yield config
     own_accounts.invalidate()
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def no_trm_network(monkeypatch):
+    """The suite never reaches datos.gov.co: the TRM client gets a transport that refuses (tests/test_fx_incomes_v4.py serves its own)."""
+    import httpx
+
+    from app.clients.trm import TrmClient
+    from app.services import fx
+
+    def refuse(request):
+        raise httpx.ConnectError("offline", request=request)
+
+    monkeypatch.setattr(fx, "new_client", lambda config: TrmClient(config.trm_base_url, config.trm_timeout_seconds, httpx.MockTransport(refuse)))
 
 
 @pytest.fixture(autouse=True)
@@ -145,9 +160,18 @@ def service(db, settings, clients, extraction, monkeypatch):
 @pytest_asyncio.fixture
 async def client(db, settings, service, monkeypatch) -> AsyncGenerator[AsyncClient, None]:
     from app.api.dependencies import _auth_failures, get_db, get_processor
+    from app.api.routers import assistant as assistant_router
     from app.api.routers import ingest, system
     from app.api.routers import own_accounts as own_accounts_router
     from app.main import app
+    from app.services import assistant_runs
+
+    @asynccontextmanager
+    async def shared_session():
+        # The background apply of the assistant works on the test's own session (as the server reset tests do).
+        yield db
+
+    monkeypatch.setattr(assistant_router, "get_db_session", shared_session)
 
     async def process_isolated(item_id):
         await service.process(await service.inbox.get(item_id))
@@ -168,6 +192,7 @@ async def client(db, settings, service, monkeypatch) -> AsyncGenerator[AsyncClie
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
             yield http
     finally:
+        await assistant_runs.shutdown()
         app.dependency_overrides.clear()
         _auth_failures.clear()
         ingest._recent_events.clear()

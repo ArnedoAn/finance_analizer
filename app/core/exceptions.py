@@ -19,3 +19,7 @@ class LLMError(FinanceAnalyzerError):
 
 class IMAPError(FinanceAnalyzerError):
     pass
+
+
+class TrmError(FinanceAnalyzerError):
+    """The official exchange-rate service (datos.gov.co) did not answer usefully."""

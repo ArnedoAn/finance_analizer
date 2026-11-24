@@ -32,7 +32,7 @@ class OwnAccount(BaseModel):
     """One entry of the OWN_ACCOUNTS seed file; the runtime model is the ``own_accounts`` table (``OwnAccountRow``)."""
     firefly_account: str = Field(min_length=1)
     bank: str
-    kind: str = Field(pattern="^(savings|checking|credit|wallet|pocket|cash)$")
+    kind: str = Field(pattern="^(savings|checking|credit|wallet|pocket|cash|loan)$")
     last4: list[str] = Field(default_factory=list)
     aliases: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     firefly_base_url: str = ""
     firefly_api_token: SecretStr = SecretStr("")
     manual_default_account: str = "Efectivo"
+    # Official TRM (datos.gov.co, SODA dataset "Tasa de Cambio Representativa del Mercado - Historico").
+    trm_base_url: str = "https://www.datos.gov.co/resource/32sa-8pi3.json"
+    trm_timeout_seconds: float = Field(default=10, gt=0)
     firefly_cache_ttl_minutes: int = Field(default=360, ge=0)
     mail_accounts: list[MailAccount] = Field(default_factory=list)
     # INITIAL SEED ONLY. At startup, if the ``own_accounts`` table is empty, these are imported once (audited as

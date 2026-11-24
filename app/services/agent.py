@@ -36,6 +36,7 @@ from app.services import (
     alerts,
     assistant,
     audit,
+    debts,
     memories,
     reports,
     snapshots,
@@ -313,6 +314,11 @@ async def _loop(session, llm, task: AgentTask, ctx: tools.ToolContext) -> str:
             steps += 1
             await _run_tool(ctx, history, steps, name, args)
         report = month_close_report(history)
+        try:
+            # Debts section: total balance, installments paid in the month and estimated interest (deterministic, from Firefly and the inbox).
+            report["debts"] = await debts.month_summary(session, ctx.firefly, ctx.settings, ctx.first, ctx.last)
+        except Exception as exc:  # the section is an extra: a Firefly outage must not stop the close
+            logger.warning("month_close_debts_unavailable", error_type=type(exc).__name__)
         task.report = json.dumps(report, ensure_ascii=False, default=str)
         await session.commit()
     kind = "month_close" if task.kind == "month_close" else "agent_task"

@@ -186,6 +186,8 @@ def test_every_table_is_deleted_reset_or_deliberately_kept():
     kept = {
         "known_senders", "cycle_runs", "own_accounts", "ai_usage", "audit", "devices", "enroll_codes", "memories", "alert_mutes",
         "mail_account_state", "rules", "merchants", "notifications", "runtime_flags",
+        # Owner configuration and cache, not movements: debts, incomes and the TRM cache survive a reset.
+        "debts", "incomes", "fx_rates",
     }
     # rules, merchants, notifications and runtime_flags are touched in part (learned rules, counters, alert keys, the digest queue).
     assert set(Base.metadata.tables) == handled | kept, set(Base.metadata.tables) ^ (handled | kept)

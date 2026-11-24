@@ -84,12 +84,14 @@ Una transferencia (`kind=transfer`) sin contraparte propia se registra como gast
 
 ## API `/api/v1`
 
-Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready` y `POST /devices/enroll`. La app usa claves por dispositivo (alcances `ingest`, `read`, `review`; `admin` implica todo); una clave `ingest` solo permite `/notifications/webhook` y `/auth/check`. `PHONE_API_KEY` es opcional y transitoria (se adopta como dispositivo `phone-legacy`). Los consumidores administrativos usan `FINANCE_API_KEY`. Tras 10 fallos 401/min por IP se limita el tráfico con claves inválidas; una clave válida no debe quedar bloqueada por esos fallos. No envíe headers de usuario/sesión. OpenAPI solo se expone en producción con `EXPOSE_DOCS=true`.
+Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready`, `POST /devices/enroll` y `GET /enroll/view/{token}` (pública a propósito: el token de un solo uso es la credencial). La app usa claves por dispositivo (alcances `ingest`, `read`, `review`; `admin` implica todo); una clave `ingest` solo permite `/notifications/webhook` y `/auth/check`. `PHONE_API_KEY` es opcional y transitoria (se adopta como dispositivo `phone-legacy`). Los consumidores administrativos usan `FINANCE_API_KEY`. Tras 10 fallos 401/min por IP se limita el tráfico con claves inválidas; una clave válida no debe quedar bloqueada por esos fallos. No envíe headers de usuario/sesión. OpenAPI solo se expone en producción con `EXPOSE_DOCS=true`.
 
 | Método | Ruta | Función |
 |---|---|---|
 | GET | `/auth/check` | `{ok:true}`, probar conexión sin efectos |
 | GET | `/health/live`, `/health/ready`, `/health` | Probes públicos live/ready; diagnóstico autenticado |
+| POST | `/devices/enroll-qr` | `admin`. Crea los dos códigos de enrolamiento y devuelve `{view_url, expires_at}` para ver el QR en el navegador (ver `docs/contract-additions/EnrollQr.md`) |
+| GET | `/enroll/view/{token}` | Pública. Página HTML con el QR de enrolamiento; `404` genérico si el enlace no existe, caducó o ya se usó |
 | POST | `/notifications/webhook` | Persistir evento; procesar en background |
 | GET | `/alerts?after_id=&limit=&include_acked=` | Avisos para la app (`read`): `{items,last_id}` en orden ascendente por `id` |
 | POST | `/alerts/{id}/ack` | Marca el aviso como visto (`read`) |

@@ -33,3 +33,17 @@ class EnrollCode(Base):
     created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
     expires_at: Mapped[datetime] = mapped_column(AwareDateTime())
     used_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+
+
+class EnrollQrView(Base):
+    """A browser view of an enrollment QR (``GET /enroll/view/{token}``): only the SHA-256 of the random view token is stored.
+
+    The two codes of the QR are derived from the token (``app.services.enroll_qr.derive_codes``) and live, hashed, in
+    ``enroll_codes``; the view works while both are unused and unexpired.
+    """
+
+    __tablename__ = "enroll_qr_views"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    expires_at: Mapped[datetime] = mapped_column(AwareDateTime())

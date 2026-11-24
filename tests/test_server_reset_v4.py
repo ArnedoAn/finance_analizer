@@ -184,7 +184,7 @@ def test_every_table_is_deleted_reset_or_deliberately_kept():
     options = server_reset.ResetOptions()
     handled = {name for name, *_ in server_reset._targets(options)} | {name for name, *_ in server_reset._updates(options)}
     kept = {
-        "known_senders", "cycle_runs", "own_accounts", "ai_usage", "audit", "devices", "enroll_codes", "memories", "alert_mutes",
+        "known_senders", "cycle_runs", "own_accounts", "ai_usage", "audit", "devices", "enroll_codes", "enroll_qr_views", "memories", "alert_mutes",
         "mail_account_state", "rules", "merchants", "notifications", "runtime_flags",
         # Owner configuration and cache, not movements: debts, incomes and the TRM cache survive a reset.
         "debts", "incomes", "fx_rates",
@@ -192,7 +192,7 @@ def test_every_table_is_deleted_reset_or_deliberately_kept():
     # rules, merchants, notifications and runtime_flags are touched in part (learned rules, counters, alert keys, the digest queue).
     assert set(Base.metadata.tables) == handled | kept, set(Base.metadata.tables) ^ (handled | kept)
     assert {"rules", "merchants", "notifications", "runtime_flags"} <= handled
-    assert not {"known_senders", "own_accounts", "audit", "devices", "memories", "alert_mutes", "ai_usage", "enroll_codes", "cycle_runs"} & handled
+    assert not {"known_senders", "own_accounts", "audit", "devices", "memories", "alert_mutes", "ai_usage", "enroll_codes", "enroll_qr_views", "cycle_runs"} & handled
 
 
 def test_cofre_movements_are_recognized_by_external_id_or_tag():

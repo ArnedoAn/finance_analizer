@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     cycle_cron: str = "0 * * * *"
     sender_learning_cron: str = "0 3 1,15 * *"
     scheduler_enabled: bool = True
+    # Public base URL (no /api/v1) that the phone reaches, e.g. https://financeapi.example. POST /devices/enroll-qr puts it in the
+    # QR link and the view URL; empty = the URL of the request (wrong behind a proxy that rewrites the host).
+    public_api_base_url: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -141,6 +144,18 @@ class Settings(BaseSettings):
             value = secret.get_secret_value() if secret is not None else None
             if value is not None and (value.casefold().startswith("replace-with") or len(set(value)) < 10):
                 raise ValueError(f"{name.upper()} must be a random key in production: no 'replace-with' placeholder and at least 10 distinct characters")
+        return self
+
+    @model_validator(mode="after")
+    def check_public_api_base_url(self):
+        from urllib.parse import urlsplit
+
+        value = self.public_api_base_url.strip().rstrip("/")
+        if value:
+            parts = urlsplit(value)
+            if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment or value.endswith("/api/v1"):
+                raise ValueError("PUBLIC_API_BASE_URL must be an http(s) base URL without /api/v1, query or fragment")
+        self.public_api_base_url = value
         return self
 
     @model_validator(mode="after")

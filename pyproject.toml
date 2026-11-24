@@ -23,6 +23,7 @@ dependencies = [
     "cryptography>=43",
     "pypdf>=5.0",
     "python-multipart>=0.0.9",
+    "segno>=1.6.6",
 ]
 
 [project.optional-dependencies]

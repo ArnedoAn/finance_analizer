@@ -1,7 +1,7 @@
 """Merchants and categorization rules (Phase 5 A6, contract section 7)."""
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, UniqueConstraint, true
+from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, UniqueConstraint, true
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.timezone import now_utc
@@ -31,6 +31,7 @@ class MerchantItem(Base):
 class Rule(Base):
     """``match`` is merchant_exact | merchant_contains | text_contains; ``source`` is manual | learned.
 
+    ``tags`` are added to the tags of every movement the rule matches (null: none).
     ``active`` is False for a learned rule the owner contradicted (it stays for the audit and for re-learning)."""
 
     __tablename__ = "rules"
@@ -43,4 +44,5 @@ class Rule(Base):
     source: Mapped[str] = mapped_column(String(10), default="manual")
     hits: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
+    tags: Mapped[list[str] | None] = mapped_column(JSON)
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())

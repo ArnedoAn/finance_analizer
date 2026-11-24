@@ -24,7 +24,7 @@ from app.core.exceptions import FinanceAnalyzerError
 from app.core.logging import get_logger
 from app.core.timezone import now_utc
 from app.db.models import InboxEvent, InboxItem
-from app.db.models_assistant import Proposal, ProposalBatch
+from app.db.models_assistant import Audit, Proposal, ProposalBatch
 from app.models.schemas import ManualTransaction
 from app.services import assistant_actions as actions
 from app.services import audit, ledger
@@ -232,6 +232,42 @@ async def add_action(session, processor, batch, *, field: str, target_ref, new_v
     return await _store(session, proposal, {"batch_id": batch.id, "target_ref": prepared.target_ref, "field": field, "risky": prepared.risky}, principal)
 
 
+async def propose(session, processor, batch, *, field: str, target_id: int | None, target_ref, new_value, reason: str, principal) -> Proposal:
+    """One proposal, either an action (``assistant_actions``) or an edit of an inbox item; shared by the single and the bulk endpoints."""
+    if field in actions.FIELDS:
+        return await add_action(session, processor, batch, field=field, target_ref=target_ref, new_value=new_value, reason=reason, principal=principal)
+    if target_id is None:
+        raise AssistantError(422, "validation_error", "target_id is required")
+    return await add_proposal(session, batch, target_id=target_id, field=field, new_value=new_value, reason=reason, principal=principal)
+
+
+async def propose_bulk(session, processor, batch_id: int, entries: list[dict | AssistantError], principal) -> list[Proposal | AssistantError]:
+    """``propose`` for each entry in order; an entry that is already an ``AssistantError`` (it failed validation) or fails here does not stop the rest.
+
+    A missing batch (404) or one that is not open (409) fails the whole call. Every ``propose`` commits its own
+    proposal, so when one fails the session is rolled back: that drops only its partial work and releases the
+    batch row lock, and nothing already created is lost (a savepoint would not survive the commit inside ``_store``).
+    Errors that are not ``AssistantError`` propagate.
+    """
+    await _open_batch(session, batch_id)
+    await session.rollback()
+    outcomes: list[int | AssistantError] = []  # a proposal id, kept apart from the object because a rollback expires it
+    for entry in entries:
+        if isinstance(entry, AssistantError):
+            outcomes.append(entry)
+            continue
+        try:
+            # Reloaded each time: a rollback expires every loaded object.
+            outcomes.append((await propose(session, processor, await get_batch(session, batch_id), **entry, principal=principal)).id)
+        except AssistantError as exc:
+            await session.rollback()
+            outcomes.append(exc)
+    ids = [outcome for outcome in outcomes if isinstance(outcome, int)]
+    query = select(Proposal).where(Proposal.id.in_(ids)).execution_options(populate_existing=True)
+    created = {proposal.id: proposal for proposal in await session.scalars(query)} if ids else {}
+    return [created[outcome] if isinstance(outcome, int) else outcome for outcome in outcomes]
+
+
 def _public_error(exc: Exception) -> str:
     if isinstance(exc, AssistantError):
         return exc.detail
@@ -372,15 +408,29 @@ async def _apply_one(processor, proposal_id: int, principal, *, resumed: bool):
     await session.commit()
 
 
-async def apply(session, processor, batch_id: int, *, approved_ids: list[int], discard_others: bool, principal):
+async def _applied_under(session, batch_id: int, key: str) -> list[int]:
+    """Ids earlier ``apply`` calls on this batch applied under the same ``Idempotency-Key`` (kept in the audit detail)."""
+    query = select(Audit).where(Audit.action == "assistant.apply", Audit.target_type == "batch", Audit.target_id == str(batch_id)).order_by(Audit.id)
+    details = [row.detail or {} for row in await session.scalars(query)]
+    return [pid for detail in details if detail.get("idempotency_key") == key for pid in detail.get("applied", [])]
+
+
+async def apply(session, processor, batch_id: int, *, approved_ids: list[int], discard_others: bool, principal, idempotency_key: str | None = None):
     """Apply the approved proposals through the normal review path.
 
     Returns ``(applied, failed)``: ids applied by this call and ``[{"id", "detail"}]`` for the rest.
     Each proposal is claimed with an atomic ``proposed|failed -> applying`` update and becomes ``applied``
     only after all its work finished, so concurrent or repeated requests never run it twice. Proposals
-    that are already applied are ignored, which makes retries safe.
+    that are already applied are ignored, which makes retries safe. A retry with the same ``idempotency_key``
+    also reports what the earlier calls under that key applied (as long as it is still applied).
+
+    Phases run in order (creations, renames and limits, everything else, deletions) and proposals run one at a
+    time on purpose: every one writes Firefly and then the single ``AsyncSession`` (claim, ledger change, audit,
+    commit), and the ledger/category services interleave both, so running them concurrently would share that
+    session between tasks. Firefly latency is what a batch pays, and the app waits 180 s for it.
     """
     batch = await get_batch(session, batch_id)
+    prior = await _applied_under(session, batch_id, idempotency_key) if idempotency_key else []
     ids = list(dict.fromkeys(approved_ids))
     if not ids and not discard_others:
         raise AssistantError(422, "validation_error", "approved_ids is empty")
@@ -433,12 +483,13 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
         batch.status = "partially_applied" if statuses & {"proposed", "failed", "applying"} else "applied"
     elif statuses == {"discarded"}:
         batch.status = "discarded"
-    await audit.record(
-        session, action="assistant.apply", target_type="batch", target_id=batch.id,
-        detail={"applied": applied, "failed": [entry["id"] for entry in failed], "discarded": discarded}, principal=principal,
-    )
+    detail = {"applied": applied, "failed": [entry["id"] for entry in failed], "discarded": discarded}
+    if idempotency_key:
+        detail["idempotency_key"] = idempotency_key
+    await audit.record(session, action="assistant.apply", target_type="batch", target_id=batch.id, detail=detail, principal=principal)
+    live = {proposal.id for proposal in proposals if proposal.status == "applied"}
     await session.commit()
-    return applied, failed
+    return [pid for pid in dict.fromkeys([*prior, *applied]) if pid in live], failed
 
 
 async def _recreate(processor, item, client_ref: str, principal):

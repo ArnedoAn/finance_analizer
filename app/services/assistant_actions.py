@@ -17,7 +17,7 @@ ledger_delete         Firefly transaction    -
 create_budget         -                      {name, amount?, month?}
 set_budget_limit      budget name            {amount, month}
 delete_budget         budget name            -
-create_rule           -                      {match, pattern, category, merchant?}
+create_rule           -                      {match, pattern, category, merchant?, tags?}
 delete_rule           rule id                -
 ====================  =====================  ==========================================================
 """
@@ -102,6 +102,7 @@ class _RuleValue(BaseModel):
     pattern: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
     category: _Name
     merchant: Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)] | None = None
+    tags: list[_Tag] | None = Field(default=None, max_length=10)
 
 
 class Prepared(NamedTuple):
@@ -326,7 +327,13 @@ async def _prepare_rule(session, proposals, field: str, target, value) -> Prepar
     if field == CREATE_RULE:
         parsed = _parse(_RuleValue, field, value)
         new = parsed.model_dump(exclude_none=True)
-        return Prepared(None, f"{parsed.pattern} → {parsed.category}", None, new, False)
+        subject = f"{parsed.pattern} → {parsed.category}"
+        if parsed.tags:
+            new["tags"] = rules.clean_tags(parsed.tags)
+            subject += f" · {', '.join(new['tags'])}"
+        else:
+            new.pop("tags", None)
+        return Prepared(None, subject[:255], None, new, False)
     ref = _target(field, target)
     _no_value(field, value)
     rule = await session.get(Rule, int(ref)) if ref.isdigit() else None
@@ -360,7 +367,10 @@ async def apply(session, processor, proposal, principal, *, resumed: bool) -> di
     elif field == DELETE_BUDGET:
         await budget_edit.delete(session, processor.firefly, ref, principal)
     elif field == CREATE_RULE:
-        await rules.add_for_owner(session, processor, match=value["match"], pattern=value["pattern"], category=value["category"], merchant=value.get("merchant"), principal=principal)
+        await rules.add_for_owner(
+            session, processor, match=value["match"], pattern=value["pattern"], category=value["category"], merchant=value.get("merchant"),
+            tags=value.get("tags"), principal=principal,
+        )
     elif field == DELETE_RULE:
         if await rules.remove_for_owner(session, int(ref), principal) is None and not resumed:
             raise AssistantError(404, "not_found", "Rule not found")

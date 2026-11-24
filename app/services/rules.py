@@ -16,6 +16,8 @@ from app.services import audit
 logger = get_logger(__name__)
 
 
+MAX_TAGS = 10
+MAX_TAG = 40
 MATCHES = ("merchant_exact", "merchant_contains", "text_contains")
 SOURCES = ("manual", "learned")
 _PRIORITY = {match: rank for rank, match in enumerate(MATCHES)}
@@ -81,7 +83,8 @@ async def _first_rule(session, name: str, text: str) -> Rule | None:
 
 async def apply(session, item) -> None:
     """Count the merchant once per item; if the item has no category, set it from the best
-    matching rule, else from the merchant's default category. Never touches status or other fields."""
+    matching rule (adding the rule's tags to the item's), else from the merchant's default category.
+    Never touches status or other fields."""
     name = merchant_name(item.merchant)
     merchant = await _count_item(session, item, name) if name else None
     if item.category:
@@ -90,6 +93,8 @@ async def apply(session, item) -> None:
     rule = await _first_rule(session, name, f"{item.subject_or_title or ''} {item.raw_text or ''}")
     if rule is not None:
         item.category = rule.category
+        if rule.tags:
+            item.tags = [*(item.tags or []), *(tag for tag in rule.tags if tag not in (item.tags or []))]
         await session.execute(
             update(Rule).where(Rule.id == rule.id).values(hits=Rule.hits + 1).execution_options(synchronize_session=False)
         )
@@ -98,10 +103,30 @@ async def apply(session, item) -> None:
         item.category = merchant.default_category
 
 
-async def create_rule(session, *, match, pattern, category, merchant=None, source="manual") -> Rule:
+def clean_tags(values) -> list[str] | None:
+    """Normalize rule tags like ``ledger._clean_tags`` (strip, drop repeats, at most 10 of 1-40 characters); ``None`` stays ``None``.
+
+    Raises ValueError.
+    """
+    if values is None:
+        return None
+    if not isinstance(values, list | tuple) or len(values) > MAX_TAGS:
+        raise ValueError(f"Rule tags must be a list of at most {MAX_TAGS} tags")
+    tags = []
+    for tag in values:
+        tag = tag.strip() if isinstance(tag, str) else ""
+        if not tag or len(tag) > MAX_TAG:
+            raise ValueError(f"Each rule tag must have between 1 and {MAX_TAG} characters")
+        if tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+async def create_rule(session, *, match, pattern, category, merchant=None, source="manual", tags=None) -> Rule:
     """Create a rule, or update the category of the existing rule with the same match and pattern.
 
-    Does not commit. Raises ValueError for an unknown ``match``/``source`` or an empty pattern or category.
+    ``tags`` (``None`` keeps the existing rule's tags; a list replaces them). Does not commit.
+    Raises ValueError for an unknown ``match``/``source``, invalid tags, or an empty pattern or category.
     """
     if match not in MATCHES:
         raise ValueError("Unknown rule match: " + str(match))
@@ -111,14 +136,17 @@ async def create_rule(session, *, match, pattern, category, merchant=None, sourc
     category = (category or "").strip()
     if not pattern or not category:
         raise ValueError("Rules require a pattern and a category")
+    tags = clean_tags(tags)
     rule = await session.scalar(select(Rule).where(Rule.match == match, Rule.pattern == pattern))
     if rule is None:
-        rule = Rule(match=match, pattern=pattern, category=category, merchant=merchant, source=source, hits=0)
+        rule = Rule(match=match, pattern=pattern, category=category, merchant=merchant, source=source, hits=0, tags=tags or None)
         session.add(rule)
     else:
         rule.category = category
         rule.active = True
         rule.merchant = merchant or rule.merchant
+        if tags is not None:
+            rule.tags = tags or None
         if source == "manual":
             rule.source = "manual"
     await session.flush()
@@ -129,10 +157,11 @@ def rule_data(rule) -> dict:
     return {
         "id": rule.id, "match": rule.match, "pattern": rule.pattern, "category": rule.category,
         "merchant": rule.merchant, "source": rule.source, "hits": rule.hits, "created_at": rule.created_at,
+        "tags": list(rule.tags or []),
     }
 
 
-async def add_for_owner(session, processor, *, match, pattern, category, merchant, principal) -> dict:
+async def add_for_owner(session, processor, *, match, pattern, category, merchant, principal, tags=None) -> dict:
     """A rule the owner chose (``POST /rules``): the category must exist in Firefly (its spelling is stored). Audits and commits.
 
     Raises ValueError("Unknown category") or the ``create_rule`` errors.
@@ -141,9 +170,12 @@ async def add_for_owner(session, processor, *, match, pattern, category, merchan
     spelled = next((name for name in await processor.categories() if name.casefold() == wanted), None)
     if spelled is None:
         raise ValueError("Unknown category")
-    rule = await create_rule(session, match=match, pattern=pattern, category=spelled, merchant=merchant)
+    rule = await create_rule(session, match=match, pattern=pattern, category=spelled, merchant=merchant, tags=tags)
     data = rule_data(rule)
-    await audit.record(session, action="rule.create", target_type="rule", target_id=rule.id, detail={"match": rule.match, "pattern": rule.pattern, "category": spelled}, principal=principal)
+    await audit.record(
+        session, action="rule.create", target_type="rule", target_id=rule.id,
+        detail={"match": rule.match, "pattern": rule.pattern, "category": spelled, "tags": data["tags"]}, principal=principal,
+    )
     await session.commit()
     return data
 

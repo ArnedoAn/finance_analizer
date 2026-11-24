@@ -421,7 +421,7 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     await rec.call("get_flags_default", "GET", "/flags", reviewer)
 
     # -- Rules and merchants ---------------------------------------------------------------------------------------------
-    rule = await rec.call("create_rule", "POST", "/rules", reviewer, status=201, json={"match": "text_contains", "pattern": "uber", "category": "Transporte"})
+    rule = await rec.call("create_rule", "POST", "/rules", reviewer, status=201, json={"match": "text_contains", "pattern": "uber", "category": "Transporte", "tags": ["taxi"]})
     rules = await rec.call("list_rules", "GET", "/rules", reviewer)
     assert len(rules["items"]) >= 2
     firefly.create_category.side_effect = lambda name: name
@@ -490,10 +490,26 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     reverted = await rec.call("revert_batch", "POST", f"{batch_url}/revert", reviewer)
     assert sorted(reverted["reverted"]) == sorted(approved) and reverted["failed"] == [], reverted
 
+    unknown_id = ids.unknown.id  # the bulk call below rolls the shared test session back, which expires loaded rows
+    # -- Assistant: proposals in bulk (an invalid element fails alone) ---------------------------------------------------
+    bulk_batch = await rec.call(
+        None, "POST", "/assistant/batches", reviewer, status=201,
+        json={"window": {"from": "2026-11-01T00:00:00+00:00", "to": "2026-11-06T23:00:00+00:00"}, "instruction": "Revisa varias categorías a la vez"},
+    )
+    bulk = await rec.call(
+        "create_proposals_bulk", "POST", f"/assistant/batches/{bulk_batch['id']}/proposals/bulk", reviewer,
+        json={"proposals": [
+            {"target_id": ids.d1_first.id, "field": "category", "new_value": "Alimentación", "reason": "TIENDA D1 vende alimentos"},
+            {"target_id": ids.history_first.id, "field": "category", "new_value": "Transporte", "reason": "Fuera de la ventana del lote"},
+            {"field": "create_category", "target_ref": None, "new_value": "Gimnasio", "reason": "Para los gastos del gimnasio"},
+        ]},
+    )
+    assert (bulk["created"], bulk["failed"]) == (2, 1) and bulk["items"][1]["error"]["code"] == "outside_window", bulk
+
     # -- Alerts, rules, flags and audit ----------------------------------------------------------------------------------
     await rec.call("ack_alert", "POST", f"/alerts/{alerts['items'][0]['id']}/ack", reviewer)
     await rec.call("delete_rule", "DELETE", f"/rules/{rule['id']}", reviewer)
-    await rec.call("reject_suspicious", "POST", f"/inbox/{ids.unknown.id}/reject", reviewer, json={"suspicious": True})
+    await rec.call("reject_suspicious", "POST", f"/inbox/{unknown_id}/reject", reviewer, json={"suspicious": True})
     await rec.call("get_flags", "GET", "/flags", reviewer)
     resumed = await rec.call("resume_auto_approve", "POST", "/flags/auto-approve/resume", reviewer)
     assert resumed == {"paused": False}

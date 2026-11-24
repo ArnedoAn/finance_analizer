@@ -115,6 +115,11 @@ Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready` y `P
 | GET | `/sync/accounts`, `/sync/categories`, `/scheduler/status` | Consultar caché/jobs |
 | POST | `/categories` | Crear en Firefly una categoría elegida explícitamente (`review`): `201` creada, `200` si ya existe (sin tildes ni mayúsculas); `docs/contract-additions/CategoryCreate.md` |
 | POST | `/categories/defaults` | Crear en Firefly las categorías sugeridas que falten (`review`, idempotente): `{created, existing}`; mismo documento |
+| GET | `/rules` | Reglas activas `{items,total}`; cada una trae `tags` (lista, `[]` si no tiene) |
+| POST | `/rules` | Crear o actualizar una regla (`review`): `{match, pattern, category, merchant?, tags?}`; las etiquetas se suman a las del movimiento cuando la regla casa (`docs/contract-additions/AssistantActions.md`) |
+| POST | `/assistant/batches/{id}/proposals` | Proponer un cambio o acción (`read`, `201`) |
+| POST | `/assistant/batches/{id}/proposals/bulk` | 1 a 50 propuestas en una llamada (`read`): `{items:[{ok,proposal}\|{ok:false,error:{detail,code}}],created,failed}` en el mismo orden; un elemento inválido no tumba a los demás; lote cerrado `409`, inexistente `404` |
+| POST | `/assistant/batches/{id}/apply` | Aplicar propuestas aprobadas (`review`), por fases y en serie; con `Idempotency-Key` repetir no aplica dos veces |
 
 ### Message Mirror
 

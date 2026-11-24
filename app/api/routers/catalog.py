@@ -31,6 +31,7 @@ class RuleCreate(BaseModel):
     pattern: str = Field(min_length=1, max_length=255)
     category: str = Field(min_length=1, max_length=255)
     merchant: str | None = Field(default=None, max_length=255)
+    tags: list[str] | None = Field(default=None, max_length=10)
 
 
 class TransferPair(BaseModel):
@@ -93,7 +94,7 @@ async def list_rules(db: DB):
 @router.post("/rules", status_code=201)
 async def create_rule(body: RuleCreate, db: DB, service: Service, principal: ReviewPrincipal):
     try:
-        return await rules.add_for_owner(db, service, match=body.match, pattern=body.pattern, category=body.category, merchant=body.merchant, principal=principal)
+        return await rules.add_for_owner(db, service, match=body.match, pattern=body.pattern, category=body.category, merchant=body.merchant, tags=body.tags, principal=principal)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

@@ -109,7 +109,7 @@ async def test_merchants_and_rules_endpoints(client, service, db, clients):
     body = done.json()
     assert body["merchant"]["default_category"] == "Transporte"
     assert body["rule"]["match"] == "merchant_exact" and body["rule"]["pattern"] == "SUPERMERCADO CENTRAL"
-    assert set(body["rule"]) == {"id", "match", "pattern", "category", "merchant", "source", "hits", "created_at"}
+    assert set(body["rule"]) == {"id", "match", "pattern", "category", "merchant", "source", "hits", "created_at", "tags"}
 
     only_default = await client.put(f"/api/v1/merchants/{merchant['id']}", headers=ADMIN, json={"default_category": "Alimentación", "create_rule": False})
     assert only_default.json()["rule"] is None

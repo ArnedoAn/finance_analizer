@@ -4,15 +4,14 @@ Errors raise ``HTTPException(status, {"detail": ..., "code": ...})``; ``main.py`
 as the flat ``{"detail", "code"}`` body of contract section 14.
 """
 from contextlib import contextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Header, HTTPException, Query
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from app.api.dependencies import ReadPrincipal, ReviewPrincipal
 from app.api.routers.common import DB, Service, item_data
 from app.services import assistant, assistant_errors, audit
-from app.services import assistant_actions as actions
 
 router = APIRouter()
 
@@ -36,6 +35,13 @@ class ProposalCreate(BaseModel):
     field: str = Field(min_length=1, max_length=30)
     new_value: Any = None
     reason: str = Field(min_length=1, max_length=1000)
+
+
+class ProposalBulk(BaseModel):
+    """Elements stay raw so that a malformed one fails alone (``ProposalCreate`` validates each)."""
+
+    model_config = ConfigDict(extra="forbid")
+    proposals: list[Any] = Field(min_length=1, max_length=assistant.MAX_PROPOSALS)
 
 
 class ApplyBody(BaseModel):
@@ -83,15 +89,30 @@ async def create_batch(body: BatchCreate, db: DB, principal: ReadPrincipal):
 async def create_proposal(batch_id: int, body: ProposalCreate, db: DB, service: Service, principal: ReadPrincipal):
     with _coded_errors():
         batch = await assistant.get_batch(db, batch_id)
-        if body.field in actions.FIELDS:
-            proposal = await assistant.add_action(
-                db, service, batch, field=body.field, target_ref=body.target_ref, new_value=body.new_value, reason=body.reason, principal=principal,
-            )
-        else:
-            if body.target_id is None:
-                raise assistant_errors.AssistantError(422, "validation_error", "target_id is required")
-            proposal = await assistant.add_proposal(db, batch, target_id=body.target_id, field=body.field, new_value=body.new_value, reason=body.reason, principal=principal)
+        proposal = await assistant.propose(db, service, batch, **body.model_dump(), principal=principal)
         return _proposal(proposal)
+
+
+def _entry(raw) -> dict | assistant_errors.AssistantError:
+    try:
+        return ProposalCreate.model_validate(raw).model_dump()
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        where = ".".join(str(part) for part in first["loc"])
+        return assistant_errors.AssistantError(422, "validation_error", f"Invalid proposal{' at ' + where if where else ''}: {first['msg']}")
+
+
+@router.post("/assistant/batches/{batch_id}/proposals/bulk")
+async def create_proposals_bulk(batch_id: int, body: ProposalBulk, db: DB, service: Service, principal: ReadPrincipal):
+    """Up to 50 proposals in one call; each is validated and created like ``POST .../proposals`` and a bad one fails alone."""
+    with _coded_errors():
+        results = await assistant.propose_bulk(db, service, batch_id, [_entry(raw) for raw in body.proposals], principal)
+    items = [
+        {"ok": False, "error": {"detail": result.detail, "code": result.code}} if isinstance(result, assistant_errors.AssistantError) else {"ok": True, "proposal": _proposal(result)}
+        for result in results
+    ]
+    failed = sum(1 for item in items if not item["ok"])
+    return {"items": items, "created": len(items) - failed, "failed": failed}
 
 
 @router.get("/assistant/batches/{batch_id}")
@@ -101,9 +122,15 @@ async def get_batch(batch_id: int, db: DB, principal: ReadPrincipal):
 
 
 @router.post("/assistant/batches/{batch_id}/apply")
-async def apply_batch(batch_id: int, body: ApplyBody, db: DB, service: Service, principal: ReviewPrincipal):
+async def apply_batch(
+    batch_id: int, body: ApplyBody, db: DB, service: Service, principal: ReviewPrincipal,
+    idempotency_key: Annotated[str | None, Header(max_length=200)] = None,
+):
     with _coded_errors():
-        applied, failed = await assistant.apply(db, service, batch_id, approved_ids=body.approved_ids, discard_others=body.discard_others, principal=principal)
+        applied, failed = await assistant.apply(
+            db, service, batch_id, approved_ids=body.approved_ids, discard_others=body.discard_others, principal=principal,
+            idempotency_key=idempotency_key or None,
+        )
         return {"batch": await _batch(db, await assistant.get_batch(db, batch_id)), "applied": applied, "failed": failed}
 
 

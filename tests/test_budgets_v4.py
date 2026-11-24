@@ -1023,11 +1023,12 @@ async def test_a_rejected_pse_receipt_is_ignored_and_a_pending_one_goes_to_revie
 
 async def test_a_receipt_whose_state_says_otherwise_never_registers_even_if_the_model_says_withdrawal(pse_env, world):
     service = pse_env
-    for state, reason in (("Rechazada", "PSE payment was not approved"), ("Pendiente", "PSE payment is pending")):
+    # A rejected receipt is a declined attempt (ignored before the model is asked); a pending one waits for review.
+    for state, status, reason in (("Rechazada", "ignored", "declined"), ("Pendiente", "needs_review", "PSE payment is pending")):
         row = await pse_email(service, state)
         await service.process(row)
         saved = await service.inbox.get(row.id)
-        assert saved.status == "needs_review" and reason in saved.review_reason
+        assert saved.status == status and reason in saved.review_reason
     assert movements(world) == []
 
 

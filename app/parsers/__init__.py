@@ -9,17 +9,21 @@ from dataclasses import replace
 
 from . import bancolombia, daviplata, davivienda, lulo, nequi, nu
 from .common import (
-    FAILURE,
+    DECLINED_REASON,
+    DECLINED_TEMPLATE,
     NON_TRANSACTION,
     REFUND,
     candidates,
     fold,
+    is_declined,
     normalize_merchant,
     parse_amount,
 )
 from .types import Extraction, Kind
 
-__all__ = ["Extraction", "Kind", "normalize_merchant", "parse", "parse_amount"]
+__all__ = [
+    "DECLINED_REASON", "DECLINED_TEMPLATE", "Extraction", "Kind", "is_declined", "normalize_merchant", "parse", "parse_amount",
+]
 
 _BANKS = {
     "bancolombia": bancolombia, "nequi": nequi, "daviplata": daviplata,
@@ -46,11 +50,11 @@ def parse(text: str, subject: str = "", sender: str = "") -> Extraction | None:
             events.append(candidate)
     first_sentence = re.split(r"[.!?;\n](?:\s|$)", text, maxsplit=1)[0]
     ignore_term = NON_TRANSACTION.search(fold(subject)) or NON_TRANSACTION.search(fold(first_sentence))
+    if is_declined(combined):
+        return Extraction(kind="ignore", template_id=DECLINED_TEMPLATE, reason=DECLINED_REASON)
     if len(events) > 1:
         return replace(events[0].extraction, kind="review", template_id="review.mixed",
                        reason="Multiple transaction events in one message")
-    if FAILURE.search(normalized):
-        return Extraction(kind="ignore", template_id="ignore.failed", reason="Transaction unsuccessful or cancelled")
     if ignore_term:
         if events:
             return replace(events[0].extraction, kind="review", template_id="review.ignore_conflict",

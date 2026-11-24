@@ -318,8 +318,16 @@ def month_series(month: str, repeat: int) -> list[str]:
     return [f"{year + (number - 1 + step) // 12:04d}-{(number - 1 + step) % 12 + 1:02d}" for step in range(repeat + 1)]
 
 
-def _exact(limits: list[dict], start: date, end: date) -> dict | None:
+def exact_limit(limits: list[dict], start: date, end: date) -> dict | None:
     return next((limit for limit in limits if limit["start"] == start.isoformat() and limit["end"] == end.isoformat()), None)
+
+
+async def write_limit(firefly, budget_id: str, start: date, end: date, amount: Decimal, limit: dict | None) -> None:
+    """Create the limit of a budget for a period, or update ``limit`` (the existing one for exactly that period)."""
+    if limit is None:
+        await firefly.create_budget_limit(budget_id, start, end, amount)
+    else:
+        await firefly.update_budget_limit(budget_id, limit["id"], start, end, amount)
 
 
 async def run(session, firefly, llm, principal, *, filename, data: bytes, month: str, dry_run: bool, repeat_months: int) -> dict:
@@ -343,7 +351,7 @@ async def run(session, firefly, llm, principal, *, filename, data: bytes, month:
         steps = []
         for label in months:
             start, end = month_bounds(label)
-            limit = _exact(await firefly.budget_limits(current["id"], start, end), start, end) if current else None
+            limit = exact_limit(await firefly.budget_limits(current["id"], start, end), start, end) if current else None
             same = limit is not None and limit["amount"].quantize(CENT) == amount
             steps.append((start, end, limit, same))
         action = "create" if current is None else "unchanged" if all(step[3] for step in steps) else "update"
@@ -365,10 +373,7 @@ async def run(session, firefly, llm, principal, *, filename, data: bytes, month:
                 for start, end, limit, same in steps:
                     if same:
                         continue
-                    if limit is None:
-                        await firefly.create_budget_limit(current["id"], start, end, amount)
-                    else:
-                        await firefly.update_budget_limit(current["id"], limit["id"], start, end, amount)
+                    await write_limit(firefly, current["id"], start, end, amount, limit)
             except FireflyError as exc:
                 failed += 1
                 row["error"] = "Firefly no aceptó este presupuesto; revisa el nombre y el monto."

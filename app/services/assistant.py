@@ -26,7 +26,9 @@ from app.core.timezone import now_utc
 from app.db.models import InboxEvent, InboxItem
 from app.db.models_assistant import Proposal, ProposalBatch
 from app.models.schemas import ManualTransaction
-from app.services import audit
+from app.services import assistant_actions as actions
+from app.services import audit, ledger
+from app.services.assistant_errors import AssistantError
 
 logger = get_logger(__name__)
 
@@ -68,14 +70,6 @@ _VALUE_TYPES = {
     "split": TypeAdapter(Annotated[list[_SplitPart], Field(min_length=2, max_length=MAX_SPLIT_PARTS)]),
 }
 _ATTRIBUTES = {"firefly_account": "asset_account"}
-
-
-class AssistantError(Exception):
-    """A client-visible failure; the router maps it to ``{"detail", "code"}`` with ``status``."""
-
-    def __init__(self, status: int, code: str, detail: str):
-        super().__init__(detail)
-        self.status, self.code, self.detail = status, code, detail
 
 
 def _money(value: Decimal) -> str:
@@ -150,9 +144,9 @@ async def proposals_of(session, batch_id: int) -> list[Proposal]:
 
 
 async def batch_contents(session, batch) -> tuple[list[Proposal], dict[int, InboxItem]]:
-    """Proposals of ``batch`` and their target items keyed by id."""
+    """Proposals of ``batch`` and the inbox items they target, keyed by id (action proposals have no item)."""
     proposals = await proposals_of(session, batch.id)
-    ids = {proposal.target_id for proposal in proposals}
+    ids = {proposal.target_id for proposal in proposals if proposal.target_id is not None}
     items = {}
     if ids:
         query = select(InboxItem).where(InboxItem.id.in_(ids)).execution_options(populate_existing=True)
@@ -180,16 +174,34 @@ async def create_batch(session, *, window_from, window_to, instruction: str, pri
     return batch
 
 
-async def add_proposal(session, batch, *, target_id: int, field: str, new_value, reason: str, principal) -> Proposal:
+async def _open_batch(session, batch_id: int) -> ProposalBatch:
     # The row lock serializes concurrent creators so the 50-proposal cap cannot be overshot.
-    batch = await _lock_batch(session, batch.id)
+    batch = await _lock_batch(session, batch_id)
     if batch.status != "open":
         raise AssistantError(409, "conflict", f"Batch is {batch.status}; proposals can only be added to an open batch")
-    if field not in ALLOWED_FIELDS:
-        raise AssistantError(422, "field_not_allowed", f"Field not allowed: {field}")
+    return batch
+
+
+async def _check_room(session, batch) -> None:
     count = await session.scalar(select(func.count()).select_from(Proposal).where(Proposal.batch_id == batch.id))
     if count >= MAX_PROPOSALS:
         raise AssistantError(422, "batch_limit", f"A batch holds at most {MAX_PROPOSALS} proposals")
+
+
+async def _store(session, proposal: Proposal, detail: dict, principal) -> Proposal:
+    session.add(proposal)
+    await session.flush()
+    await audit.record(session, action="assistant.proposal_created", target_type="proposal", target_id=proposal.id, detail=detail, principal=principal)
+    await session.commit()
+    return proposal
+
+
+async def add_proposal(session, batch, *, target_id: int, field: str, new_value, reason: str, principal) -> Proposal:
+    """Propose a change to one inbox item."""
+    batch = await _open_batch(session, batch.id)
+    if field not in ALLOWED_FIELDS:
+        raise AssistantError(422, "field_not_allowed", f"Field not allowed: {field}")
+    await _check_room(session, batch)
     item = await session.get(InboxItem, target_id, populate_existing=True)
     if item is None:
         raise AssistantError(404, "not_found", "Inbox item not found")
@@ -205,18 +217,25 @@ async def add_proposal(session, batch, *, target_id: int, field: str, new_value,
         batch_id=batch.id, target_id=item.id, field=field, old_value=current_value(item, field), new_value=value,
         reason=reason.strip(), risky=field in RISKY_FIELDS, status="proposed",
     )
-    session.add(proposal)
-    await session.flush()
-    await audit.record(
-        session, action="assistant.proposal_created", target_type="proposal", target_id=proposal.id,
-        detail={"batch_id": batch.id, "target_id": item.id, "field": field, "risky": proposal.risky}, principal=principal,
+    return await _store(session, proposal, {"batch_id": batch.id, "target_id": item.id, "field": field, "risky": proposal.risky}, principal)
+
+
+async def add_action(session, processor, batch, *, field: str, target_ref, new_value, reason: str, principal) -> Proposal:
+    """Propose a category, registered-movement, budget or rule action (see ``assistant_actions``)."""
+    batch = await _open_batch(session, batch.id)
+    await _check_room(session, batch)
+    prepared = await actions.prepare(session, processor, batch, await proposals_of(session, batch.id), field, target_ref, new_value)
+    proposal = Proposal(
+        batch_id=batch.id, target_id=None, target_ref=prepared.target_ref, subject=prepared.subject, field=field,
+        old_value=prepared.old_value, new_value=prepared.new_value, reason=reason.strip(), risky=prepared.risky, status="proposed",
     )
-    await session.commit()
-    return proposal
+    return await _store(session, proposal, {"batch_id": batch.id, "target_ref": prepared.target_ref, "field": field, "risky": prepared.risky}, principal)
 
 
 def _public_error(exc: Exception) -> str:
     if isinstance(exc, AssistantError):
+        return exc.detail
+    if isinstance(exc, ledger.LedgerError):
         return exc.detail
     if isinstance(exc, ValueError | FinanceAnalyzerError):
         return str(exc)[:300]
@@ -284,7 +303,8 @@ def _already_effective(item, proposal) -> bool:
 
 
 async def _apply_edit(processor, item, proposal, principal):
-    await processor.review(item, "edit", {proposal.field: proposal.new_value}, principal=principal)
+    value = await actions.canonical_category(processor, proposal.new_value) if proposal.field == "category" else proposal.new_value
+    await processor.review(item, "edit", {proposal.field: value}, principal=principal)
 
 
 async def _apply_void(processor, item, principal):
@@ -299,13 +319,10 @@ async def _apply_split(processor, item, proposal, principal):
     parts = proposal.new_value
     if sum((Decimal(part["amount"]) for part in parts), Decimal(0)) != item.amount:
         raise AssistantError(409, "conflict", "The item amount changed; the split no longer adds up")
-    known = {name.casefold() for name in await processor.categories()}
-    for part in parts:
-        if part["category"].casefold() not in known:
-            raise AssistantError(422, "validation_error", f"Unknown category: {part['category']}")
+    canonical = [await actions.canonical_category(processor, part["category"]) for part in parts]
     # Children first (idempotent by client_ref) so a failure never loses the original; then void it.
-    for number, part in enumerate(parts, 1):
-        payload = _manual_copy(item, f"split:{proposal.id}:{number}", Decimal(part["amount"]), part.get("description"), part["category"])
+    for number, (part, category) in enumerate(zip(parts, canonical, strict=True), 1):
+        payload = _manual_copy(item, f"split:{proposal.id}:{number}", Decimal(part["amount"]), part.get("description"), category)
         await _manual_once(processor, payload, f"Split part {number}")
     await processor.review(item, "void", principal=principal)
 
@@ -333,21 +350,25 @@ async def _claim(session, proposal_id: int) -> bool:
 async def _apply_one(processor, proposal_id: int, principal, *, resumed: bool):
     session = processor.session
     proposal = await session.get(Proposal, proposal_id, populate_existing=True)
-    item = await session.get(InboxItem, proposal.target_id, populate_existing=True)
-    if item is None:
-        raise AssistantError(404, "not_found", "Inbox item not found")
-    if not (resumed and _already_effective(item, proposal)):
-        _check_applicable(item, proposal.field)
-        if current_value(item, proposal.field) != proposal.old_value:
-            raise AssistantError(409, "conflict", "The item changed after the proposal was created; the proposal is stale")
-        if proposal.field == "void":
-            await _apply_void(processor, item, principal)
-        elif proposal.field == "split":
-            await _apply_split(processor, item, proposal, principal)
-        else:
-            await _apply_edit(processor, item, proposal, principal)
+    result = None
+    if proposal.field in actions.FIELDS:
+        result = await actions.apply(session, processor, proposal, principal, resumed=resumed)
+    else:
+        item = await session.get(InboxItem, proposal.target_id, populate_existing=True)
+        if item is None:
+            raise AssistantError(404, "not_found", "Inbox item not found")
+        if not (resumed and _already_effective(item, proposal)):
+            _check_applicable(item, proposal.field)
+            if current_value(item, proposal.field) != proposal.old_value:
+                raise AssistantError(409, "conflict", "The item changed after the proposal was created; the proposal is stale")
+            if proposal.field == "void":
+                await _apply_void(processor, item, principal)
+            elif proposal.field == "split":
+                await _apply_split(processor, item, proposal, principal)
+            else:
+                await _apply_edit(processor, item, proposal, principal)
     proposal = await session.get(Proposal, proposal_id, populate_existing=True)
-    proposal.status, proposal.error, proposal.applied_at = "applied", None, now_utc()
+    proposal.status, proposal.error, proposal.applied_at, proposal.result = "applied", None, now_utc(), result
     await session.commit()
 
 
@@ -368,7 +389,9 @@ async def apply(session, processor, batch_id: int, *, approved_ids: list[int], d
     if missing:
         raise AssistantError(422, "validation_error", f"Proposals not in this batch: {missing}")
     if len(ids) > 1 and any(known[pid].risky for pid in ids):
-        raise AssistantError(422, "risky_requires_single", "A risky proposal (amount, void, split, type, accounts or date) must be applied on its own")
+        raise AssistantError(422, "risky_requires_single", "A risky proposal (amount, void, split, type, accounts, date or a deletion) must be applied on its own")
+    # Stable: what others name (a new category or budget) exists before they run; deletions go last.
+    ids.sort(key=lambda pid: actions.rank(known[pid].field))
     if batch.status in {"reverted", "discarded"}:
         raise AssistantError(409, "conflict", f"Batch is {batch.status}")
     applied, failed = [], []
@@ -441,6 +464,15 @@ async def _restore_original(processor, item, proposal, principal):
 
 async def _revert_one(processor, proposal, principal):
     session = processor.session
+    if proposal.field in actions.FIELDS:
+        await actions.revert(session, processor, proposal, principal)
+    else:
+        await _revert_item_change(processor, proposal, principal)
+    proposal.status, proposal.error, proposal.reverted_at = "reverted", None, now_utc()
+    await session.commit()
+
+
+async def _revert_item_change(processor, proposal, principal):
     item = await processor.inbox.get(proposal.target_id)
     if item is None:
         raise AssistantError(404, "not_found", "Inbox item not found")
@@ -458,8 +490,6 @@ async def _revert_one(processor, proposal, principal):
         if proposal.old_value is None and proposal.field not in RESTORABLE_EMPTY:
             raise AssistantError(409, "conflict", "The previous value was empty and cannot be restored automatically")
         await processor.review(item, "edit", {proposal.field: proposal.old_value}, principal=principal)
-    proposal.status, proposal.error, proposal.reverted_at = "reverted", None, now_utc()
-    await session.commit()
 
 
 async def revert(session, processor, batch_id: int, *, principal):
@@ -471,7 +501,7 @@ async def revert(session, processor, batch_id: int, *, principal):
     batch = await get_batch(session, batch_id)
     if batch.status == "reverted":
         return [], []
-    applied = [proposal for proposal in await proposals_of(session, batch.id) if proposal.status == "applied"]
+    applied = [proposal for proposal in await proposals_of(session, batch.id) if proposal.status == "applied" and actions.revertible(proposal)]
     if not applied:
         raise AssistantError(409, "conflict", "The batch has nothing to revert")
     now = now_utc()
@@ -492,7 +522,7 @@ async def revert(session, processor, batch_id: int, *, principal):
         else:
             reverted.append(pid)
     batch = await _lock_batch(session, batch_id)
-    if not any(proposal.status == "applied" for proposal in await proposals_of(session, batch_id)):
+    if not any(proposal.status == "applied" and actions.revertible(proposal) for proposal in await proposals_of(session, batch_id)):
         batch.status = "reverted"
     await audit.record(
         session, action="assistant.revert", target_type="batch", target_id=batch.id,

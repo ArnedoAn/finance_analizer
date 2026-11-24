@@ -2,15 +2,22 @@
 from datetime import UTC, datetime
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Query, Response
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from app.api.dependencies import READ, ReviewPrincipal
 from app.api.routers.common import DB, Service, item_data
 from app.db.models_rules import Merchant, Rule
-from app.services import ai_anomalies, anomalies, rules, transfers
+from app.parsers.common import fold
+from app.services import ai_anomalies, anomalies, categories, rules, transfers
 
+# Suggested starting categories (the AI only picks from the owner's Firefly categories), in display order.
+DEFAULT_CATEGORIES = (
+    "Mercado", "Comida", "Transporte", "Servicios", "Suscripciones", "Arriendo", "Salud", "Ingresos", "Compras",
+    "Entretenimiento", "Educación", "Hogar", "Viajes", "Cuidado personal", "Mascotas", "Comisiones e impuestos",
+    "Regalos y donaciones",
+)
 router = APIRouter()
 
 
@@ -29,6 +36,11 @@ class RuleCreate(BaseModel):
 class TransferPair(BaseModel):
     out_id: int
     in_id: int
+
+
+class CategoryCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: categories.CategoryName
 
 
 async def _known_category(service, value: str) -> str:
@@ -80,26 +92,44 @@ async def list_rules(db: DB):
 
 @router.post("/rules", status_code=201)
 async def create_rule(body: RuleCreate, db: DB, service: Service, principal: ReviewPrincipal):
-    category = await _known_category(service, body.category)
     try:
-        rule = await rules.create_rule(db, match=body.match, pattern=body.pattern, category=category, merchant=body.merchant)
+        return await rules.add_for_owner(db, service, match=body.match, pattern=body.pattern, category=body.category, merchant=body.merchant, principal=principal)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    result = rules.rule_data(rule)
-    await _audit(db, principal, "rule.create", "rule", rule.id, {"match": rule.match, "pattern": rule.pattern, "category": category})
-    await db.commit()
-    return result
+
+
+@router.post("/categories")
+async def create_category(body: CategoryCreate, response: Response, db: DB, service: Service, principal: ReviewPrincipal):
+    """Create a Firefly category the owner explicitly chose; a name that exists (any case or accents) is returned as is."""
+    name, created = await categories.create(db, service, body.name, principal)
+    if created:
+        response.status_code = 201
+    return {"name": name, "created": created}
+
+
+@router.post("/categories/defaults")
+async def create_default_categories(db: DB, service: Service, principal: ReviewPrincipal):
+    """Create the suggested categories Firefly lacks; idempotent, and a failure midway keeps what was created."""
+    known = {fold(name): name for name in await service.categories()}
+    created, existing = [], []
+    try:
+        for name in DEFAULT_CATEGORIES:
+            if fold(name) in known:
+                existing.append(known[fold(name)])
+                continue
+            created.append(await service.firefly.create_category(name))
+    finally:
+        if created:
+            service.invalidate_categories()
+            await _audit(db, principal, "category.defaults", "category", "defaults", {"created": created})
+            await db.commit()
+    return {"created": created, "existing": existing}
 
 
 @router.delete("/rules/{rule_id}")
 async def delete_rule(rule_id: int, db: DB, principal: ReviewPrincipal):
-    rule = await db.get(Rule, rule_id)
-    if rule is None:
+    if await rules.remove_for_owner(db, rule_id, principal) is None:
         raise HTTPException(404, "Rule not found")
-    detail = {"match": rule.match, "pattern": rule.pattern, "category": rule.category}
-    await db.delete(rule)
-    await _audit(db, principal, "rule.delete", "rule", rule_id, detail)
-    await db.commit()
     return {"deleted": True}
 
 

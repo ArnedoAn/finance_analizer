@@ -424,6 +424,11 @@ async def test_every_analyzer_endpoint_matches_its_contract_fixture(client, serv
     rule = await rec.call("create_rule", "POST", "/rules", reviewer, status=201, json={"match": "text_contains", "pattern": "uber", "category": "Transporte"})
     rules = await rec.call("list_rules", "GET", "/rules", reviewer)
     assert len(rules["items"]) >= 2
+    firefly.create_category.side_effect = lambda name: name
+    created_category = await rec.call("create_category", "POST", "/categories", reviewer, status=201, json={"name": "Mascotas"})
+    assert created_category == {"name": "Mascotas", "created": True}
+    defaults = await rec.call("create_default_categories", "POST", "/categories/defaults", reviewer)
+    assert "Transporte" in defaults["existing"] and "Compras" in defaults["created"]
     tienda_d1 = next(merchant for merchant in merchants["items"] if merchant["name"] == "TIENDA D1")
     await rec.call("set_merchant_category", "PUT", f"/merchants/{tienda_d1['id']}", reviewer, json={"default_category": "Alimentación", "create_rule": True})
     await rec.error("error_422_validation_error", "POST", "/rules", reviewer, 422, "validation_error", json={"match": "text_contains", "pattern": "x", "category": "Categoria inexistente"})

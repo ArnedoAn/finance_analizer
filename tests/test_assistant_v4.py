@@ -134,7 +134,7 @@ async def test_proposal_shape_and_risk_flags(client, service):
         response = await propose(client, batch_id, item.id, field, value)
         assert response.status_code == 201, (field, response.text)
         body = response.json()
-        assert set(body) == {"id", "batch_id", "target_id", "field", "old_value", "new_value", "reason", "risky", "status", "error", "applied_at", "reverted_at"}
+        assert set(body) == {"id", "batch_id", "target_id", "target_ref", "subject", "field", "old_value", "new_value", "reason", "risky", "status", "error", "applied_at", "reverted_at"}
         assert body["risky"] is risky and body["status"] == "proposed" and body["batch_id"] == batch_id and body["target_id"] == item.id
         if field != "occurred_at":
             assert body["old_value"] == old, field
@@ -278,10 +278,10 @@ async def test_failed_proposals_are_reported_and_change_nothing(client, service,
     response = await apply(client, batch_id, [unknown])
     assert response.status_code == 200
     body = response.json()
-    assert body["applied"] == [] and body["failed"] == [{"id": unknown, "detail": "Unknown category"}]
+    assert body["applied"] == [] and body["failed"] == [{"id": unknown, "detail": "Unknown category: Inexistente"}]
     assert body["batch"]["status"] == "open"
     failed = body["batch"]["proposals"][0]
-    assert failed["status"] == "failed" and failed["error"] == "Unknown category" and failed["applied_at"] is None
+    assert failed["status"] == "failed" and failed["error"] == "Unknown category: Inexistente" and failed["applied_at"] is None
     clients[0].update_transaction.assert_not_awaited()
 
     # An upstream outage rolls the local change back and is retryable.

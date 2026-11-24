@@ -21,7 +21,15 @@ from app.core.exceptions import PermanentError
 from app.core.logging import get_logger
 from app.db.models import CycleRun, InboxEvent, InboxItem
 from app.db.repositories import InboxRepository, KnownSenderRepository, MailStateRepository
-from app.parsers import Extraction, normalize_merchant, parse, parse_amount
+from app.parsers import (
+    DECLINED_REASON,
+    DECLINED_TEMPLATE,
+    Extraction,
+    is_declined,
+    normalize_merchant,
+    parse,
+    parse_amount,
+)
 from app.parsers.common import fold
 from app.parsers.trim import trim_template
 from app.security import is_sensitive_code
@@ -126,7 +134,7 @@ class Processor:
         self._summaries = {}
 
     async def sync(self, force=False):
-        if force or self._accounts is None:
+        if force or self._accounts is None or self._categories is None:
             self._accounts = await self.firefly.accounts()
             self._categories = await self.firefly.categories()
         own = await self._own()
@@ -143,6 +151,10 @@ class Processor:
     async def categories(self):
         await self.sync()
         return self._categories
+
+    def invalidate_categories(self) -> None:
+        """Forget the cached categories; the next ``categories()`` reads them from Firefly again."""
+        self._categories = None
 
     async def _asset(self, name):
         for account in await self.accounts():
@@ -485,6 +497,18 @@ class Processor:
         self.session.add(InboxEvent(inbox_id=item.id, action="second_opinion", detail=verdict["reason"] or "verified"))
         return verdict
 
+    @staticmethod
+    def _ignore_declined(item):
+        """Ignore (reason ``declined``) an automatic item whose subject or body says the attempt was declined; True when it did.
+
+        One rule before any parser, model, second opinion or auto-approval: a declined attempt never happened. Only an
+        owner's manual approval (``process(approved=True)``) or an owner's manual entry registers one.
+        """
+        if item.source == "manual" or not is_declined((item.subject_or_title or "") + "\n" + (item.raw_text or "")):
+            return False
+        item.status, item.method, item.template_id, item.review_reason = "ignored", "parser", DECLINED_TEMPLATE, DECLINED_REASON
+        return True
+
     async def _extract(self, item, cycle_id, reuse=False):
         """Extract the item and decide whether it may reach Firefly unreviewed; otherwise it becomes ``needs_review``.
 
@@ -505,6 +529,8 @@ class Processor:
             return
         await descriptions.refresh(self.session)
         text, subject, previous = item.raw_text or "", item.subject_or_title or "", item.review_reason or ""
+        if self._ignore_declined(item):
+            return
         if not reuse:
             item.second_opinion = None
         extraction = parse(text, subject, item.sender or "")
@@ -665,6 +691,8 @@ class Processor:
                 await self._extract(item, cycle_id)
             if approved:
                 item.status, item.review_reason = "pending", None
+            elif item.status == "pending":
+                self._ignore_declined(item)  # a row extracted before this rule existed that waits for a retry
             if item.status in {"ignored", "needs_review"}:
                 return await self._finish(item, old_status)
             async with self._economic_guard(item) as acquired:

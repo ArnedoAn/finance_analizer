@@ -113,6 +113,8 @@ Todas las rutas requieren `X-API-Key` salvo `/health/live`, `/health/ready` y `P
 | POST/GET | `/maintenance/reset`, `/maintenance/reset/{id}` | Solo `admin`: borrar todo lo de movimientos (Firefly y base) para reimportar; prueba en seco por defecto, confirmación `BORRAR MOVIMIENTOS`, tras un respaldo (`docs/contract-additions/ServerReset.md`) |
 | POST | `/sync/all` | Refrescar caché Firefly |
 | GET | `/sync/accounts`, `/sync/categories`, `/scheduler/status` | Consultar caché/jobs |
+| POST | `/categories` | Crear en Firefly una categoría elegida explícitamente (`review`): `201` creada, `200` si ya existe (sin tildes ni mayúsculas); `docs/contract-additions/CategoryCreate.md` |
+| POST | `/categories/defaults` | Crear en Firefly las categorías sugeridas que falten (`review`, idempotente): `{created, existing}`; mismo documento |
 
 ### Message Mirror
 

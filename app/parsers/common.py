@@ -15,10 +15,28 @@ from .types import Extraction, Kind
 
 BOGOTA = ZoneInfo("America/Bogota")
 MONEY = r"(?P<currency>US\$|USD|COP|\$)\s*(?P<amount>\d[\d.,]*)"
-FAILURE = re.compile(
-    r"\b(?:intento|rechazad[ao]|declinad[ao]|denegad[ao]|cancelad[ao]|"
-    r"no\s+(?:fue\s+)?(?:exitos[ao]|autorizad[ao]|aprobad[ao])|"
-    r"no\s+(?:se\s+)?(?:realizo|pudo\s+realizar)|fondos\s+insuficientes)\b"
+# A declined, failed or cancelled attempt NEVER happened: no parser, model or review may register it. Patterns run on
+# folded text (lower case, no accents). Clauses that only warn («si su pago fue rechazado, contacte...», «si no
+# reconoces esta transaccion...», «en caso de rechazo...») are removed first, and a labelled approved state
+# («Estado: Aprobada», the same rule ``pse.status`` uses) wins over loose words elsewhere in the text.
+DECLINED_TEMPLATE = "ignore.declined"
+DECLINED_REASON = "declined"
+DECLINED = re.compile(
+    r"\b(?:intento|rechazad[ao]s?|rechazo|rechazamos|declinad[ao]s?|denegad[ao]s?|cancelad[ao]s?|fallid[ao]s?|"
+    r"no\s+(?:fue\s+|ha\s+sido\s+|resulto\s+)?(?:exitos[ao]|autorizad[ao]|aprobad[ao]|aceptad[ao]|procesad[ao]|realizad[ao])|"
+    r"no\s+(?:fue|ha\s+sido)\s+posible|"
+    r"no\s+se\s+(?:realizo|pudo\s+(?:procesar|realizar|completar|efectuar|aprobar|autorizar|aplicar))|"
+    r"(?:fondos|saldo|cupo)\s+(?:(?:es|son)\s+)?(?:insuficientes?|no\s+(?:(?:es|son)\s+)?suficientes?)|"
+    r"insuficiencia\s+de\s+(?:fondos|saldo|cupo)|"
+    r"tarjeta\s+(?:(?:esta|fue|se\s+encuentra)\s+)?bloquead[ao]|"
+    r"exced(?:e|io|ido)\s+(?:el\s+|al\s+|tu\s+|su\s+|del\s+)?(?:limite|monto\s+maximo|cupo|maximo)|"
+    r"super(?:a|o|ado)\s+(?:el\s+|al\s+|tu\s+|su\s+|del\s+)?(?:limite|monto\s+maximo|cupo|maximo)|"
+    r"(?:limite|monto\s+maximo)\s+(?:excedido|superado))\b"
+)
+_WARNING_CLAUSE = re.compile(r"\b(?:si|en\s+caso\s+de(?:\s+que)?)\b[^.!?;,\n]{0,120}")
+_APPROVED_STATE = re.compile(
+    r"\bestado(?:\s+(?:de\s+la\s+transaccion|del\s+pago|de\s+pago|de\s+la\s+transferencia))?\s*[:\-]\s*"
+    r"(?:aprobad|exitos|aceptad|autorizad|confirmad)"
 )
 REFUND = re.compile(r"\b(?:revers\w*|anul\w*|devoluci\w*|reembols\w*)\b")
 NON_TRANSACTION = re.compile(
@@ -39,6 +57,14 @@ MERCHANT_END = re.compile(
 def fold(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", text.casefold())
                    if unicodedata.category(c) != "Mn")
+
+
+def is_declined(text: str | None) -> bool:
+    """The message (subject AND body, joined by the caller) says the transaction was declined, failed or never happened."""
+    folded = fold(text or "")
+    if _APPROVED_STATE.search(folded):
+        return False
+    return bool(DECLINED.search(_WARNING_CLAUSE.sub(" ", folded)))
 
 
 def parse_amount(raw: str, currency: str = "COP") -> Decimal:

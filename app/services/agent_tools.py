@@ -26,6 +26,7 @@ from app.services import (
     ai_features,
     anomalies,
     assistant,
+    assistant_errors,
     budget_status,
     counterparties,
     own_accounts,
@@ -380,7 +381,7 @@ async def propose_change(ctx: ToolContext, args: dict):
             raise ToolError("La propuesta no cambia nada.")
         batch = await _ensure_batch(ctx)
         proposal = await assistant.add_proposal(ctx.session, batch, target_id=target, field=name, new_value=value, reason=reason, principal=ctx.actor)
-    except assistant.AssistantError as exc:
+    except assistant_errors.AssistantError as exc:
         raise ToolError(exc.detail) from exc
     ctx.proposed.add((target, name))
     ctx.proposals += 1

@@ -76,6 +76,29 @@ class FireflyClient:
     async def categories(self) -> list[str]:
         return [row["attributes"]["name"] for row in await self._list("categories")]
 
+    async def create_category(self, name: str) -> str:
+        """Create a category and return its name as Firefly stored it."""
+        result = await self._request("POST", "categories", json={"name": name})
+        return result["data"]["attributes"]["name"]
+
+    async def _category_row(self, name: str) -> dict:
+        wanted = name.strip().casefold()
+        for row in await self._list("categories"):
+            if row["attributes"]["name"].casefold() == wanted:
+                return row
+        raise PermanentError("Firefly 404: category not found")
+
+    async def rename_category(self, name: str, new_name: str) -> str:
+        """Rename a category and return its name as Firefly stored it."""
+        row = await self._category_row(name)
+        result = await self._request("PUT", f"categories/{row['id']}", json={"name": new_name})
+        return result["data"]["attributes"]["name"]
+
+    async def delete_category(self, name: str) -> None:
+        """Delete a category; Firefly leaves its transactions without category."""
+        row = await self._category_row(name)
+        await self._request("DELETE", f"categories/{row['id']}")
+
     async def create_account(self, name: str, type: str) -> dict:
         if type not in {"expense", "revenue"}:
             raise PermanentError("Only merchant expense/revenue accounts may be created")
@@ -150,6 +173,10 @@ class FireflyClient:
         """Create an active budget; returns ``{id, name}``."""
         result = await self._request("POST", "budgets", json={"name": name, "active": True})
         return {"id": str(result["data"]["id"]), "name": result["data"]["attributes"]["name"]}
+
+    async def delete_budget(self, budget_id: str) -> None:
+        """Delete a budget with its limits; Firefly leaves its transactions without budget."""
+        await self._request("DELETE", f"budgets/{budget_id}")
 
     async def budget_limits(self, budget_id: str, start, end) -> list[dict]:
         """The limits of a budget that overlap the period, as ``{id, amount, start, end}`` (``amount`` Decimal, dates ``YYYY-MM-DD``)."""

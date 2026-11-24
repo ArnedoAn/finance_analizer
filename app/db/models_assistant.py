@@ -41,7 +41,11 @@ class Proposal(Base):
     __tablename__ = "proposals"
     id: Mapped[int] = mapped_column(primary_key=True)
     batch_id: Mapped[int] = mapped_column(ForeignKey("proposal_batches.id"), index=True)
-    target_id: Mapped[int] = mapped_column(ForeignKey("inbox_items.id"), index=True)
+    # Inbox item the proposal changes; null for the actions on something else (see ``target_ref``).
+    target_id: Mapped[int | None] = mapped_column(ForeignKey("inbox_items.id"), index=True, nullable=True)
+    # What a non-inbox action points at: a Firefly transaction id, a category, budget or rule. ``subject`` is its label.
+    target_ref: Mapped[str | None] = mapped_column(String(255))
+    subject: Mapped[str | None] = mapped_column(String(255))
     field: Mapped[str] = mapped_column(String(30))
     old_value: Mapped[Any] = mapped_column(JSON, nullable=True)
     new_value: Mapped[Any] = mapped_column(JSON, nullable=True)
@@ -53,3 +57,5 @@ class Proposal(Base):
     created_at: Mapped[datetime] = mapped_column(AwareDateTime(), default=now_utc)
     applied_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
     reverted_at: Mapped[datetime | None] = mapped_column(AwareDateTime())
+    # What applying left behind (the ledger change id that "undo batch" reverts).
+    result: Mapped[Any] = mapped_column(JSON, nullable=True)

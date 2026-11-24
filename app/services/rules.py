@@ -132,6 +132,35 @@ def rule_data(rule) -> dict:
     }
 
 
+async def add_for_owner(session, processor, *, match, pattern, category, merchant, principal) -> dict:
+    """A rule the owner chose (``POST /rules``): the category must exist in Firefly (its spelling is stored). Audits and commits.
+
+    Raises ValueError("Unknown category") or the ``create_rule`` errors.
+    """
+    wanted = (category or "").strip().casefold()
+    spelled = next((name for name in await processor.categories() if name.casefold() == wanted), None)
+    if spelled is None:
+        raise ValueError("Unknown category")
+    rule = await create_rule(session, match=match, pattern=pattern, category=spelled, merchant=merchant)
+    data = rule_data(rule)
+    await audit.record(session, action="rule.create", target_type="rule", target_id=rule.id, detail={"match": rule.match, "pattern": rule.pattern, "category": spelled}, principal=principal)
+    await session.commit()
+    return data
+
+
+async def remove_for_owner(session, rule_id: int, principal) -> dict | None:
+    """Delete a rule (``DELETE /rules/{id}``); its data, or None when it does not exist. Audits and commits."""
+    rule = await session.get(Rule, rule_id)
+    if rule is None:
+        return None
+    detail = {"match": rule.match, "pattern": rule.pattern, "category": rule.category}
+    data = rule_data(rule)
+    await session.delete(rule)
+    await audit.record(session, action="rule.delete", target_type="rule", target_id=rule_id, detail=detail, principal=principal)
+    await session.commit()
+    return data
+
+
 def merchant_data(merchant) -> dict:
     return {
         "id": merchant.id, "name": merchant.name, "default_category": merchant.default_category,

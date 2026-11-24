@@ -142,6 +142,15 @@ class LedgerBulkSet(BaseModel):
     tags_remove: list[str] = Field(default_factory=list)
 
 
+class LedgerEdit(LedgerBulkSet):
+    """Changes to ONE movement: everything a bulk edit sets plus description, date, amount (single split) and merchant."""
+
+    description: str | None = None
+    date: datetime | None = None
+    amount: Decimal | None = None
+    merchant: str | None = None
+
+
 class LedgerBulk(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True, coerce_numbers_to_str=True)
     ids: list[str]
@@ -821,30 +830,71 @@ async def _bulk_operations(processor, changes: LedgerBulkSet) -> dict:
         operations["tags_add"] = _clean_tags(changes.tags_add)
     if changes.tags_remove:
         operations["tags_remove"] = _clean_tags(changes.tags_remove)
+    operations.update(await _edit_operations(processor, changes))
     if not operations:
         raise _invalid("Indica al menos un cambio.")
     return operations
 
 
-async def _bulk_one(db, processor, firefly_id: str, operations: dict, principal, group_id: str) -> bool:
-    raw = await _fetch(processor, firefly_id)
-    before = normalize(raw, processor.zone)
-    _require_editable(before)
-    draft = _draft_from(before, processor.zone)
+async def _edit_operations(processor, changes: LedgerBulkSet) -> dict:
+    """The extra single-movement changes of a ``LedgerEdit``: description, date, amount and merchant."""
+    operations = {}
+    if not isinstance(changes, LedgerEdit):
+        return operations
+    if changes.description is not None:
+        operations["description"] = _required(changes.description, "La descripción")
+    if changes.date is not None:
+        operations["date"] = _date(changes.date, processor.zone)
+    if changes.amount is not None:
+        operations["amount"] = _amount(changes.amount, "El monto", processor.settings.max_amount_cop)
+    if changes.merchant is not None:
+        operations["merchant"] = _required(changes.merchant, "El comercio")
+    return operations
+
+
+def _apply_operations(draft: LedgerDraft, operations: dict) -> None:
+    """Write ``operations`` into the draft rebuilt from the movement as it is now."""
+    if "description" in operations:
+        draft.description = operations["description"]
+    if "date" in operations:
+        draft.date = datetime.fromisoformat(operations["date"])
+    if "amount" in operations:
+        if len(draft.splits) != 1:
+            raise _invalid("El monto solo se cambia en movimientos de una sola división.")
+        draft.splits[0].amount = operations["amount"]
+    counterparty_side = "source_account" if draft.type == "deposit" else "destination_account"
+    if "merchant" in operations and draft.type == "transfer":
+        raise _invalid("Una transferencia no tiene comercio.")
     for split in draft.splits:
         for key in ("category", "budget", "source_account"):
             if key in operations:
                 setattr(split, key, operations[key])
+        if "merchant" in operations:
+            setattr(split, counterparty_side, operations["merchant"])
         removed = set(operations.get("tags_remove", ()))
         split.tags = [tag for tag in split.tags if tag not in removed]
         split.tags += [tag for tag in operations.get("tags_add", ()) if tag not in split.tags]
+
+
+async def _bulk_one(db, processor, firefly_id: str, operations: dict, principal, group_id: str | None) -> LedgerChange | None:
+    """Apply ``operations`` to one movement; the recorded change, or None when nothing would change."""
+    raw = await _fetch(processor, firefly_id)
+    before = normalize(raw, processor.zone)
+    _require_editable(before)
+    draft = _draft_from(before, processor.zone)
+    _apply_operations(draft, operations)
     target = await resolve(processor, draft)
     target["external_id"] = before["external_id"]
     if _comparable(target) == _comparable(before):
-        return False
-    await _write_update(db, processor, firefly_id, raw, before, target, principal, group_id)
+        return None
+    _, _, change = await _write_update(db, processor, firefly_id, raw, before, target, principal, group_id)
     await db.commit()
-    return True
+    return change
+
+
+async def edit(db, processor, firefly_id: str, changes: LedgerEdit, principal) -> LedgerChange | None:
+    """Change some fields of one movement (the same path as a bulk edit); None when it already has those values."""
+    return await _bulk_one(db, processor, firefly_id, await _bulk_operations(processor, changes), principal, None)
 
 
 async def _isolate(db, exc: Exception, label: str, **context) -> str:

@@ -11,7 +11,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from app.api.dependencies import ReadPrincipal, ReviewPrincipal
 from app.api.routers.common import DB, Service, item_data
-from app.services import assistant, audit
+from app.services import assistant, assistant_errors, audit
+from app.services import assistant_actions as actions
 
 router = APIRouter()
 
@@ -30,7 +31,8 @@ class BatchCreate(BaseModel):
 
 class ProposalCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    target_id: int
+    target_id: int | None = None
+    target_ref: str | int | None = None
     field: str = Field(min_length=1, max_length=30)
     new_value: Any = None
     reason: str = Field(min_length=1, max_length=1000)
@@ -46,13 +48,14 @@ class ApplyBody(BaseModel):
 def _coded_errors():
     try:
         yield
-    except assistant.AssistantError as exc:
+    except assistant_errors.AssistantError as exc:
         raise HTTPException(exc.status, detail={"detail": exc.detail, "code": exc.code}) from exc
 
 
 def _proposal(proposal):
     return {
-        "id": proposal.id, "batch_id": proposal.batch_id, "target_id": proposal.target_id, "field": proposal.field,
+        "id": proposal.id, "batch_id": proposal.batch_id, "target_id": proposal.target_id, "target_ref": proposal.target_ref,
+        "subject": proposal.subject, "field": proposal.field,
         "old_value": proposal.old_value, "new_value": proposal.new_value, "reason": proposal.reason,
         "risky": proposal.risky, "status": proposal.status, "error": proposal.error,
         "applied_at": proposal.applied_at, "reverted_at": proposal.reverted_at,
@@ -65,7 +68,7 @@ async def _batch(db, batch):
         "id": batch.id, "window": {"from": batch.window_from, "to": batch.window_to}, "instruction": batch.instruction,
         "status": batch.status, "created_at": batch.created_at, "applied_at": batch.applied_at,
         "revert_deadline": assistant.revert_deadline(batch),
-        "proposals": [{**_proposal(proposal), "target": item_data(items[proposal.target_id], redacted_raw=True)} for proposal in proposals],
+        "proposals": [{**_proposal(proposal), "target": item_data(items[proposal.target_id], redacted_raw=True) if proposal.target_id is not None else None} for proposal in proposals],
     }
 
 
@@ -77,10 +80,17 @@ async def create_batch(body: BatchCreate, db: DB, principal: ReadPrincipal):
 
 
 @router.post("/assistant/batches/{batch_id}/proposals", status_code=201)
-async def create_proposal(batch_id: int, body: ProposalCreate, db: DB, principal: ReadPrincipal):
+async def create_proposal(batch_id: int, body: ProposalCreate, db: DB, service: Service, principal: ReadPrincipal):
     with _coded_errors():
         batch = await assistant.get_batch(db, batch_id)
-        proposal = await assistant.add_proposal(db, batch, target_id=body.target_id, field=body.field, new_value=body.new_value, reason=body.reason, principal=principal)
+        if body.field in actions.FIELDS:
+            proposal = await assistant.add_action(
+                db, service, batch, field=body.field, target_ref=body.target_ref, new_value=body.new_value, reason=body.reason, principal=principal,
+            )
+        else:
+            if body.target_id is None:
+                raise assistant_errors.AssistantError(422, "validation_error", "target_id is required")
+            proposal = await assistant.add_proposal(db, batch, target_id=body.target_id, field=body.field, new_value=body.new_value, reason=body.reason, principal=principal)
         return _proposal(proposal)
 
 

@@ -31,6 +31,27 @@ APPROVED_WITH_FOOTER = [
     "Comprobante de pago PSE. Estado de la transacción: Aprobada. Valor $12.000 a SUPERMERCADO CENTRAL. Los pagos rechazados se reversan solos.",
 ]
 
+# A real Lulo bank email (card digits and receipt numbers changed): the footer «Si no reconoces este movimiento…»
+# must not hide the decline, and DiDi must never reach Firefly.
+LULO_DECLINED = """Compra rechazada
+Compra rechazada en DiDi CO Ride por $15,000.00
+
+Origen tarjeta débito •0000
+Lulo bank
+No. comprobante 000000
+
+Operación sin costo
+
+Fecha 23 de noviembre de 2026
+Hora 10:08 p.m.
+
+Si no reconoces este movimiento ingresa a la sección de ayuda en el App de Lulo bank.
+
+© 2026. Lulo bank, Bogotá, Colombia.
+
+En Lulo bank, nunca te pediremos datos como claves o usuarios mediante correo electrónico. Si tienes alguna pregunta \
+nos puedes contactar a través de tu app en la sección Ayuda o consulta www.lulobank.com"""
+
 
 async def item(service, source="email", **changes):
     values = dict(
@@ -108,6 +129,15 @@ async def test_declined_sms_is_ignored_without_touching_firefly(service, clients
 
 async def test_a_declined_subject_with_a_neutral_body_is_ignored(service, clients):
     row = await service.process(await item(service, subject_or_title="Transacción rechazada", raw_text=PAID))
+    assert_ignored(row)
+    nothing_written(clients)
+
+
+@pytest.mark.parametrize("subject", ["Compra rechazada", "Notificación de tu tarjeta Lulo"])
+async def test_the_owners_real_lulo_decline_is_ignored(service, clients, subject):
+    assert is_declined(LULO_DECLINED)
+    assert parse(LULO_DECLINED, subject, "notificaciones@lulobank.com").kind == "ignore"
+    row = await service.process(await item(service, sender="notificaciones@lulobank.com", subject_or_title=subject, raw_text=LULO_DECLINED))
     assert_ignored(row)
     nothing_written(clients)
 

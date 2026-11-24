@@ -1,5 +1,6 @@
 """Single-owner Firefly JSON:API client; retries belong to the durable inbox."""
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import httpx
@@ -7,6 +8,9 @@ import httpx
 from app.core import error_log
 from app.core.config import get_settings
 from app.core.exceptions import FireflyError, PermanentError
+
+# Widest period Firefly accepts: it rejects an end date on or after 2038-01-17 (422).
+ALL_TIME = (date(2000, 1, 1), date(2037, 12, 31))
 
 
 class FireflyClient:

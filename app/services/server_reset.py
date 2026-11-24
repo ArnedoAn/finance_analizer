@@ -22,11 +22,11 @@ import asyncio
 import copy
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date
 from uuid import uuid4
 
 from sqlalchemy import delete, func, not_, or_, select, update
 
+from app.clients.firefly import ALL_TIME
 from app.core.exceptions import FireflyError, PermanentError
 from app.core.logging import get_logger
 from app.core.timezone import now_utc
@@ -74,7 +74,7 @@ ACCOUNT_TYPES = ("expense", "revenue")
 DELETE_CHUNK = 50
 EXAMPLES = 20
 MAX_RUNS = 20
-_FROM, _TO = date(2000, 1, 1), date(2100, 1, 1)  # every movement, whatever the period
+_FROM, _TO = ALL_TIME  # every movement, whatever the period
 
 
 @dataclass(frozen=True)

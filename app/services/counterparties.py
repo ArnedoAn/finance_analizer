@@ -15,11 +15,12 @@ import hashlib
 import json
 import re
 import unicodedata
-from datetime import date, timedelta
+from datetime import timedelta
 from difflib import SequenceMatcher
 
 from sqlalchemy import select
 
+from app.clients.firefly import ALL_TIME
 from app.core.exceptions import FireflyError
 from app.core.logging import get_logger
 from app.core.timezone import now_utc
@@ -38,7 +39,7 @@ MAX_LLM_PAIRS = 40
 MIN_LLM_CONFIDENCE = 0.6
 CACHE_KEY = "counterparty_llm"
 CACHE_LIMIT = 1000
-_FROM, _TO = date(2000, 1, 1), date(2100, 1, 1)  # every transaction of an account, whatever the period
+_FROM, _TO = ALL_TIME  # every transaction of an account, whatever the period
 _BUCKET_LIMIT = 60  # candidate buckets bigger than this (a generic word) are not compared pairwise
 _LEGAL_TAIL = re.compile(r"\b(?:s a s|s a|sas|sa|ltda|cia|inc|llc|corp|sucursal colombia|sucursal)\s*$")
 _lock = asyncio.Lock()

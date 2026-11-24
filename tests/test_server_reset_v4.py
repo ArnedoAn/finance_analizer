@@ -2,6 +2,7 @@
 import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -47,6 +48,11 @@ ACCOUNTS = [
 ]
 
 
+def _firefly_period(end):
+    if end >= date(2038, 1, 17):  # what the real Firefly answers
+        raise PermanentError("Firefly 422: The end must be a date before 2038-01-17.")
+
+
 def group(group_id, source, destination, *, external=None, tags=()):
     return {"id": group_id, "attributes": {"transactions": [{
         "transaction_journal_id": "j" + group_id, "type": "withdrawal", "date": "2026-11-01T10:00:00-05:00", "description": "x",
@@ -76,6 +82,7 @@ class FakeFirefly:
         firefly.delete_account.side_effect = self._delete_account
 
     async def _page(self, page, start, end):
+        _firefly_period(end)
         rows = list(self.groups.values())
         return rows[(page - 1) * 2:page * 2], max(1, -(-len(rows) // 2))
 
@@ -83,6 +90,7 @@ class FakeFirefly:
         return [dict(account) for account in self.accounts]
 
     async def _transactions(self, account_id, start, end):
+        _firefly_period(end)
         return [
             {"firefly_id": row["id"], **{key: split.get(key) for key in ("transaction_journal_id", "type", "date", "description", "amount", "source_id", "destination_id")}}
             for row in self.groups.values() for split in row["attributes"]["transactions"] if account_id in (split["source_id"], split["destination_id"])

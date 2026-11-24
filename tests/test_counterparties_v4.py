@@ -1,6 +1,6 @@
 """Consolidating counterparties: suggestions, merge in Firefly and the 7-day undo (Firefly and LLM mocked)."""
 import json
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import call
 from uuid import uuid4
@@ -62,6 +62,8 @@ class FakeLedger:
         return [dict(account) for account in self.accounts]
 
     async def _transactions(self, account_id, start, end):
+        if end >= date(2038, 1, 17):  # what the real Firefly answers
+            raise PermanentError("Firefly 422: The end must be a date before 2038-01-17.")
         return [
             {"firefly_id": row["group"], "transaction_journal_id": row["journal"], "type": "withdrawal", "date": "2026-11-01T10:00:00-05:00",
              "description": "x", "amount": "1.00", "source_id": row["source"], "destination_id": row["destination"]}

@@ -466,6 +466,34 @@ async def test_a_card_payment_stays_one_full_transfer(client, ledger, service, e
     assert (only["type"], only["amount"], only["destination_id"]) == ("transfer", "250000.00", "9")
 
 
+DAVIVIENDA_CARD_PAYMENT = (
+    "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\n"
+    "Fecha: 2026/11/15\nHora: 03:28:30\nValor Transacción: $1,651,063\nClase de Movimiento: Descuento Pago Tarjeta de Credito,\n"
+    "Lugar de Transacción: App Davivienda\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A."
+)
+
+
+async def test_the_davivienda_card_payment_notice_is_one_full_transfer_to_the_card(client, ledger, service, add_own_account, monkeypatch):
+    from app.parsers import parse
+    from app.services import processor as pipeline
+
+    monkeypatch.setattr(pipeline, "parse", parse)
+    monkeypatch.setattr(pipeline, "_now", lambda: datetime(2026, 11, 15, 12, 0, tzinfo=UTC))  # the notice is dated 2026/11/15 03:28:30 Bogota
+    ledger.account_list.append({"id": "5", "name": "Davivienda Ahorros", "type": "asset"})
+    await add_own_account("Davivienda Ahorros", bank="davivienda", kind="savings", last4=["0000"], sources=["email:davivienda.com"])
+    card = {"kind": "credit_card", "name": "Visa", "firefly_account_id": "9", "rate_ea": "32", "minimum_payment": "120000.00", "payment_match": ["Pago Tarjeta de Credito"]}
+    assert (await client.post(URL, headers=ADMIN, json=card)).status_code == 201
+    row = await pending(service, sender="alertas@davivienda.com", subject_or_title="Alerta Davivienda", raw_text=DAVIVIENDA_CARD_PAYMENT,
+                        occurred_at=datetime(2026, 11, 15, 9, 0, tzinfo=UTC))
+    item = await service.process(row)
+    assert item.method == "parser" and item.template_id == "davivienda.aviso_pago_tarjeta"
+    assert item.status == "created", item.review_reason
+    assert (item.transaction_type, item.asset_account, item.destination_account) == ("transfer", "Davivienda Ahorros", "Visa Oro")
+    assert list(ledger.written) == [f"fa:{item.source_ref}"]  # a card is never split into capital and interest
+    only = ledger.written[f"fa:{item.source_ref}"]
+    assert (only["type"], only["amount"], only["source_id"], only["destination_id"]) == ("transfer", "1651063.00", "5", "9")
+
+
 async def test_a_manual_transfer_to_a_loan_is_not_split(client, ledger, service, extraction, monkeypatch):
     await make_loan(client)
     from app.models.schemas import ManualTransaction

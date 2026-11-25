@@ -35,5 +35,87 @@
     "expected": {
       "kind": "ignore"
     }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\nFecha: 2026/11/15\nHora: 03:28:30\nValor Transacción: $1,651,063\nClase de Movimiento: Descuento Pago Tarjeta de Credito,\nLugar de Transacción: App Davivienda\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "Alerta Davivienda",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "1651063.00",
+      "currency": "COP",
+      "merchant": "PAGO TARJETA DE CREDITO",
+      "occurred_at": "2026-11-15T03:28:30-05:00",
+      "date_only": null,
+      "account_hint": "0000",
+      "counterparty_hint": null,
+      "template_id": "davivienda.aviso_pago_tarjeta"
+    }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\nFecha: 2026/11/15\nHora: 03:28:30\nValor Transacción: $1.651.063\nClase de Movimiento: Descuento Pago TC\nNúmero de Tarjeta: ****1111\nLugar de Transacción: App Davivienda\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "1651063.00",
+      "merchant": "PAGO TARJETA DE CREDITO",
+      "counterparty_hint": "Tarjeta ****1111"
+    }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta Corriente terminada (o) en ****0000:\n\nFecha: 2026/11/16\nHora: 18:05:09\nValor Transacción: $1,234,567.00\nClase de Movimiento: Compra\nLugar de Transacción: EXITO CALLE 80\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "Alerta Davivienda",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "1234567.00",
+      "merchant": "EXITO CALLE 80",
+      "occurred_at": "2026-11-16T18:05:09-05:00",
+      "account_hint": "0000",
+      "template_id": "davivienda.aviso_compra"
+    }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\nFecha: 2026/11/17\nHora: 09:10:00\nValor Transacción: $2,500,000\nClase de Movimiento: Abono por Nomina\nLugar de Transacción: PSE\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "Alerta Davivienda",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "deposit",
+      "amount": "2500000.00",
+      "occurred_at": "2026-11-17T09:10:00-05:00",
+      "account_hint": "0000",
+      "template_id": "davivienda.aviso_abono"
+    }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\nFecha: 2026/11/18\nHora: 12:00:00\nValor Transacción: $300,000\nClase de Movimiento: Retiro\nLugar de Transacción: Cajero Centro\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "Alerta Davivienda",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "300000.00",
+      "merchant": "RETIRO CAJERO CENTRO"
+    }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\nFecha: 2026/11/18\nHora: 12:30:00\nValor Transacción: $85,000\nClase de Movimiento: Descuento Pago Servicios Publicos\nLugar de Transacción: App Davivienda\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "Alerta Davivienda",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "withdrawal",
+      "amount": "85000.00",
+      "merchant": "PAGO SERVICIOS PUBLICOS",
+      "template_id": "davivienda.aviso_pago"
+    }
+  },
+  {
+    "text": "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros terminada (o) en ****0000:\n\nFecha: 2026/11/19\nHora: 08:00:00\nValor Transacción: $400,000\nClase de Movimiento: Abono Pago de Nomina\nLugar de Transacción: App Davivienda\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A.",
+    "subject": "Alerta Davivienda",
+    "sender": "alertas@davivienda.com",
+    "expected": {
+      "kind": "deposit",
+      "amount": "400000.00"
+    }
   }
 ]

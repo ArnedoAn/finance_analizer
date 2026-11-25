@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.parsers import normalize_merchant, parse, parse_amount
+from app.parsers import is_placeholder_merchant, normalize_merchant, parse, parse_amount
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CASES = [(path.stem, index, case)
@@ -38,6 +38,7 @@ def test_bank_golden(bank, index, case):
     ("1", "COP", "1.00"), ("50000", "COP", "50000.00"),
     ("50.000", "COP", "50000.00"), ("1.234.567,00", "COP", "1234567.00"),
     ("50000.00", "COP", "50000.00"), ("50,000.00", "COP", "50000.00"),
+    ("1.651.063", "COP", "1651063.00"), ("1,651,063.00", "COP", "1651063.00"),
     ("25.99", "USD", "25.99"), ("1,234.56", "USD", "1234.56"),
     ("1.5", "USD", "1.50"), ("25", "USD", "25.00"),
 ])
@@ -75,3 +76,50 @@ def test_due_date_with_el_is_not_transaction_date():
     assert result is not None
     assert result.occurred_at is None
     assert result.date_only is None
+
+
+DAVIVIENDA_NOTICE = (
+    "Apreciado(a) CLIENTE:\n\nLe informamos que se ha registrado el siguiente movimiento de su Cta de Ahorros "
+    "terminada (o) en ****0000:\n\nFecha: 2026/11/15\nHora: 03:28:30\nValor Transacción: {amount}\n"
+    "Clase de Movimiento: {movement}\nLugar de Transacción: {place}\n\nAtentamente,\n\nBANCO DAVIVIENDA S.A."
+)
+
+
+def davivienda(amount="$1,651,063", movement="Descuento Pago Tarjeta de Credito,", place="App Davivienda", subject="Alerta Davivienda"):
+    return parse(DAVIVIENDA_NOTICE.format(amount=amount, movement=movement, place=place), subject, "alertas@davivienda.com")
+
+
+@pytest.mark.parametrize("amount", ["$1,651,063", "$1.651.063", "$1,651,063.00", "$ 1651063", "1,651,063"])
+def test_davivienda_notice_amount_groupings(amount):
+    result = davivienda(amount)
+    assert result is not None and result.kind == "withdrawal" and result.amount == Decimal("1651063.00")
+
+
+def test_davivienda_notice_ambiguous_amount_goes_to_review():
+    result = davivienda("$1.65")
+    assert result is not None and result.kind == "review" and result.amount is None and result.reason
+
+
+@pytest.mark.parametrize("movement", ["Cuota de Manejo", "Reverso Compra", "Devolucion Pago Tarjeta de Credito"])
+def test_davivienda_notice_unknown_or_reversed_class_falls_through(movement):
+    assert davivienda(movement=movement) is None
+
+
+def test_davivienda_notice_declined_is_ignored():
+    result = davivienda(movement="Compra rechazada")
+    assert result is not None and result.kind == "ignore"
+
+
+def test_davivienda_notice_sent_transfer_and_received_transfer():
+    assert davivienda(movement="Transferencia a otra cuenta").kind == "withdrawal"
+    assert davivienda(movement="Transferencia recibida").kind == "deposit"
+
+
+def test_davivienda_notice_placeholder_merchant_stays_a_placeholder():
+    result = davivienda(movement="Compra", place="PENDING")
+    assert result is not None and is_placeholder_merchant(result.merchant)
+
+
+def test_davivienda_notice_subject_word_descuento_does_not_ignore_it():
+    result = davivienda(subject="Descuento en su cuenta")
+    assert result is not None and result.kind == "withdrawal" and result.merchant == "PAGO TARJETA DE CREDITO"

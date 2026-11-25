@@ -57,6 +57,10 @@ def parse(text: str, subject: str = "", sender: str = "") -> Extraction | None:
     ignore_term = NON_TRANSACTION.search(fold(subject)) or NON_TRANSACTION.search(fold(first_sentence))
     if is_declined(combined):
         return Extraction(kind="ignore", template_id=DECLINED_TEMPLATE, reason=DECLINED_REASON)
+    if bank == "davivienda" and (notice := davivienda.notice(combined)) is not None:
+        # A labelled movement notice carries its own vocabulary («Clase de Movimiento: Descuento ...»), so a subject word
+        # such as «descuento» does not make it non-transactional.
+        return notice
     if len(events) > 1:
         return replace(events[0].extraction, kind="review", template_id="review.mixed",
                        reason="Multiple transaction events in one message")

@@ -5,6 +5,9 @@ failure is ``ValueError`` and a Firefly failure propagates.
 """
 from decimal import Decimal
 
+from sqlalchemy import update
+
+from app.db.models import BudgetAssignment, BudgetMap
 from app.services import audit
 from app.services.budget_assign import month_bounds, valid_month
 from app.services.budget_import import CENT, exact_limit, write_limit
@@ -62,6 +65,21 @@ async def set_limit(session, firefly, name: str, amount: Decimal, month: str, pr
     )
     await session.commit()
     return budget
+
+
+async def rename(session, firefly, name: str, new_name: str, principal) -> str:
+    """Rename an existing budget in Firefly and in the analyzer's rows that name it (learned mappings and suggestions);
+    returns the new spelling. A different budget with that name is a conflict. Commits."""
+    budget = await _existing(firefly, name)
+    clash = await find(firefly, new_name)
+    if clash is not None and clash["id"] != budget["id"]:
+        raise ValueError(f"A budget named «{clash['name']}» already exists")
+    stored = (await firefly.rename_budget(budget["id"], new_name))["name"]
+    await session.execute(update(BudgetMap).where(BudgetMap.budget == budget["name"]).values(budget=stored))
+    await session.execute(update(BudgetAssignment).where(BudgetAssignment.budget == budget["name"]).values(budget=stored))
+    await audit.record(session, action="budget.rename", target_type="budget", target_id=stored, detail={"from": budget["name"], "to": stored}, principal=principal)
+    await session.commit()
+    return stored
 
 
 async def delete(session, firefly, name: str, principal) -> dict:

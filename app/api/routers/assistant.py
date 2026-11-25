@@ -68,7 +68,7 @@ def _proposal(proposal):
         "subject": proposal.subject, "field": proposal.field,
         "old_value": proposal.old_value, "new_value": proposal.new_value, "reason": proposal.reason,
         "risky": proposal.risky, "status": proposal.status, "error": proposal.error,
-        "applied_at": proposal.applied_at, "reverted_at": proposal.reverted_at,
+        "applied_at": proposal.applied_at, "reverted_at": proposal.reverted_at, "result": proposal.result,
     }
 
 

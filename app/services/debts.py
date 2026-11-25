@@ -8,10 +8,12 @@ The maths is ``app.services.debt_math``; nothing here does arithmetic of its own
 Functions never commit unless they say so; the creation, update and removal commit (they also touch ``own_accounts``).
 """
 import re
-from datetime import datetime, time
+from datetime import date, datetime, time
 from decimal import Decimal
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy import select
 
 from app.core.exceptions import PermanentError
@@ -33,6 +35,59 @@ KINDS = ("loan", "credit_card")
 OWN_KIND = {"loan": "loan", "credit_card": "credit"}
 LIABILITY_KIND = {"loan": "loan", "credit_card": "debt"}
 ZERO = Decimal(0)
+# Fields of ``PUT /debts/{id}`` (and ``update_debt``) that may be left out but never sent as null.
+NOT_NULL = ("name", "rate_ea", "active")
+
+_Money = Annotated[Decimal, Field(ge=0, max_digits=18, decimal_places=2)]
+_Pattern = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+_Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+_Rate = Annotated[Decimal, Field(ge=0, le=100, max_digits=8, decimal_places=4)]
+_Day = Annotated[int, Field(ge=1, le=31, strict=True)]
+
+
+class DebtIn(BaseModel):
+    """Body of ``POST /debts`` and ``new_value`` of the assistant's ``create_debt``."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["loan", "credit_card"]
+    name: _Name
+    lender: Annotated[str, StringConstraints(strip_whitespace=True, max_length=100)] = ""
+    firefly_account_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)] | None = None
+    currency: Literal["COP"] = "COP"
+    balance: _Money | None = None  # current balance: opening balance of a new liability, ignored when an account is linked
+    original_amount: _Money | None = None
+    rate_ea: _Rate
+    term_months: Annotated[int, Field(ge=1, le=600, strict=True)] | None = None
+    start_date: date | None = None
+    installment: _Money | None = None
+    payment_day: _Day | None = None
+    insurance_monthly: _Money = Decimal(0)
+    credit_limit: _Money | None = None
+    minimum_payment: _Money | None = None
+    payment_match: list[_Pattern] = Field(default_factory=list, max_length=20)
+
+
+class DebtPatch(BaseModel):
+    """Update: only the fields sent change (the app sends the whole draft). Body of ``PUT /debts/{id}`` and ``update_debt``."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["loan", "credit_card"] | None = None
+    name: _Name | None = None
+    lender: Annotated[str, StringConstraints(strip_whitespace=True, max_length=100)] | None = None
+    firefly_account_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)] | None = None
+    currency: Literal["COP"] | None = None
+    balance: _Money | None = None
+    original_amount: _Money | None = None
+    rate_ea: _Rate | None = None
+    term_months: Annotated[int, Field(ge=1, le=600, strict=True)] | None = None
+    start_date: date | None = None
+    installment: _Money | None = None
+    payment_day: _Day | None = None
+    insurance_monthly: _Money | None = None
+    credit_limit: _Money | None = None
+    minimum_payment: _Money | None = None
+    payment_match: list[_Pattern] | None = Field(default=None, max_length=20)
+    active: bool | None = None
 
 
 class DebtError(Exception):
@@ -112,6 +167,14 @@ def owed(info: dict | None) -> Decimal:
 
 async def balance_of(firefly, row: Debt) -> Decimal:
     return owed(await firefly.account_balance(row.firefly_account_id))
+
+
+async def payment_split(firefly, row: Debt, payment: Decimal) -> math.PaymentSplit:
+    """How a ``payment`` of the debt ``row`` divides today: the single place that decides it (the processor and the assistant
+    use it). A loan: interest and insurance apart from the capital (``debt_math.payment_split``); a card: all of it is capital."""
+    if row.kind == "credit_card":
+        return math.PaymentSplit(payment, payment, ZERO, ZERO, ZERO)
+    return math.payment_split(await balance_of(firefly, row), row.rate_ea, row.insurance_monthly, payment)
 
 
 def installment_for(row: Debt, balance: Decimal, on) -> Decimal:
@@ -199,23 +262,29 @@ async def _taken(session, name: str, exclude_id: int | None = None) -> bool:
     return any(row.id != exclude_id and row.name.casefold() == wanted for row in await active(session))
 
 
+async def validate_new(session, firefly, data: dict) -> dict | None:
+    """What ``create`` checks before writing anything: a free name and, to link an account, that it exists; to create the
+    liability, the balance and a free account name. Returns the linked Firefly account (None when a liability will be created)."""
+    if await _taken(session, data["name"]):
+        raise DebtError(409, "Ya existe una deuda con ese nombre.", "debt_exists")
+    if data.get("firefly_account_id"):
+        return await _account(firefly, data["firefly_account_id"])
+    balance = data.get("balance")
+    if balance is None or balance <= 0:
+        raise DebtError(422, "Indica el saldo actual (balance) para crear el pasivo en Firefly.", "balance_required")
+    if any(a["name"].casefold() == data["name"].casefold() and a["type"] in ASSET_OR_LIABILITY for a in await firefly.accounts()):
+        raise DebtError(409, "Ya existe una cuenta con ese nombre en Firefly; vincúlala con firefly_account_id.", "firefly_account_exists")
+    return None
+
+
 async def create(session, firefly, settings, data: dict, principal=None) -> dict:
     """Create a debt. Without ``firefly_account_id`` a liability is created in Firefly with the current balance as its
     opening balance (``data["balance"]``, required then); with one, the existing account (liability or card asset) is linked.
     The Firefly account is also registered as an own account so the payments are recognized. Commits."""
-    if await _taken(session, data["name"]):
-        raise DebtError(409, "Ya existe una deuda con ese nombre.", "debt_exists")
-    on = today(settings)
-    if data.get("firefly_account_id"):
-        account = await _account(firefly, data["firefly_account_id"])
-    else:
-        balance = data.get("balance")
-        if balance is None or balance <= 0:
-            raise DebtError(422, "Indica el saldo actual (balance) para crear el pasivo en Firefly.", "balance_required")
-        if any(a["name"].casefold() == data["name"].casefold() and a["type"] in ASSET_OR_LIABILITY for a in await firefly.accounts()):
-            raise DebtError(409, "Ya existe una cuenta con ese nombre en Firefly; vincúlala con firefly_account_id.", "firefly_account_exists")
+    account = await validate_new(session, firefly, data)
+    if account is None:
         try:
-            account = await firefly.create_liability(data["name"], LIABILITY_KIND[data["kind"]], data["rate_ea"], balance, on)
+            account = await firefly.create_liability(data["name"], LIABILITY_KIND[data["kind"]], data["rate_ea"], data["balance"], today(settings))
         except PermanentError as exc:
             raise DebtError(422, "Firefly rechazó crear el pasivo: " + str(exc)[:200], "firefly_rejected") from exc
     row = Debt(
@@ -236,18 +305,26 @@ async def create(session, firefly, settings, data: dict, principal=None) -> dict
     return view(row, await balance_of(firefly, row))
 
 
+async def validate_update(session, firefly, row: Debt, data: dict) -> dict | None:
+    """What ``update`` checks before writing anything: a free name, the kind unchanged and, to link another account, that it exists.
+    Returns that Firefly account (None when the link does not change)."""
+    if "name" in data and await _taken(session, data["name"], row.id):
+        raise DebtError(409, "Ya existe una deuda con ese nombre.", "debt_exists")
+    if "kind" in data and data["kind"] != row.kind:
+        raise DebtError(422, "El tipo de una deuda no se puede cambiar.", "debt_kind_locked")
+    if data.get("firefly_account_id") and str(data["firefly_account_id"]) != row.firefly_account_id:
+        return await _account(firefly, data["firefly_account_id"])
+    return None
+
+
 async def update(session, firefly, settings, debt_id: int, data: dict, principal=None) -> dict:
     """Update the fields sent (``balance`` is ignored: Firefly owns it). A new EA rate is pushed to the liability. Commits."""
     row = await get(session, debt_id)
     data = {key: value for key, value in data.items() if key != "balance"}
-    if "name" in data and await _taken(session, data["name"], row.id):
-        raise DebtError(409, "Ya existe una deuda con ese nombre.", "debt_exists")
-    if data.get("firefly_account_id") and str(data["firefly_account_id"]) != row.firefly_account_id:
-        account = await _account(firefly, data.pop("firefly_account_id"))
+    account = await validate_update(session, firefly, row, data)
+    if account is not None:
         row.firefly_account_id, row.firefly_account = str(account["id"]), account["name"]
     data.pop("firefly_account_id", None)
-    if "kind" in data and data["kind"] != row.kind:
-        raise DebtError(422, "El tipo de una deuda no se puede cambiar.", "debt_kind_locked")
     rate_changed = "rate_ea" in data and Decimal(data["rate_ea"]) != Decimal(row.rate_ea)
     for key, value in data.items():
         if key == "payment_match":

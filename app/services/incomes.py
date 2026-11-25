@@ -7,7 +7,9 @@ default), is a variable extra and raises the ``extra_income`` alert with the pla
 deposits (refunds, small transfers) count in neither. Functions never commit unless they say so.
 """
 from decimal import Decimal
+from typing import Annotated, Literal
 
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from sqlalchemy import select
 
 from app.core.logging import get_logger
@@ -22,6 +24,38 @@ THRESHOLD_KEY = "extra_income_threshold"
 DEFAULT_THRESHOLD = Decimal("200000.00")
 MAX_THRESHOLD = Decimal("1000000000")
 ALERT_TYPE = "extra_income"
+# Fields of ``PUT /incomes/{id}`` (and ``update_income``) that may be left out but never sent as null.
+NOT_NULL = ("name", "kind", "currency", "amount", "active")
+
+_Pattern = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+_Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+_Amount = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=2)]
+_Day = Annotated[int, Field(ge=1, le=31, strict=True)]
+
+
+class IncomeIn(BaseModel):
+    """Body of ``POST /incomes`` and ``new_value`` of the assistant's ``create_income``."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: _Name
+    kind: Literal["fixed", "variable"]
+    currency: Literal["COP", "USD"]
+    amount: _Amount
+    day_of_month: _Day | None = None
+    match: list[_Pattern] = Field(default_factory=list, max_length=20)
+
+
+class IncomePatch(BaseModel):
+    """Body of ``PUT /incomes/{id}`` and ``new_value`` of ``update_income``: only the fields sent change."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: _Name | None = None
+    kind: Literal["fixed", "variable"] | None = None
+    currency: Literal["COP", "USD"] | None = None
+    amount: _Amount | None = None
+    day_of_month: _Day | None = None
+    match: list[_Pattern] | None = Field(default=None, max_length=20)
+    active: bool | None = None
 
 
 class IncomeError(Exception):

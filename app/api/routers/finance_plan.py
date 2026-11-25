@@ -4,42 +4,16 @@ Reads need ``read``; writes ``review`` (``admin`` implies both).
 """
 from datetime import date
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.dependencies import READ, REVIEW, Principal
 from app.api.routers.common import DB, Service
 from app.services import audit, debts, finance_plan, fx, incomes
 
 router = APIRouter()
-
-_Pattern = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-_Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-_Amount = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=2)]
-_Day = Annotated[int, Field(ge=1, le=31, strict=True)]
-
-
-class IncomeIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: _Name
-    kind: Literal["fixed", "variable"]
-    currency: Literal["COP", "USD"]
-    amount: _Amount
-    day_of_month: _Day | None = None
-    match: list[_Pattern] = Field(default_factory=list, max_length=20)
-
-
-class IncomePatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: _Name | None = None
-    kind: Literal["fixed", "variable"] | None = None
-    currency: Literal["COP", "USD"] | None = None
-    amount: _Amount | None = None
-    day_of_month: _Day | None = None
-    match: list[_Pattern] | None = Field(default=None, max_length=20)
-    active: bool | None = None
 
 
 class ThresholdIn(BaseModel):
@@ -57,14 +31,14 @@ async def list_incomes(db: DB):
 
 
 @router.post("/incomes", status_code=201)
-async def create_income(payload: IncomeIn, db: DB, principal: Annotated[Principal, REVIEW]):
+async def create_income(payload: incomes.IncomeIn, db: DB, principal: Annotated[Principal, REVIEW]):
     return await incomes.create(db, payload.model_dump(), principal)
 
 
 @router.put("/incomes/{income_id}")
-async def update_income(income_id: int, payload: IncomePatch, db: DB, principal: Annotated[Principal, REVIEW]):
+async def update_income(income_id: int, payload: incomes.IncomePatch, db: DB, principal: Annotated[Principal, REVIEW]):
     fields = payload.model_dump(exclude_unset=True)
-    for name in ("name", "kind", "currency", "amount", "active"):
+    for name in incomes.NOT_NULL:
         if name in fields and fields[name] is None:
             raise HTTPException(422, detail={"detail": f"{name} no puede ser nulo.", "code": "validation_error"})
     try:

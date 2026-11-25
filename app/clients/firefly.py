@@ -217,6 +217,11 @@ class FireflyClient:
         result = await self._request("POST", "budgets", json={"name": name, "active": True})
         return {"id": str(result["data"]["id"]), "name": result["data"]["attributes"]["name"]}
 
+    async def rename_budget(self, budget_id: str, name: str) -> dict:
+        """Rename a budget (limits and transactions keep pointing at it); returns ``{id, name}`` as Firefly stores it."""
+        result = await self._request("PUT", f"budgets/{budget_id}", json={"name": name})
+        return {"id": str(result["data"]["id"]), "name": result["data"]["attributes"]["name"]}
+
     async def delete_budget(self, budget_id: str) -> None:
         """Delete a budget with its limits; Firefly leaves its transactions without budget."""
         await self._request("DELETE", f"budgets/{budget_id}")

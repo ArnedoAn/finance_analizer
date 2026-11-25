@@ -504,8 +504,9 @@ async def _named(lookup) -> dict:
     return {row["name"].casefold(): row for row in await lookup()}
 
 
-async def resolve(processor, draft: LedgerDraft) -> dict:
-    """Validate ``draft`` against the ledger (contract section 15) and return its version. Own accounts are never created."""
+async def resolve(processor, draft: LedgerDraft, *, create_accounts: bool = True) -> dict:
+    """Validate ``draft`` against the ledger (contract section 15) and return its version. Own accounts are never created;
+    with ``create_accounts=False`` neither are the merchant and income accounts (a dry run that writes nothing)."""
     kind = (draft.type or "").strip()
     if kind not in TYPES:
         raise _invalid("El tipo debe ser withdrawal, deposit o transfer.")
@@ -537,7 +538,8 @@ async def resolve(processor, draft: LedgerDraft) -> dict:
     if sum((Decimal(row["amount"]) for row in rows), Decimal(0)) > maximum:
         raise _invalid(f"El total del movimiento supera el máximo permitido ({format_money(maximum)}).")
     _same_account(kind, rows)
-    await _create_missing(processor, rows, pendings)
+    if create_accounts:
+        await _create_missing(processor, rows, pendings)
     return _assemble(kind, date, description, rows, None)
 
 

@@ -48,7 +48,6 @@ from app.services import (
     audit,
     bills,
     capture,
-    debt_math,
     debts,
     descriptions,
     digest,
@@ -168,6 +167,10 @@ class Processor:
     def invalidate_categories(self) -> None:
         """Forget the cached categories; the next ``categories()`` reads them from Firefly again."""
         self._categories = None
+
+    def invalidate_accounts(self) -> None:
+        """Forget the cached accounts; the next ``accounts()`` reads them from Firefly again (a debt just created a liability)."""
+        self._accounts = None
 
     async def _asset(self, name):
         for account in await self.accounts():
@@ -736,12 +739,10 @@ class Processor:
                 return data
         if loan is None:
             return None
-        interest = debt_math.peso(await debts.balance_of(self.firefly, loan) * debt_math.monthly_rate(loan.rate_ea))
-        insurance = debt_math.peso(loan.insurance_monthly or 0)
-        capital = max(Decimal(0), item.amount - interest - insurance)
+        split = await debts.payment_split(self.firefly, loan, item.amount)
         data = {
-            "debt": loan.name, "payment": f"{item.amount:.2f}", "capital": f"{capital:.2f}", "interest": f"{interest:.2f}",
-            "insurance": f"{insurance:.2f}", "expense": f"{item.amount - capital:.2f}",
+            "debt": loan.name, "payment": f"{split.payment:.2f}", "capital": f"{split.capital:.2f}", "interest": f"{split.interest:.2f}",
+            "insurance": f"{split.insurance:.2f}", "expense": f"{split.expense:.2f}",
         }
         self.session.add(InboxEvent(inbox_id=item.id, action="debt_payment_split", detail=json.dumps(data)))
         return data

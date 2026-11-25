@@ -20,6 +20,7 @@ import calendar
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Context, Decimal, localcontext
+from typing import NamedTuple
 
 PESO = Decimal(1)
 ZERO = Decimal(0)
@@ -89,6 +90,27 @@ def card_payment(installment, minimum_payment) -> Decimal | None:
         if value is not None and Decimal(value) > 0:
             return Decimal(value)
     return None
+
+
+class PaymentSplit(NamedTuple):
+    """How a loan payment divides: ``capital`` reduces the balance; ``expense`` (interest + insurance, or the whole payment
+    when it does not cover them) is what the lender keeps."""
+
+    payment: Decimal
+    capital: Decimal
+    interest: Decimal
+    insurance: Decimal
+    expense: Decimal
+
+
+def payment_split(balance, rate_ea, insurance_monthly, payment) -> PaymentSplit:
+    """Split a loan ``payment`` made against ``balance``: interest = balance x monthly EA rate and insurance = the fixed one,
+    both to the peso; the capital is what the payment leaves (zero when it does not cover them; an extra payment is all capital)."""
+    interest = peso(Decimal(balance) * monthly_rate(rate_ea))
+    insurance = peso(insurance_monthly or 0)
+    payment = Decimal(payment)
+    capital = max(ZERO, payment - interest - insurance)
+    return PaymentSplit(payment, capital, interest, insurance, payment - capital)
 
 
 def term_for(balance, rate_ea, installment) -> int | None:
